@@ -53,7 +53,7 @@ static int bundle_open(const char *relative){
     off64_t start=0,length=0;int fd=AAsset_openFileDescriptor64(asset,&start,&length);unsigned region=fd>=0;
     if(fd<0){
         length=AAsset_getLength64(asset);start=0;fd=(int)syscall(__NR_memfd_create,"bundle-resource",MFD_CLOEXEC);
-        if(fd>=0){unsigned char buffer[65536];off64_t done=0;while(done<length){int count=AAsset_read(asset,buffer,sizeof(buffer));if(count<=0){close(fd);fd=-1;errno=EIO;break;}int offset=0;while(offset<count){ssize_t written=write(fd,buffer+offset,(size_t)(count-offset));if(written<0 && errno==EINTR)continue;if(written<=0){int code=errno;close(fd);fd=-1;errno=code;break;}offset+=(int)written;}if(fd<0)break;done+=count;}}
+        if(fd>=0 && length>0){size_t capacity=(uint64_t)length<65536 ? (size_t)length : 65536;unsigned char *buffer=malloc(capacity);if(!buffer){close(fd);fd=-1;errno=ENOMEM;}else{off64_t done=0;while(done<length){int count=AAsset_read(asset,buffer,capacity);if(count<=0){close(fd);fd=-1;errno=EIO;break;}int offset=0;while(offset<count){ssize_t written=write(fd,buffer+offset,(size_t)(count-offset));if(written<0 && errno==EINTR)continue;if(written<=0){int code=errno;close(fd);fd=-1;errno=code;break;}offset+=(int)written;}if(fd<0)break;done+=count;}free(buffer);}}
     }
     int code=errno;AAsset_close(asset);if(fd<0){errno=code;return -1;}
     if(!region){char path[64];snprintf(path,sizeof(path),"/proc/self/fd/%d",fd);int readonly=open(path,O_RDONLY|O_CLOEXEC);code=errno;close(fd);fd=readonly;if(fd<0){errno=code;return -1;}}
@@ -78,9 +78,9 @@ static ssize_t io_read(int fd,void *bytes,size_t count){
 }
 static ssize_t io_readv(int fd,const struct iovec *vectors,int count){
     struct BundleFile *file=bundle_fd_acquire(fd);if(!file)return readv(fd,vectors,count);if(count<0 || count>IOV_MAX){bundle_file_release(file);errno=EINVAL;return -1;}
-    struct iovec selected[IOV_MAX];pthread_mutex_lock(&file->mutex);off_t left=file->position<file->length ? file->length-file->position : 0;int used=0;size_t total=0;
-    for(int i=0;i<count;++i){if(vectors[i].iov_len>SSIZE_MAX-total){pthread_mutex_unlock(&file->mutex);bundle_file_release(file);errno=EINVAL;return -1;}total+=vectors[i].iov_len;if(left<=0)continue;selected[used]=vectors[i];if(selected[used].iov_len>(uint64_t)left)selected[used].iov_len=(size_t)left;left-=selected[used++].iov_len;}
-    ssize_t result=used ? preadv(fd,selected,used,file->start+file->position) : 0;if(result>0)file->position+=result;pthread_mutex_unlock(&file->mutex);bundle_file_release(file);return result;
+    struct iovec *selected=count ? malloc((size_t)count*sizeof(*selected)) : NULL;if(count && !selected){bundle_file_release(file);errno=ENOMEM;return -1;}pthread_mutex_lock(&file->mutex);off_t left=file->position<file->length ? file->length-file->position : 0;int used=0;size_t total=0;
+    for(int i=0;i<count;++i){if(vectors[i].iov_len>SSIZE_MAX-total){pthread_mutex_unlock(&file->mutex);free(selected);bundle_file_release(file);errno=EINVAL;return -1;}total+=vectors[i].iov_len;if(left<=0)continue;selected[used]=vectors[i];if(selected[used].iov_len>(uint64_t)left)selected[used].iov_len=(size_t)left;left-=selected[used++].iov_len;}
+    ssize_t result=used ? preadv(fd,selected,used,file->start+file->position) : 0;if(result>0)file->position+=result;pthread_mutex_unlock(&file->mutex);free(selected);bundle_file_release(file);return result;
 }
 static off_t io_seek(int fd,off_t offset,int origin){
     struct BundleFile *file=bundle_fd_acquire(fd);if(!file)return lseek(fd,offset,origin);pthread_mutex_lock(&file->mutex);off_t base=origin==SEEK_SET ? 0 : origin==SEEK_CUR ? file->position : file->length,result;
@@ -106,9 +106,9 @@ static void *io_mmap(void *address,size_t length,int protection,int flags,int fd
     uint64_t rounded=(remaining+(uint64_t)page-1)/(uint64_t)page*(uint64_t)page;
     if(file->start%page || offset>=file->length || length>rounded){
         int copy=(int)syscall(__NR_memfd_create,"bundle-mapping",MFD_CLOEXEC);if(copy<0){bundle_file_release(file);return MAP_FAILED;}
-        unsigned char bytes[65536];off_t done=0;int code=0;
-        while(done<file->length){size_t wanted=(uint64_t)(file->length-done)<sizeof(bytes) ? (size_t)(file->length-done) : sizeof(bytes);ssize_t count=pread(fd,bytes,wanted,file->start+done);if(count<0 && errno==EINTR)continue;if(count<=0){code=count<0 ? errno : EIO;break;}size_t written=0;while(written<(size_t)count){ssize_t n=write(copy,bytes+written,(size_t)count-written);if(n<0 && errno==EINTR)continue;if(n<=0){code=n<0 ? errno : EIO;break;}written+=(size_t)n;}if(code)break;done+=count;}
-        if(!code)fchmod(copy,0444);void *result=code ? MAP_FAILED : mmap(address,length,protection,flags,copy,offset);if(code)errno=code;int saved=errno;close(copy);bundle_file_release(file);errno=saved;return result;
+        size_t capacity=file->length>0 && file->length<65536 ? (size_t)file->length : 65536;unsigned char *bytes=malloc(capacity);off_t done=0;int code=bytes ? 0 : ENOMEM;
+        while(!code && done<file->length){size_t wanted=(uint64_t)(file->length-done)<capacity ? (size_t)(file->length-done) : capacity;ssize_t count=pread(fd,bytes,wanted,file->start+done);if(count<0 && errno==EINTR)continue;if(count<=0){code=count<0 ? errno : EIO;break;}size_t written=0;while(written<(size_t)count){ssize_t n=write(copy,bytes+written,(size_t)count-written);if(n<0 && errno==EINTR)continue;if(n<=0){code=n<0 ? errno : EIO;break;}written+=(size_t)n;}if(code)break;done+=count;}
+        free(bytes);if(!code)fchmod(copy,0444);void *result=code ? MAP_FAILED : mmap(address,length,protection,flags,copy,offset);if(code)errno=code;int saved=errno;close(copy);bundle_file_release(file);errno=saved;return result;
     }
     void *result=mmap(address,length,protection,flags,fd,file->start+offset);
     uint64_t tail=remaining%(uint64_t)page,tail_offset=remaining-tail;
