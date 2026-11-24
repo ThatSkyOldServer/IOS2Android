@@ -28,7 +28,37 @@ static void spin_lock(volatile int32_t *value) {
     }
 }
 static void spin_unlock(volatile int32_t *value) { __atomic_store_n(value,0,__ATOMIC_RELEASE); }
+#include <linux/futex.h>
+/* Four-byte, zero-initialized lock storage; use the same owner identity as
+ * mach_thread_self. Android futexes provide blocking acquire/release semantics.
+ * Darwin workqueue/adaptive-spin options are scheduling hints only here. */
+static uint32_t unfair_lock_owner(void) { return 0x80000000U|(uint32_t)syscall(SYS_gettid); }
+static unsigned char unfair_trylock(uint32_t *lock) {
+    uint32_t unlocked=0;
+    return __atomic_compare_exchange_n(lock,&unlocked,unfair_lock_owner(),0,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED);
+}
+static void unfair_lock_options(uint32_t *lock,uint32_t options) {
+    if(options&~0x50000U)stop("Unsupported unfair lock options","os_unfair_lock_lock_with_options");
+    uint32_t owner=unfair_lock_owner();
+    for(;;){
+        uint32_t expected=0;
+        if(__atomic_compare_exchange_n(lock,&expected,owner,0,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED))return;
+        if(expected==owner)stop("Recursive unfair lock","os_unfair_lock_lock");
+        if(syscall(SYS_futex,lock,FUTEX_WAIT_PRIVATE,expected,NULL,NULL,0)<0 && errno!=EAGAIN && errno!=EINTR)
+            stop("Unfair lock wait failed","os_unfair_lock_lock");
+    }
+}
+static void unfair_lock(uint32_t *lock) { unfair_lock_options(lock,0); }
+static void unfair_unlock(uint32_t *lock) {
+    uint32_t expected=unfair_lock_owner();
+    if(!__atomic_compare_exchange_n(lock,&expected,0,0,__ATOMIC_RELEASE,__ATOMIC_RELAXED))stop("Unfair lock owner mismatch","os_unfair_lock_unlock");
+    syscall(SYS_futex,lock,FUTEX_WAKE_PRIVATE,1,NULL,NULL,0);
+}
 static Word resolve_atomic_import(const char *name) {
+    if (!strcmp(name,"_os_unfair_lock_lock")) return (Word)unfair_lock;
+    if (!strcmp(name,"_os_unfair_lock_lock_with_options")) return (Word)unfair_lock_options;
+    if (!strcmp(name,"_os_unfair_lock_trylock")) return (Word)unfair_trylock;
+    if (!strcmp(name,"_os_unfair_lock_unlock")) return (Word)unfair_unlock;
     if (!strcmp(name,"_OSAtomicAdd32")) return (Word)atomic_add32;
     if (!strcmp(name,"_OSAtomicAdd32Barrier")) return (Word)atomic_add32_barrier;
     if (!strcmp(name,"_OSAtomicIncrement32")) return (Word)atomic_increment32;

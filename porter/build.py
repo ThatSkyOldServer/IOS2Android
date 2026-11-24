@@ -245,7 +245,7 @@ def build(context, core_only=False):
     from .bundle.identity import font_plan, prepare_app_identity
     from .bundle.storyboard import prepare_controller_catalogue, prepare_launch_screen
     from .image.macho import prepare_image
-    from .shaders.build import build_shader_pack
+    from .shaders.build import build_shader_pack, pending_shader_plan
 
     native.validate(context)
     context = replace(context, core_only=core_only)
@@ -265,20 +265,22 @@ def build(context, core_only=False):
                 if adapter
                 else None
             )
-            prepare_image(raw, context.work, patch)
+            main_image = prepare_image(raw, context.work, patch)
+            from .image.collection import prepare_collection
+            prepare_collection(source, context.identity.prefix, context.identity.executable, context.work, main_image)
             if context.development:
                 interface_catalogue(context)
             event("bundle")
             prepare_controller_catalogue(source, context.identity.prefix, context.work)
             bundle_header(context, source)
-            _, resources = prepare_app_identity(
-                source, context.identity.prefix, context.info, context.work
-            )
             exclusions = adapter.catalog_exclusions() if adapter else ()
             catalog = (
                 prepare_asset_catalog(source, context.identity.prefix, context.work, exclusions)
                 if not core_only
                 else []
+            )
+            _, resources = prepare_app_identity(
+                source, context.identity.prefix, context.info, context.work, catalog
             )
             launch_screen = prepare_launch_screen(source, context.identity.prefix, context.info, resources, catalog) if not core_only else None
             overlays = adapter.resources(context, source) if adapter else {}
@@ -299,16 +301,15 @@ def build(context, core_only=False):
             if adapter:
                 plan = adapter.shader_plan(context, source)
             else:
-                if not core_only and any(
-                    name.startswith(context.identity.prefix) and name.endswith(".metallib")
-                    for name in source.namelist()
-                ):
-                    raise ValueError("Metal libraries need an explicit validated shader plan")
-                plan = dict(
-                    executable=context.identity.prefix + context.identity.executable,
-                    libraries=[],
-                    shaders={},
-                )
+                has_metal = any(name.startswith(context.identity.prefix) and name.endswith('.metallib') for name in source.namelist())
+                allow_pending = context.host.get('allow_incomplete_shaders', False)
+                if allow_pending and not context.development:
+                    raise ValueError('Incomplete shaders are permitted only in an explicitly configured dev build')
+                if has_metal and not core_only and not allow_pending:
+                    raise ValueError('Metal libraries need an explicit validated shader plan')
+                plan = (dict(executable=context.identity.prefix + context.identity.executable, libraries=[], shaders={})
+                        if core_only or not has_metal else pending_shader_plan(source, context.identity.prefix,
+                            context.identity.prefix + context.identity.executable, context.work))
             build_shader_pack(source, context.work, plan)
             event("native")
             native.generate_descriptors(context.work)

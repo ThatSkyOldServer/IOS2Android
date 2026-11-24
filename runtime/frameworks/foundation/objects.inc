@@ -236,6 +236,10 @@ static Word collection_init_file(Word object,const char *selector,Word path) { W
 static Word collection_url(Word cls,const char *selector,Word url) { return url && url_is_file((void *)url) ? collection_file(cls,selector,url_path((void *)url)) : 0; }
 static Word collection_init_url(Word object,const char *selector,Word url) { Word result=collection_url(read_word(object),selector,url); free((void *)object); return result; }
 static Word method_for_selector(Word object,const char *selector,const char *action) { return (Word)find_implementation(object,action); }
+static Word instance_method_for_selector(Word cls,const char *selector,const char *action) {
+    Word prototype=cls;
+    return action ? (Word)find_implementation((Word)&prototype,action) : 0;
+}
 static Method foundation_value_method(Word object,const char *selector,const char *receiver,int class_receiver) {
     if(receiver && !class_receiver && !strcmp(receiver,"_OBJC_CLASS_$_NSProcessInfo")){
         if(!strcmp(selector,"beginActivityWithOptions:reason:"))return (Method)process_begin_activity;
@@ -243,6 +247,7 @@ static Method foundation_value_method(Word object,const char *selector,const cha
     }
     if (!strcmp(selector,"isEqual:") || !strcmp(selector,"isEqualToDictionary:") || !strcmp(selector,"isEqualToArray:")) return (Method)equal_objects;
     if (!strcmp(selector,"methodForSelector:")) return (Method)method_for_selector;
+    if ((class_receiver || guest_class_object(object)) && !strcmp(selector,"instanceMethodForSelector:")) return (Method)instance_method_for_selector;
     if (!receiver) return NULL;
     int plist_collection=!strcmp(receiver,"_OBJC_CLASS_$_NSDictionary") || !strcmp(receiver,"_OBJC_CLASS_$_NSMutableDictionary") || !strcmp(receiver,"_OBJC_CLASS_$_NSArray") || !strcmp(receiver,"_OBJC_CLASS_$_NSMutableArray");
     if (plist_collection) {

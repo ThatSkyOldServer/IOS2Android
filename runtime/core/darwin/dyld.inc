@@ -15,6 +15,24 @@ static struct GuestLibrary guest_libraries[]={
     {"libc++","_Z",0,0},{"libsqlite3","sqlite3_",0,0}
 };
 static pthread_mutex_t guest_library_mutex=PTHREAD_MUTEX_INITIALIZER;
+#ifdef I2A_GUEST_COLLECTION
+struct EmbeddedLibraryHandle { unsigned references; };
+static struct EmbeddedLibraryHandle embedded_library_handles[COUNT(guest_images)];
+static int embedded_library_path(const char *path) {
+    if(!path)return -1;
+    for(unsigned i=0;i<COUNT(guest_images);++i){
+        const char *relative=guest_images[i].path;size_t n=strlen(path),m=strlen(relative);
+        if(!strcmp(path,guest_images[i].install_name) || !strcmp(path,relative) ||
+           (n>m && path[n-m-1]=='/' && !strcmp(path+n-m,relative)))return (int)i;
+    }
+    return -1;
+}
+static int embedded_library_handle(intptr_t handle) {
+    for(unsigned i=0;i<COUNT(guest_images);++i)if(handle==(intptr_t)&embedded_library_handles[i])return (int)i;
+    return -1;
+}
+static Word guest_collection_export(const char *,int);
+#endif
 static _Thread_local char guest_library_error[384];
 static _Thread_local int guest_library_error_pending;
 static void guest_library_fail(const char *operation,const char *detail) {
@@ -56,6 +74,15 @@ static void *guest_library_open(const char *path,int mode) {
     if ((mode&~(1|2|4|8|16|128|256)) || (mode&3)==3 || (mode&12)==12) {
         guest_library_fail("dlopen","invalid Darwin mode"); return NULL;
     }
+#ifdef I2A_GUEST_COLLECTION
+    int embedded=embedded_library_path(path);
+    if(embedded>=0){
+        pthread_mutex_lock(&guest_library_mutex);
+        ++embedded_library_handles[embedded].references;
+        pthread_mutex_unlock(&guest_library_mutex);
+        return &embedded_library_handles[embedded];
+    }
+#endif
     struct GuestLibrary *library=guest_library_path(path);
     if (!library) { guest_library_fail("dlopen",path); return NULL; }
     pthread_once(&guest_library_once,guest_library_initialize);
@@ -74,6 +101,16 @@ static void *guest_library_open(const char *path,int mode) {
 }
 static int guest_library_close(void *handle) {
     pthread_mutex_lock(&guest_library_mutex);
+#ifdef I2A_GUEST_COLLECTION
+    int embedded=embedded_library_handle((intptr_t)handle);
+    if(embedded>=0){
+        unsigned *references=&embedded_library_handles[embedded].references;
+        int valid=*references!=0;if(valid)--*references;
+        pthread_mutex_unlock(&guest_library_mutex);
+        if(!valid)guest_library_fail("dlclose","invalid handle");
+        return valid ? 0 : -1;
+    }
+#endif
     struct GuestLibrary *library=guest_library_handle((intptr_t)handle);
     if (!library || !library->references) {
         pthread_mutex_unlock(&guest_library_mutex); guest_library_fail("dlclose","invalid handle"); return -1;
@@ -81,7 +118,12 @@ static int guest_library_close(void *handle) {
     --library->references; if (!library->references && !library->resident && !library->nodelete) library->global=0;
     pthread_mutex_unlock(&guest_library_mutex); return 0;
 }
-static int guest_library_preflight(const char *path) { return guest_library_path(path)!=NULL; }
+static int guest_library_preflight(const char *path) {
+#ifdef I2A_GUEST_COLLECTION
+    if(embedded_library_path(path)>=0)return 1;
+#endif
+    return guest_library_path(path)!=NULL;
+}
 static int guest_library_matches(const struct GuestLibrary *library,const char *name) {
     if (!library->prefixes[0]) return 1;
     if (!strncmp(name,"OBJC_CLASS_$_",13)) name+=13;
@@ -101,13 +143,46 @@ static int guest_library_exports(const struct GuestLibrary *library,const char *
     return library==guest_libraries || (library==guest_libraries+1 ? guest_library_owner(name)==library : guest_library_matches(library,name));
 }
 
+#ifdef I2A_GUEST_COLLECTION
+static uint32_t guest_image_count(void) { return COUNT(guest_images); }
+static const void *guest_image_header(uint32_t index) { return index<COUNT(guest_images) ? guest_images[index].address : NULL; }
+static intptr_t guest_image_slide(uint32_t index) { return index<COUNT(guest_images) ? (intptr_t)((Word)guest_images[index].address-guest_images[index].native_base) : 0; }
+static const char *guest_image_name(uint32_t index) { return index<COUNT(guest_images) ? guest_images[index].path : NULL; }
+static int guest_image_index(Word address) {
+    size_t first=0,last=COUNT(guest_images);
+    while(first<last){size_t middle=first+(last-first)/2;if((Word)guest_images[middle].address<=address)first=middle+1;else last=middle;}
+    return first && address-(Word)guest_images[first-1].address<guest_images[first-1].size ? (int)(first-1) : -1;
+}
+static Word guest_collection_export(const char *name,int image) {
+    size_t first=0,last=COUNT(guest_defined_exports);
+    while(first<last){size_t middle=first+(last-first)/2;if(strcmp(guest_defined_exports[middle].name,name)<0)first=middle+1;else last=middle;}
+    for(size_t i=first;i<COUNT(guest_defined_exports) && !strcmp(guest_defined_exports[i].name,name);++i){
+        const struct I2AGuestExport *entry=guest_defined_exports+i;
+        if(image>=0 && entry->image!=(unsigned)image)continue;
+        if(entry->kind==0)return (Word)guest_images[entry->image].address+entry->value;
+        if(entry->kind==2)return entry->value;
+        stop("Unsupported thread-local export",name);
+    }
+    return 0;
+}
+#else
 static uint32_t guest_image_count(void) { return 1; }
 static const void *guest_image_header(uint32_t index) { return index ? NULL : (void *)aslr; }
 static intptr_t guest_image_slide(uint32_t index) { return index ? 0 : (intptr_t)(aslr-GUEST_IMAGE_BASE); }
 static const char *guest_image_name(uint32_t index) { return index ? NULL : GUEST_IMAGE_PATH; }
+#endif
+static Word guest_native_address(Word address) {
+    if(!in_image(address))return 0;
+#ifdef I2A_GUEST_COLLECTION
+    int image=guest_image_index(address);
+    return image<0 ? 0 : guest_images[image].native_base+address-(Word)guest_images[image].address;
+#else
+    return GUEST_IMAGE_BASE+address-aslr;
+#endif
+}
 typedef void (*ImageCallback)(const void *,intptr_t);
 static void guest_register_add_image(ImageCallback callback) {
-    if (callback) callback((void *)aslr,guest_image_slide(0));
+    if (callback) for(unsigned i=0;i<guest_image_count();++i) callback(guest_image_header(i),guest_image_slide(i));
 }
 static void guest_register_remove_image(ImageCallback callback) {
      
@@ -133,6 +208,39 @@ static const void *guest_section64(const void *header,const char *segment,const 
             }
         }
         command+=size;
+    }
+    return NULL;
+}
+static const void *guest_section_data(const void *header,const char *segment,const char *section,unsigned long *size) {
+    if(size)*size=0;
+    const unsigned char *record=guest_section64(header,segment,section);
+    if(!record)return NULL;
+    uint64_t address,length;memcpy(&address,record+32,8);memcpy(&length,record+40,8);
+    for(unsigned i=0;i<guest_image_count();++i)if(guest_image_header(i)==header){
+        Word pointer=address+guest_image_slide(i);
+        if(!length || !image_segment_for(pointer,length))return NULL;
+        if(size)*size=length;return (void *)pointer;
+    }
+    return NULL;
+}
+static const void *guest_segment_data(const void *header,const char *segment,unsigned long *size) {
+    if(size)*size=0;
+    if(!header || !segment || !image_segment_for((Word)header,32))return NULL;
+    const uint32_t *words=header;
+    if(words[0]!=0xfeedfacf || !image_segment_for((Word)header,32+(size_t)words[5]))return NULL;
+    intptr_t slide=0;int known=0;
+    for(unsigned i=0;i<guest_image_count();++i)if(guest_image_header(i)==header){slide=guest_image_slide(i);known=1;break;}
+    if(!known)return NULL;
+    const unsigned char *command=(const unsigned char *)header+32,*end=command+words[5];
+    for(unsigned i=0;i<words[4] && (size_t)(end-command)>=8;++i){
+        uint32_t kind,bytes;memcpy(&kind,command,4);memcpy(&bytes,command+4,4);
+        if(bytes<8 || bytes>(size_t)(end-command))return NULL;
+        if(kind==0x19 && bytes>=72 && !strncmp((const char *)command+8,segment,16)){
+            uint64_t address,length;memcpy(&address,command+24,8);memcpy(&length,command+32,8);
+            Word pointer=address+slide;if(!length || !image_segment_for(pointer,length))return NULL;
+            if(size)*size=length;return (void *)pointer;
+        }
+        command+=bytes;
     }
     return NULL;
 }
@@ -180,7 +288,11 @@ static int32_t guest_runtime_library_version(const char *name) {
     }
     return -1;
 }
+static const void *guest_main_image_header(void) { return guest_image_header(0); }
 static Word resolve_dyld_import(const char *name) {
+    if (!strcmp(name,"__NSGetMachExecuteHeader")) return (Word)guest_main_image_header;
+    if (!strcmp(name,"_getsegmentdata")) return (Word)guest_segment_data;
+    if (!strcmp(name,"_getsectiondata")) return (Word)guest_section_data;
     if (!strcmp(name,"_NSVersionOfLinkTimeLibrary")) return (Word)guest_link_library_version;
     if (!strcmp(name,"_NSVersionOfRunTimeLibrary")) return (Word)guest_runtime_library_version;
     if (!strcmp(name,"_dlopen")) return (Word)guest_library_open;

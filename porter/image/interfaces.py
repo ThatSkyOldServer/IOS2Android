@@ -12,7 +12,7 @@ import struct
 import capstone
 import lief
 
-REVISION = 4
+REVISION = 6
 FACTORY_RETURN_CLASSES = {
     ('PHImageManager', 'defaultManager'): 'PHImageManager',
     ('NSNotificationQueue', 'defaultQueue'): 'NSNotificationQueue',
@@ -53,6 +53,7 @@ def scan_interfaces(binary):
         return struct.unpack('<Q', data)[0] if len(data) == 8 else 0
 
     def string(address):
+        address &= 0x00ffffffffffffff
         for start, end, offset in sections:
             if start <= address < end:
                 position = offset + address - start
@@ -63,20 +64,36 @@ def scan_interfaces(binary):
     stubs = image.get_section('__stubs')
     indirect = list(image.dynamic_symbol_command.indirect_symbols)
     imports = {stubs.virtual_address + i * stubs.reserved2: s.name for i, s in enumerate(
-        indirect[stubs.reserved1:stubs.reserved1 + stubs.size // stubs.reserved2])}
+        indirect[stubs.reserved1:stubs.reserved1 + stubs.size // stubs.reserved2])} if stubs and stubs.reserved2 else {}
     section = image.get_section('__objc_selrefs')
-    selectors = {section.virtual_address + i: string(word(section.virtual_address + i)) for i in range(0, section.size, 8)}
+    selectors = {section.virtual_address + i: string(word(section.virtual_address + i)) for i in range(0, section.size, 8)} if section else {}
     classes, owners, ivars, properties = {}, {}, {}, {}
 
     def methods(address, owner, class_method):
         if not address:
             return
-        size, count = struct.unpack('<II', read(address, 8))
-        if size != 24:
+        header = read(address, 8)
+        if len(header) != 8:
+            raise ValueError(f'Method table outside file-backed metadata at {address:#x}')
+        flags, count = struct.unpack('<II', header)
+        relative = bool(flags & 0x80000000)
+        size = flags & 0xfffc
+        if size != (12 if relative else 24):
             raise ValueError(f'Unsupported method table at {address:#x}')
         for i in range(count):
-            entry = address + 8 + i * 24
-            owners[word(entry + 16)] = (owner, class_method, string(word(entry)))
+            entry = address + 8 + i * size
+            if relative:
+                encoded = read(entry, 12)
+                if len(encoded) != 12:
+                    raise ValueError(f'Truncated relative method entry at {entry:#x}')
+                selector, _, implementation = struct.unpack('<iii', encoded)
+                selector += entry
+                if not flags & 0x40000000:
+                    selector = word(selector)
+                implementation += entry + 8
+            else:
+                selector, implementation = word(entry), word(entry + 16)
+            owners[implementation] = (owner, class_method, string(selector))
 
     def class_identity(address):
         bound = bindings.get(address)
@@ -84,7 +101,8 @@ def scan_interfaces(binary):
             return bound.removeprefix('_OBJC_CLASS_$_')
         return classes.get(word(address))
 
-    for (address,) in struct.iter_unpack('<Q', bytes(image.get_section('__objc_classlist').content)):
+    class_list = image.get_section('__objc_classlist')
+    for (address,) in struct.iter_unpack('<Q', bytes(class_list.content) if class_list else b''):
         ro = word(address + 32) & ~7
         classes[address] = string(word(ro + 24))
     for address, name in classes.items():

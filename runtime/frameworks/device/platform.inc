@@ -69,7 +69,7 @@ static Method platform_method(Word object,const char *selector,const char *recei
         if (class_receiver && (!strcmp(selector,"currentLocale") || !strcmp(selector,"systemLocale"))) return (Method)current_locale;
         if (!class_receiver && !strcmp(selector,"localeIdentifier")) return (Method)locale_identifier;
     }
-    if (object==(Word)&process_info) {
+    if (!class_receiver && !strcmp(receiver,"_OBJC_CLASS_$_NSProcessInfo")) {
         if (!strcmp(selector,"operatingSystemVersion")) return (Method)operating_system_version;
         if (!strcmp(selector,"isOperatingSystemAtLeastVersion:")) return (Method)version_at_least;
     }

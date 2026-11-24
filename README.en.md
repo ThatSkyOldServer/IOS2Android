@@ -62,6 +62,8 @@ The CLI provides `inspect`, `build`, `check-core`, and `shader`. The `check-core
 
 External adapters supply application patches, resource replacements, service configuration, and shader translation rules. Keep IPAs, toolchains, configuration, signing keys, adapters, and build outputs outside the repository.
 
+Metal applications without a shader plan fail the build by default. A dev configuration used for startup diagnosis may explicitly set `android.host.allow_incomplete_shaders=true` to retain pending library metadata; using those libraries still reports missing translation. This option is not available for release builds.
+
 Online services reuse portable endpoints and configuration from the original application where available. iOS account, payment, push, and third-party platform identifiers cannot be used directly on Android. Without compatible configuration, the runtime reports failure or unavailability. Helpshift can use its web backend when a valid domain is available.
 
 Resources are normally read from the installed APK. A real-path requirement or unavailable shared-memory support is handled per file; temporary mapping files are released when no longer in use. Startup removes resource copies left by older runtime versions. Shaders and driver compilation results are cached in private storage. Updates remove old caches even when the application version stays the same. Unavailable caches are regenerated.
@@ -73,7 +75,9 @@ APKs are written to `out/<application-id>/<CFBundleVersion>/dev|release/` in the
 The runtime targets ARM64 Android 9 and later. Window, picker, and permission APIs are selected according to platform capabilities. GPU drivers, WebView, photo providers, and location services still affect feature availability. Validation does not cover every Android version or vendor ROM.
 
 - General Foundation/UIKit object destruction remains incomplete. Automatic weak-reference clearing currently covers only objects whose lifetimes are managed by the runtime.
-- Encrypted binaries and chained fixups are not supported. Dynamic library and symbol loading also have coverage limits.
+- Encrypted binaries, chained fixups, reexports, and resolver exports are unsupported. Dependency collection is limited to resolvable ARM64 images in the original IPA; loading new images at runtime and binding thread-local exports across images remain unimplemented.
+- System Swift libraries are not supplied automatically. Dynamic class relocation, full bridging between Swift objects and host Foundation objects, and Core Data persistence remain unimplemented.
+- Full CoreUI trait selection remains unimplemented. Ambiguous atlases or default rendition aliases remain unavailable, and original catalogs are retained.
 - Scene lifecycle, complex NIBs, layout, animation, general scrolling, and text editing still have compatibility gaps; not every native interface can be rendered.
 - Tables still lack constraint-based automatic row heights, NIB cells, editing/reordering, insertion/deletion animations, and complete grouped styling. Offscreen row geometry may use estimated heights.
 - Web pages support basic loading and interaction. Multiple windows, downloads, and some navigation and scripting APIs remain unsupported.
@@ -97,5 +101,7 @@ Source repository: [ThatSkyOldServer/IOS2Android](https://github.com/ThatSkyOldS
 - Every redistribution must include the `LICENSE` text or its official URL and preserve every line beginning with `Required Notice:` in [NOTICE](NOTICE), including the authors and source repository URL.
 - Redistribution and subsequent use remain subject to the noncommercial terms. The project and modified versions may not be used commercially or for profit, and project code may not be republished under a license that permits commercial use.
 - Third-party tools, libraries, and SDKs retain their own licenses and attribution requirements. This license does not authorize redistribution of the original iOS applications, their assets, or third-party dependencies. Distributing them requires separate permission or compliance with their applicable licenses.
+
+The runtime LZFSE decoder comes from Apple under its [BSD-3-Clause license](third_party/lzfse/LICENSE). The license text is also included in generated APKs.
 
 See `LICENSE` for the complete and governing terms.

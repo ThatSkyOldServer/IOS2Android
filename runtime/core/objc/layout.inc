@@ -2,21 +2,26 @@
  * visible in that translation unit. libobjc normally slides subclass ivars
  * when the loaded superclass is larger. This is runtime realization, not a
  * patch to the original executable's instructions or on-disk metadata. */
-struct ClassLayout { Word cls; uint32_t size; unsigned visiting,done,initialization; pthread_t initializer; };
-static struct ClassLayout class_layouts[CLASSES_COUNT];
 static unsigned moved_classes,moved_ivars;
 static pthread_mutex_t initialize_mutex=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t initialize_condition=PTHREAD_COND_INITIALIZER;
+static int class_ro_valid(Word cls,Word ro) {
+    if(image_segment_for(ro,72))return 1;
+    struct ClassLayout *layout=class_layout(cls);
+    return layout && __atomic_load_n(&layout->ro_copy,__ATOMIC_ACQUIRE)==ro;
+}
 
 static uint32_t external_instance_size(Word cls) {
     const char *name=host_symbol(cls);
     if (!name) return 8;
     if (!strcmp(name,"_OBJC_CLASS_$_NSOperation") || !strcmp(name,"_OBJC_CLASS_$_NSBlockOperation") || !strcmp(name,"_OBJC_CLASS_$_NSInvocationOperation")) return 24;
+    /* Abstract collection bases contribute only isa to guest subclasses.
+     * Host container payloads belong to the host allocation, not this ABI. */
     if (!strcmp(name,"_OBJC_CLASS_$_NSArray") || !strcmp(name,"_OBJC_CLASS_$_NSMutableArray") ||
-        !strcmp(name,"_OBJC_CLASS_$_NSSet") || !strcmp(name,"_OBJC_CLASS_$_NSMutableSet")) return sizeof(struct Sequence);
-    if (!strcmp(name,"_OBJC_CLASS_$_NSDictionary") || !strcmp(name,"_OBJC_CLASS_$_NSMutableDictionary")) return sizeof(struct GuestMap);
+        !strcmp(name,"_OBJC_CLASS_$_NSSet") || !strcmp(name,"_OBJC_CLASS_$_NSMutableSet") ||
+        !strcmp(name,"_OBJC_CLASS_$_NSDictionary") || !strcmp(name,"_OBJC_CLASS_$_NSMutableDictionary")) return sizeof(Word);
     if (!strcmp(name,"_OBJC_CLASS_$_NSString") || !strcmp(name,"_OBJC_CLASS_$_NSMutableString") ||
-        !strcmp(name,"_OBJC_CLASS_$_NSData") || !strcmp(name,"_OBJC_CLASS_$_NSMutableData")) return sizeof(struct HostObject);
+        !strcmp(name,"_OBJC_CLASS_$_NSData") || !strcmp(name,"_OBJC_CLASS_$_NSMutableData")) return sizeof(Word);
     if (!strcmp(name,"_OBJC_CLASS_$_NSRecursiveLock")) return 24;
     if (!strcmp(name,"_OBJC_CLASS_$_NSSortDescriptor")) return sizeof(struct HostObject);
     if (!strcmp(name,"_OBJC_CLASS_$_UIAlertController")) return sizeof(struct UIKitAlert);
@@ -29,19 +34,43 @@ static uint32_t external_instance_size(Word cls) {
     return 8;  
 }
 
-static uint32_t realize_class_layout(Word cls,unsigned depth) {
+static Word swift_metadata_initializer(Word cls) {
+    if (!in_image(cls) || !(read_word(cls+32)&3)) return 0;
+    Word ro=read_word(cls+32)&~(Word)7;
+    const struct I2AImageSegment *region=image_segment_for(ro,72);
+    struct ClassLayout *layout=class_layout(cls);
+    int copied=layout && __atomic_load_n(&layout->ro_copy,__ATOMIC_ACQUIRE)==ro;
+    if (!region && !copied) stop("Invalid Swift class metadata",class_name(cls));
+    uint32_t flags; memcpy(&flags,(void *)ro,4);
+    if (!(flags&(1U<<6))) return 0;
+    if (!copied && !image_segment_for(ro,80)) stop("Truncated Swift metadata initializer",class_name(cls));
+    Word initializer=read_word(ro+72);
+    region=image_segment_for(initializer,4);
+    if (!region || !(region->initial&PROT_EXEC)) stop("Invalid Swift metadata initializer",class_name(cls));
+    return initializer;
+}
+static uint32_t realize_class_layout_body(Word cls,unsigned depth) {
     if (!cls) return 0;
     if (!in_image(cls)) return external_instance_size(cls);
     if (depth>=128) stop("Invalid class inheritance depth","Objective-C realization");
-    struct ClassLayout *layout=NULL;
-    for (unsigned i=0;i<CLASSES_COUNT;++i) if (class_layouts[i].cls==cls) { layout=class_layouts+i; break; }
+    struct ClassLayout *layout=class_layout(cls);
     if (!layout) stop("Unlisted superclass","Objective-C realization");
     if (layout->done) return layout->size;
+    Word swift_initializer=swift_metadata_initializer(cls);
+    if (swift_initializer && layout->swift_initialization!=2) {
+        if (layout->swift_initialization==1) stop("Recursive Swift metadata initialization",class_name(cls));
+        layout->swift_initialization=1;
+        LOG("Swift metadata initializer: %s at 0x%lx",class_name(cls),swift_initializer-aslr+GUEST_IMAGE_BASE);
+        Word result=((Word (*)(Word,Word))swift_initializer)(cls,0);
+        if (result!=cls) stop("Unsupported relocated Swift class",class_name(cls));
+        if (!layout->done) stop("Swift initializer did not realize class",class_name(cls));
+        return layout->size;
+    }
     if (layout->visiting) stop("Cyclic class inheritance",class_name(cls));
     layout->visiting=1;
     uint32_t super_size=realize_class_layout(read_word(cls+8),depth+1);
     Word ro=read_word(cls+32)&~(Word)7;
-    if (!in_image(ro)) stop("Invalid class metadata",class_name(cls));
+    if (!class_ro_valid(cls,ro)) stop("Invalid class metadata",class_name(cls));
     uint32_t start,size;
     memcpy(&start,(void *)(ro+4),4); memcpy(&size,(void *)(ro+8),4);
     if (size<start) stop("Invalid instance bounds",class_name(cls));
@@ -65,64 +94,142 @@ static uint32_t realize_class_layout(Word cls,unsigned depth) {
         for (uint32_t i=0;i<count;++i) {
             Word pointer=read_word(ivars+8+32*i);
             if (!pointer) continue;
-            if (!in_image(pointer)) stop("Invalid ivar offset pointer",class_name(cls));
+            const struct I2AImageSegment *region=image_segment_for(pointer,4);
+            if (!region || !(region->initial&PROT_WRITE)) stop("Ivar offset cannot be relocated",class_name(cls));
             uint32_t offset;
             memcpy(&offset,(void *)pointer,4);
             if (offset<start || delta>INT32_MAX-offset) stop("Invalid realized ivar",class_name(cls));
             offset+=(uint32_t)delta;
             memcpy((void *)pointer,&offset,4);
-            ++moved_ivars;
+            __atomic_fetch_add(&moved_ivars,1,__ATOMIC_RELAXED);
         }
+        /* libobjc copies class_ro_t before changing instance bounds. Its
+         * original may live in an executable/read-only segment. */
+        uint32_t flags;memcpy(&flags,(void *)ro,4);
+        size_t ro_bytes=(flags&(1U<<6)) ? 80 : 72;
+        void *copy=malloc(ro_bytes);
+        if(!copy)stop("Allocation failed","realized class metadata");
+        memcpy(copy,(void *)ro,ro_bytes);
+        const struct I2AImageSegment *class_region=image_segment_for(cls+32,8);
+        if(!class_region || !(class_region->initial&PROT_WRITE)){free(copy);stop("Class metadata pointer is read-only",class_name(cls));}
+        ro=(Word)copy;
         start+=(uint32_t)delta; size+=(uint32_t)delta;
         memcpy((void *)(ro+4),&start,4); memcpy((void *)(ro+8),&size,4);
-        ++moved_classes;
+        __atomic_store_n(&layout->ro_copy,ro,__ATOMIC_RELEASE);
+        __atomic_store_n((Word *)(cls+32),ro|(read_word(cls+32)&7),__ATOMIC_RELEASE);
+        __atomic_fetch_add(&moved_classes,1,__ATOMIC_RELAXED);
     }
     layout->size=size; layout->done=1; layout->visiting=0;
     return size;
 }
 
+static uint32_t realize_class_layout(Word cls,unsigned depth) {
+    if(!cls)return 0;
+    if(!in_image(cls))return external_instance_size(cls);
+    struct ClassLayout *layout=class_layout(cls);
+    if(!layout)stop("Unlisted superclass","Objective-C realization");
+    if(__atomic_load_n(&layout->realization,__ATOMIC_ACQUIRE)==2)return layout->size;
+    pthread_mutex_lock(&realization_mutex);
+    while(layout->realization==1 && !pthread_equal(layout->realizer,pthread_self()))
+        pthread_cond_wait(&realization_condition,&realization_mutex);
+    unsigned state=layout->realization;
+    if(!state){layout->realizer=pthread_self();__atomic_store_n(&layout->realization,1,__ATOMIC_RELEASE);}
+    pthread_mutex_unlock(&realization_mutex);
+    if(state==2)return layout->size;
+    if(state==3)stop("Class realization previously failed",class_name(cls));
+    if(state==1){
+        if(layout->swift_initialization==2 && !layout->visiting)return realize_class_layout_body(cls,depth);
+        stop("Recursive class realization",class_name(cls));
+    }
+    struct GuestCallBoundary call={.previous=active_guest_call_boundary};
+    active_guest_call_boundary=&call;
+    int failed=setjmp(call.environment);
+    if(!failed)realize_class_layout_body(cls,depth);
+    active_guest_call_boundary=call.previous;
+    pthread_mutex_lock(&realization_mutex);
+    __atomic_store_n(&layout->realization,failed ? 3U : 2U,__ATOMIC_RELEASE);
+    pthread_cond_broadcast(&realization_condition);
+    pthread_mutex_unlock(&realization_mutex);
+    if(failed)propagate_guest_failure();
+    return layout->size;
+}
+
+static Word realize_class_from_swift(Word cls,Word previous) {
+    if (!cls || (previous && previous!=cls)) stop("Unsupported Swift class relocation","_objc_realizeClassFromSwift");
+    struct ClassLayout *layout=class_layout(cls);
+    if(layout){
+        pthread_mutex_lock(&realization_mutex);
+        while(layout->realization==1 && !pthread_equal(layout->realizer,pthread_self()))
+            pthread_cond_wait(&realization_condition,&realization_mutex);
+        layout->swift_initialization=2;
+        pthread_mutex_unlock(&realization_mutex);
+        realize_class_layout(cls,0);
+        return cls;
+    }
+    stop("Unregistered Swift class","_objc_realizeClassFromSwift");
+}
 static void realize_class_layouts(void) {
     const Word *classes=(const Word *)(aslr+CLASSES_OFFSET);
-    for (unsigned i=0;i<CLASSES_COUNT;++i) class_layouts[i].cls=classes[i];
-    for (unsigned i=0;i<CLASSES_COUNT;++i) realize_class_layout(classes[i],0);
-    LOG("Objective-C instance layouts realized: %u classes, %u ivar offsets adjusted",moved_classes,moved_ivars);
+    for(unsigned i=0;i<CLASSES_COUNT;++i){
+        class_layouts[i].cls=classes[i];
+        size_t slot=class_pointer_bucket(classes[i],COUNT(class_layout_index));
+        while(class_layout_index[slot])slot=(slot+1)%COUNT(class_layout_index);
+        class_layout_index[slot]=i+1;
+    }
+    const Word *categories=(const Word *)(aslr+CATEGORIES_OFFSET);
+    unsigned count=0;
+    for(unsigned i=0;i<CATEGORIES_COUNT;++i){
+        Word category=categories[i],cls=read_word(category+8);
+        if(!cls)continue;
+        for(unsigned meta=0;meta<2;++meta){
+            Word target=meta ? read_word(cls) : cls;
+            if(!target)continue;
+            size_t bucket=class_pointer_bucket(target,COUNT(category_buckets));
+            category_methods[++count]=(struct CategoryMethods){target,category+16+8*meta,category_buckets[bucket]};
+            category_buckets[bucket]=count;
+        }
+    }
+    class_layouts_ready=1;
+    LOG("Objective-C classes registered for lazy realization: %u",CLASSES_COUNT);
 }
 
 static void initialize_guest_class(Word cls) {
     struct DynamicClass *dynamic=dynamic_class(cls);
-    if (dynamic) {
-        if (cls!=(Word)dynamic->words || __atomic_load_n(&dynamic->initialization,__ATOMIC_ACQUIRE)==2) return;
-        initialize_guest_class(dynamic->words[1]);
-        pthread_mutex_lock(&initialize_mutex);
-        while (dynamic->initialization==1 && !pthread_equal(dynamic->initializer,pthread_self())) pthread_cond_wait(&initialize_condition,&initialize_mutex);
-        if (dynamic->initialization) { pthread_mutex_unlock(&initialize_mutex); return; }
-        dynamic->initializer=pthread_self(); __atomic_store_n(&dynamic->initialization,1,__ATOMIC_RELEASE);
-        pthread_mutex_unlock(&initialize_mutex);
-        Method method=lookup(dynamic->words[0],"initialize");
-        if (method) method(cls,"initialize",0,0,0,0);
-        pthread_mutex_lock(&initialize_mutex); __atomic_store_n(&dynamic->initialization,2,__ATOMIC_RELEASE);
-        pthread_cond_broadcast(&initialize_condition); pthread_mutex_unlock(&initialize_mutex); return;
+    unsigned *state;pthread_t *owner;Word superclass,metaclass;
+    if(dynamic){
+        if(cls!=(Word)dynamic->words)return;
+        state=&dynamic->initialization;owner=&dynamic->initializer;
+        superclass=dynamic->words[1];metaclass=dynamic->words[0];
+    }else{
+        if(!in_image(cls))return;
+        realize_class_layout(cls,0);
+        struct ClassLayout *layout=class_layout(cls);
+        if(!layout)return;
+        state=&layout->initialization;owner=&layout->initializer;
+        superclass=read_word(cls+8);metaclass=read_word(cls);
     }
-    if (!in_image(cls)) return;
-    struct ClassLayout *layout=NULL;
-    for (unsigned i=0;i<CLASSES_COUNT;++i) if (class_layouts[i].cls==cls) { layout=class_layouts+i; break; }
-    if (!layout || __atomic_load_n(&layout->initialization,__ATOMIC_ACQUIRE)==2) return;
-    initialize_guest_class(read_word(cls+8));
+    if(__atomic_load_n(state,__ATOMIC_ACQUIRE)==2)return;
+    initialize_guest_class(superclass);
     pthread_mutex_lock(&initialize_mutex);
-    while (layout->initialization==1 && !pthread_equal(layout->initializer,pthread_self())) pthread_cond_wait(&initialize_condition,&initialize_mutex);
-    if (layout->initialization) { pthread_mutex_unlock(&initialize_mutex); return; }
-    layout->initializer=pthread_self();
-    __atomic_store_n(&layout->initialization,1,__ATOMIC_RELEASE);
+    while(*state==1 && !pthread_equal(*owner,pthread_self()))pthread_cond_wait(&initialize_condition,&initialize_mutex);
+    unsigned previous=*state;
+    if(!previous){*owner=pthread_self();__atomic_store_n(state,1,__ATOMIC_RELEASE);}
     pthread_mutex_unlock(&initialize_mutex);
-    Method method=lookup(read_word(cls),"initialize");
-    if (method) {
-        LOG("+[%s initialize] 0x%lx",class_name(cls),(Word)method-aslr+GUEST_IMAGE_BASE);
-        method(cls,"initialize",0,0,0,0);
+    if(previous==3)stop("Class initialization previously failed",class_name(cls));
+    if(previous)return;
+    struct GuestCallBoundary call={.previous=active_guest_call_boundary};
+    active_guest_call_boundary=&call;
+    int failed=setjmp(call.environment);
+    if(!failed){
+        Method method=lookup(metaclass,"initialize");
+        if(method){LOG("+[%s initialize]",class_name(cls));method(cls,"initialize",0,0,0,0);}
     }
+    active_guest_call_boundary=call.previous;
     pthread_mutex_lock(&initialize_mutex);
-    __atomic_store_n(&layout->initialization,2,__ATOMIC_RELEASE);
+    __atomic_store_n(state,failed ? 3U : 2U,__ATOMIC_RELEASE);
     pthread_cond_broadcast(&initialize_condition);
     pthread_mutex_unlock(&initialize_mutex);
+    if(failed)propagate_guest_failure();
 }
 
 static void construct_guest_ivars(Word object,Word cls) {

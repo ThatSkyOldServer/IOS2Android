@@ -135,10 +135,12 @@ def archived_scene(source, folder, filename):
         raise ValueError('Startup colour has no archived components')
 
     def visit(index, parent):
+        if index in mapping:
+            return
         cls, fields = view_objects[index]
         actual=string(view_objects,fields['UIClassName']) if cls=='UIClassSwapper' else cls
         base=string(view_objects,fields['UIOriginalClassName']) if cls=='UIClassSwapper' else cls
-        if base not in ('UIView', 'UIImageView', 'UILabel', '_UILayoutGuide'):
+        if base not in ('UIView', 'UIImageView', 'UILabel', '_UILayoutGuide', 'UILayoutGuide'):
             raise ValueError(f'Unsupported startup view class {cls}')
         local = len(nodes)
         mapping[index] = local
@@ -151,7 +153,7 @@ def archived_scene(source, folder, filename):
                 raise ValueError(f'Unsupported startup image {image_cls}')
             image = string(view_objects, image_values['UIResourceName'])
         nodes.append({'class': actual, 'base': base, 'parent': parent, 'tag': fields.get('UITag', 0),
-                      'hidden': fields.get('UIHidden', False), 'alpha': fields.get('UIAlpha', 1),
+                      'hidden': fields.get('UIHidden', False) or base in ('_UILayoutGuide','UILayoutGuide'), 'alpha': fields.get('UIAlpha', 1),
                       'contentMode': fields.get('UIContentMode', 0), 'autoresizing': fields.get('UIAutoresizingMask', 0),
                       'interaction': not fields.get('UIUserInteractionDisabled', False), 'image': image,
                       'background': colour(fields.get('UIBackgroundColor')),
@@ -165,6 +167,9 @@ def archived_scene(source, folder, filename):
             visit(child, local)
 
     visit(root_index, -1)
+    for index,(cls,fields) in enumerate(view_objects):
+        if cls in ('UILayoutGuide','_UILayoutGuide') and fields.get('UILayoutGuideOwningView') in mapping:
+            visit(index,mapping[fields['UILayoutGuideOwningView']])
     for cls, fields in view_objects:
         if cls not in ('NSLayoutConstraint', '_UILayoutSupportConstraint'):
             continue

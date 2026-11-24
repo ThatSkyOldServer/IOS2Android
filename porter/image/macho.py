@@ -1,11 +1,9 @@
-import json
+from dataclasses import dataclass
 from pathlib import Path
-import struct
 import re
 
 from ..files import resolve_file
-from .. import IMAGE_ABI_VERSION, ImagePatchResult
-from .unwind import prepare_guest_unwind
+from .. import ImagePatchResult
 
 
 class ImageOverlay:
@@ -56,6 +54,32 @@ def binding_offset(raw, image, address, expected):
     raise ValueError(f'Native binding bytes differ at {address:#x}')
 
 
+def mapped_segments(image, byte_count):
+    base = image.imagebase
+    segments = sorted((s for s in image.segments if s.name != '__PAGEZERO' and s.virtual_size),
+                      key=lambda s: s.virtual_address)
+    if not segments or segments[0].virtual_address != base or segments[0].file_offset != 0 or not segments[0].file_size:
+        raise ValueError('The image header must start the first file-backed segment')
+    previous_end = base
+    for segment in segments:
+        if segment.virtual_address < previous_end or segment.virtual_address % 4096:
+            raise ValueError('Overlapping or unaligned mapped segment: ' + segment.name)
+        if segment.file_size > segment.virtual_size or segment.file_offset + segment.file_size > byte_count:
+            raise ValueError('Invalid file-backed segment bounds: ' + segment.name)
+        if segment.init_protection & ~segment.max_protection or segment.max_protection & ~7:
+            raise ValueError('Invalid segment protection: ' + segment.name)
+        previous_end = segment.virtual_address + segment.virtual_size
+        if previous_end - base > 0xffffffff:
+            raise ValueError('Mapped image exceeds the 32-bit fixup-offset contract')
+    return segments
+
+
+@dataclass(frozen=True)
+class PreparedImage:
+    image: object
+    executable: Path
+
+
 def prepare_image(raw, work, patch=None):
     import lief
     original = work / 'guest.bin'
@@ -66,20 +90,9 @@ def prepare_image(raw, work, patch=None):
     image = parsed.at(0)
     if int(image.header.cpu_type) != 0x0100000c or (image.has_encryption_info and image.encryption_info.crypt_id):
         raise ValueError('Unsupported or encrypted Mach-O image')
-    base = image.imagebase
-    text, data, links = [image.get_segment(name) for name in ('__TEXT', '__DATA', '__LINKEDIT')]
-    if any(segment is None for segment in (text, data, links)):
+    if any(image.get_segment(name) is None for name in ('__TEXT', '__DATA', '__LINKEDIT')):
         raise ValueError('Image ABI requires __TEXT, __DATA and __LINKEDIT')
-    supported = {'__PAGEZERO', '__TEXT', '__DATA', '__LINKEDIT'}
-    if any(s.name not in supported and s.virtual_size for s in image.segments):
-        raise ValueError('Additional mapped segments are unsupported by this image ABI')
-    if text.file_offset != 0 or text.virtual_address != base or data.virtual_address != base + text.file_size:
-        raise ValueError('Unsupported text/data layout')
-    if data.file_offset != data.virtual_address - base:
-        raise ValueError('Writable segment must preserve file/image offsets')
-    gap = links.virtual_address - data.virtual_address - data.file_size
-    if gap < 0 or any(s.file_offset + s.file_size > len(raw) for s in (text, data, links)):
-        raise ValueError('Invalid segment bounds')
+    mapped_segments(image, len(raw))
     executable = original
     if patch:
         result = patch(raw, image, work)
@@ -87,74 +100,7 @@ def prepare_image(raw, work, patch=None):
             raise ValueError('Adapter must return ImagePatchResult')
         executable = resolve_file(work, result.image)
         for name in result.files:
-            resolve_file(work,name)
+            resolve_file(work, name)
         if executable.stat().st_size != len(raw):
             raise ValueError('Image overlay must preserve the original file layout')
-    assembly = []
-    for section, flags, segment in [('text', 'ax', text), ('data', 'aw', data), ('links', 'a', links)]:
-        assembly += [f'.section .guest_{section},"{flags}",%progbits', '.balign 16384',
-                     f'.global guest_{section}', f'.hidden guest_{section}', f'guest_{section}:',
-                     f'.incbin "{executable.relative_to(work.resolve()).as_posix()}",{segment.file_offset},{segment.file_size}']
-    assembly += ['.section .guest_zero,"aw",%nobits', f'.space {gap}']
-    (work / 'layout.ld').write_text(f'''SECTIONS {{
- .guest_text ALIGN(16384) : {{ KEEP(*(.guest_text)) }}
- .guest_data ADDR(.guest_text) + {data.virtual_address-base} : {{ KEEP(*(.guest_data)) }}
- .guest_zero ADDR(.guest_data) + {data.file_size} (NOLOAD) : {{ KEEP(*(.guest_zero)) }}
- .guest_links ADDR(.guest_text) + {links.virtual_address-base} : {{ KEEP(*(.guest_links)) }}
-}} INSERT AFTER .bss;
-''', encoding='utf-8')
-    imports = sorted({binding.symbol.name for binding in image.bindings if not binding.symbol.value})
-    if len(imports) > 65536:
-        raise ValueError('Import gate count exceeds the image ABI')
-    indices = {name: index for index, name in enumerate(imports)}
-    stubs = image.get_section('__stubs')
-    indirect = list(image.dynamic_symbol_command.indirect_symbols)
-    if not stubs or not stubs.reserved2 or stubs.size % stubs.reserved2:
-        raise ValueError('Unsupported import stubs')
-    callable_names = {sym.name for sym in indirect[stubs.reserved1:stubs.reserved1+stubs.size//stubs.reserved2]}
-    bindings = {}
-    rebases = {item.address - base: None for item in image.relocations}
-    for item in image.bindings:
-        offset = item.address - base
-        if item.symbol.value:
-            rebases[offset] = item.symbol.value + item.addend - base
-            bindings.pop(offset, None)
-        else:
-            rebases.pop(offset, None)
-            bindings[offset] = (indices[item.symbol.name], item.addend)
-    for offset in [*rebases, *bindings]:
-        if not data.virtual_address-base <= offset <= data.virtual_address-base + data.file_size-8:
-            raise ValueError(f'Fixup outside writable segment at {offset:x}')
-    fixups = bytearray()
-    for offset, local in sorted(rebases.items()):
-        pointer = struct.unpack_from('<Q', raw, offset)[0] - base if local is None else local
-        fixups.extend(struct.pack('<IQ', offset, pointer))
-    (work / 'rebases.bin').write_bytes(fixups)
-    (work / 'binds.bin').write_bytes(b''.join(struct.pack('<IIq', off, idx, add) for off, (idx, add) in sorted(bindings.items())))
-    for name in ['rebases', 'binds']:
-        assembly += ['.section .rodata', '.balign 8', f'.global {name}', f'.hidden {name}',
-                     f'{name}:', f'.incbin "{name}.bin"']
-    assembly += prepare_guest_unwind(image, work)
-    assembly += ['.text', '.balign 4', '.global guest_gates', '.hidden guest_gates', 'guest_gates:']
-    for index in range(len(imports)):
-        assembly += [f'mov w0, #{index}', 'b missing_call']
-    assembly += ['.section .note.GNU-stack,"",%progbits']
-    (work / 'image.S').write_text('\n'.join(assembly)+'\n', encoding='utf-8')
-    header = [f'#define I2A_IMAGE_ABI {IMAGE_ABI_VERSION}', f'#define GUEST_IMAGE_BASE {base}UL',
-              f'#define GUEST_DATA_OFFSET {data.virtual_address-base}UL',
-              f'#define GUEST_LINKS_OFFSET {links.virtual_address-base}UL',
-              f'#define REBASE_COUNT {len(rebases)}', f'#define BIND_COUNT {len(bindings)}',
-              f'#define ENTRY {image.entrypoint-base}', f'#define IMAGE_END {links.virtual_address-base+links.file_size}']
-    for key, name in [('INIT','__mod_init_func'), ('LOAD_CLASSES','__objc_nlclslist'),
-                      ('LOAD_CATEGORIES','__objc_nlcatlist'), ('CLASSES','__objc_classlist'),
-                      ('CATEGORIES','__objc_catlist')]:
-        section = image.get_section(name)
-        header += [f'#define {key}_OFFSET {section.virtual_address-base if section else 0}',
-                   f'#define {key}_COUNT {section.size//8 if section else 0}']
-    header += ['static const char *const guest_dependencies[] = {',
-               *[json.dumps(library.name)+',' for library in image.libraries], 'NULL};']
-    header += ['static const char *const symbols[] = {', *[json.dumps(name)+',' for name in imports], '};',
-               'static const unsigned char functions[] = {', ','.join(str(int(name in callable_names)) for name in imports), '};']
-    (work / 'image.h').write_text('\n'.join(header)+'\n', encoding='utf-8')
-    (work / 'imports.json').write_text(json.dumps(imports, indent=2), encoding='utf-8')
-    return image
+    return PreparedImage(image, executable)

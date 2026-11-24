@@ -1,6 +1,7 @@
 import hashlib
 import json
 import plistlib
+import re
 import struct
 import zipfile
 import zlib
@@ -130,20 +131,36 @@ def normalize_png(raw):
     ), (width, height)
 
 
-def prepare_app_identity(source, prefix, info, work):
+def prepare_app_identity(source, prefix, info, work, catalog=()):
     name = info.get("CFBundleDisplayName") or info["CFBundleName"]
     files = info.get("CFBundleIcons", {}).get("CFBundlePrimaryIcon", {}).get(
         "CFBundleIconFiles"
     ) or info.get("CFBundleIconFiles", [])
     candidates = []
     for filename in files:
-        filename = filename if filename.endswith(".png") else filename + ".png"
-        if prefix + filename in source.namelist():
-            original = source.read(prefix + filename)
+        stem = filename.removesuffix(".png")
+        pattern = re.compile(re.escape(stem) + r"(?:@[1-4]x)?(?:~(?:iphone|ipad))?\.png")
+        for member in source.namelist():
+            filename = member.removeprefix(prefix)
+            if not member.startswith(prefix) or not pattern.fullmatch(filename):
+                continue
+            original = source.read(member)
             normalized, size = normalize_png(original)
             candidates.append((size[0] * size[1], filename, original, normalized, size))
     if not candidates:
-        raise ValueError("Original IPA has no declared standalone icon")
+        primary = info.get("CFBundleIcons", {}).get("CFBundlePrimaryIcon", {})
+        icon_name = primary.get("CFBundleIconName") or "AppIcon"
+        for filename, path in catalog:
+            if "/" in filename or not filename.endswith(".png"):
+                continue
+            stem = re.sub(r"(?:@[1-4]x)?(?:~(?:iphone|ipad))?$", "", filename.removesuffix(".png"))
+            if stem != icon_name:
+                continue
+            original = path.read_bytes()
+            normalized, size = normalize_png(original)
+            candidates.append((size[0] * size[1], "Assets.car/" + filename, original, normalized, size))
+    if not candidates:
+        raise ValueError("Original IPA has no convertible declared icon in standalone resources or Assets.car")
     _, filename, original, normalized, size = max(candidates, key=lambda item: item[0])
     resources = work / "identity-res"
     (resources / "values").mkdir(parents=True, exist_ok=True)

@@ -80,6 +80,12 @@ static int guest_mutexattr_type(struct DarwinMutexAttr *attr,int type) {
     if (!attr || attr->tag!=MUTEX_ATTR_TAG || type<0 || type>2) return EINVAL;
     return darwin_pthread_error(pthread_mutexattr_settype(&attr->native,type==2 ? PTHREAD_MUTEX_RECURSIVE : type==1 ? PTHREAD_MUTEX_ERRORCHECK : PTHREAD_MUTEX_NORMAL));
 }
+static int guest_mutexattr_protocol(struct DarwinMutexAttr *attr,int protocol) {
+    if(!attr || attr->tag!=MUTEX_ATTR_TAG || protocol<0 || protocol>2)return EINVAL;
+    if(protocol==2)return darwin_pthread_error(ENOTSUP); /* Android has no priority-ceiling mutexes. */
+    int native=protocol==0 ? PTHREAD_PRIO_NONE : PTHREAD_PRIO_INHERIT;
+    return darwin_pthread_error(pthread_mutexattr_setprotocol(&attr->native,native));
+}
 static int guest_mutexattr_destroy(struct DarwinMutexAttr *attr) {
     if (!attr || attr->tag!=MUTEX_ATTR_TAG) return EINVAL;
     int error=pthread_mutexattr_destroy(&attr->native);
@@ -204,6 +210,13 @@ static struct ThreadRecord *current_thread_record(void) {
     return record;
 }
 static pthread_t guest_pthread_self(void) { return current_thread_record()->handle; }
+static uint32_t guest_pthread_mach_thread(pthread_t thread) {
+    if(pthread_equal(thread,pthread_self()))current_thread_record();
+    pthread_mutex_lock(&thread_records_lock);
+    struct ThreadRecord *record=registered_thread(thread);
+    uint32_t port=record && record->tid>0 ? 0x80000000U|(uint32_t)record->tid : 0;
+    pthread_mutex_unlock(&thread_records_lock);return port;
+}
 static int guest_thread_stack(pthread_t thread,void **base,size_t *size) {
     pthread_mutex_lock(&thread_records_lock);
     if (!registered_thread(thread)) { pthread_mutex_unlock(&thread_records_lock); return ESRCH; }
@@ -358,7 +371,22 @@ static int guest_thread_create(pthread_t *thread,const struct DarwinThreadAttr *
 }
 static int guest_thread_join(pthread_t thread,void **value) { return darwin_pthread_error(pthread_join(thread,value)); }
 
+struct GuestOnceRecord { void *control; pthread_once_t native; struct GuestOnceRecord *next; };
+static struct GuestOnceRecord *guest_once_records;
+static pthread_mutex_t guest_once_mutex=PTHREAD_MUTEX_INITIALIZER;
+static int guest_pthread_once(void *control,void (*initialize)(void)) {
+    if(!control || !initialize)return EINVAL;
+    pthread_mutex_lock(&guest_once_mutex);
+    struct GuestOnceRecord *entry=guest_once_records;
+    while(entry && entry->control!=control)entry=entry->next;
+    if(!entry){entry=calloc(1,sizeof(*entry));if(entry){entry->control=control;entry->native=PTHREAD_ONCE_INIT;entry->next=guest_once_records;guest_once_records=entry;}}
+    pthread_mutex_unlock(&guest_once_mutex);
+    return entry ? darwin_pthread_error(pthread_once(&entry->native,initialize)) : ENOMEM;
+}
 static Word resolve_thread_import(const char *name) {
+    if(!strcmp(name,"_pthread_once"))return (Word)guest_pthread_once;
+    if(!strcmp(name,"_pthread_mach_thread_np"))return (Word)guest_pthread_mach_thread;
+    if(!strcmp(name,"_pthread_mutexattr_setprotocol"))return (Word)guest_mutexattr_protocol;
     const struct { const char *name; Word pointer; } entries[]={
         {"_pthread_mutex_init",(Word)guest_mutex_init},{"_pthread_mutex_destroy",(Word)guest_mutex_destroy},
         {"_pthread_mutex_lock",(Word)guest_mutex_lock},{"_pthread_mutex_unlock",(Word)guest_mutex_unlock},{"_pthread_mutex_trylock",(Word)guest_mutex_trylock},

@@ -49,7 +49,7 @@
 #include "i2a/extension.h"
 static struct I2AExtension runtime_extension;
 static void initialize_extension(void);
-_Static_assert(I2A_IMAGE_ABI == 1, "Image ABI mismatch");
+_Static_assert(I2A_IMAGE_ABI == 2, "Image ABI mismatch");
 
 extern unsigned char guest_text[], guest_data[], guest_links[], guest_gates[];
 extern const unsigned char rebases[], binds[];
@@ -63,10 +63,18 @@ static Word class_from_name(const char *);
 static Word host_superclass(Word);
 static size_t host_allocation_size(Word);
 static uint32_t external_instance_size(Word);
+static int class_layouts_ready;
+static int class_ro_valid(Word,Word);
+static uint32_t realize_class_layout(Word,unsigned);
+static Word realize_class_from_swift(Word,Word);
 static JNIEnv *attached_environment(const char *);
 static Word image_data_normalize(Word);
 static void schedule_queue_function(Word,void (*)(void *),void *,void (*)(void *));
 static void cf_release(Word);
+static uint32_t guest_image_count(void);
+static const void *guest_image_header(uint32_t);
+static const void *guest_section_data(const void *,const char *,const char *,unsigned long *);
+static Word guest_native_address(Word);
 #if I2A_DEVELOPMENT
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "I2AGuest", __VA_ARGS__)
 #else
@@ -190,11 +198,16 @@ static __attribute__((noreturn)) void stop(const char *kind, const char *name) {
     if (may_unwind) longjmp(boundary, 1);
     abort();
 }
+static __attribute__((noreturn)) void propagate_guest_failure(void) {
+    if(active_guest_call_boundary)longjmp(active_guest_call_boundary->environment,1);
+    if(may_unwind)longjmp(boundary,1);
+    abort();
+}
 
 __attribute__((visibility("hidden"), noreturn)) void missing_call(unsigned index) {
     Word caller=(Word)__builtin_return_address(0);
     char detail[240];
-    snprintf(detail,sizeof(detail),"%s caller=0x%lx",symbols[index],in_image(caller) ? caller-aslr+GUEST_IMAGE_BASE-4 : 0UL);
+    snprintf(detail,sizeof(detail),"%s caller=0x%lx",symbols[index],guest_native_address(caller ? caller-4 : 0));
     stop("Unimplemented import",detail);
 }
 
@@ -206,9 +219,21 @@ static Word read_word(Word address) {
 
 #include "ownership/lifetime.inc"
 #include "objc/dynamic_state.inc"
+#include "objc/layout_state.inc"
 
+static const struct I2AImageSegment *image_segment_for(Word address,size_t bytes) {
+    if (address<aslr || address-aslr>=IMAGE_END) return NULL;
+    Word offset=address-aslr;
+    size_t first=0,last=COUNT(guest_segments);
+    while(first<last){size_t middle=first+(last-first)/2;if(guest_segments[middle].offset<=offset)first=middle+1;else last=middle;}
+    if(!first)return NULL;
+    const struct I2AImageSegment *segment=&guest_segments[first-1];
+    if(offset-segment->offset<segment->memory_size && bytes<=segment->memory_size-(offset-segment->offset))return segment;
+    return NULL;
+}
 static int in_image(Word address) {
-    return address >= aslr && address - aslr < IMAGE_END;
+    const struct I2AImageSegment *segment=image_segment_for(address,1);
+    return segment && (segment->initial&PROT_READ);
 }
 #include "../diagnostics/cpu_sampling.inc"
 
@@ -229,21 +254,13 @@ static const char *class_name(Word cls) {
     if (dynamic) return dynamic->name;
     if (!in_image(cls)) return NULL;
     Word ro = read_word(cls+32) & ~(Word)7;
-    if (!in_image(ro)) return NULL;
+    if (!class_ro_valid(cls,ro)) return NULL;
     Word name = read_word(ro+24);
     return in_image(name) ? (const char *)name : NULL;
 }
 
-static Word find_method_record(Word list, const char *selector) {
-    if (!list) return 0;
-    unsigned *header = (unsigned *)list;
-    if (!in_image(list) || header[0] != 24) stop("Unsupported method list", selector);
-    for (unsigned index=0; index<header[1]; ++index) {
-        Word entry = list+8+24*index;
-        if (!strcmp((const char *)read_word(entry), selector)) return entry;
-    }
-    return 0;
-}
+#include "objc/selectors.inc"
+#include "objc/method_lists.inc"
 
 static Method method_list(Word list, const char *selector) {
     Word entry = find_method_record(list,selector);
@@ -252,6 +269,7 @@ static Method method_list(Word list, const char *selector) {
 
 static int guest_class_object(Word object) {
     if (dynamic_class(object)) return 1;
+    if(class_layouts_ready)return class_layout(object)!=NULL;
     if (!in_image(object)) return 0;
     const Word *classes=(const Word *)(aslr+CLASSES_OFFSET);
     for (unsigned index=0;index<CLASSES_COUNT;++index)
@@ -260,30 +278,41 @@ static int guest_class_object(Word object) {
 }
 
 static struct MethodRecord *host_instance_record(const char *,const char *);
+static struct MethodRecord *category_method_record(Word cls,const char *selector) {
+    if(class_layouts_ready){
+        unsigned index=category_buckets[class_pointer_bucket(cls,COUNT(category_buckets))];
+        for(;index;index=category_methods[index].next){
+            struct CategoryMethods *entry=&category_methods[index];
+            if(entry->cls==cls){Word found=find_method_record(read_word(entry->list),selector);if(found)return (void *)found;}
+        }
+        return NULL;
+    }
+    const Word *categories=(const Word *)(aslr+CATEGORIES_OFFSET);
+    for(unsigned pos=CATEGORIES_COUNT;pos>0;--pos){
+        Word category=categories[pos-1],target=read_word(category+8);
+        Word list=target==cls ? read_word(category+16) : target && read_word(target)==cls ? read_word(category+24) : 0;
+        Word found=find_method_record(list,selector);if(found)return (void *)found;
+    }
+    return NULL;
+}
+static struct MethodRecord *owned_method_record(Word cls,const char *selector) {
+    struct MethodRecord *record=added_method(cls,selector);
+    if(!record)record=category_method_record(cls,selector);
+    if(!record && in_image(cls))record=(void *)find_method_record(read_word((read_word(cls+32)&~(Word)7)+32),selector);
+    if(!record && !dynamic_class(cls))record=host_instance_record(host_symbol(cls),selector);
+    return record;
+}
 static Method lookup(Word cls, const char *selector) {
     for (unsigned depth=0; depth<64 && cls; ++depth) {
-        struct MethodRecord *added=added_method(cls,selector);
-        if (added) return __atomic_load_n(&added->implementation,__ATOMIC_ACQUIRE);
+        struct MethodRecord *owned=owned_method_record(cls,selector);
+        if(owned)return __atomic_load_n(&owned->implementation,__ATOMIC_ACQUIRE);
         if (dynamic_class(cls)) { cls=read_word(cls+8); continue; }
-        const Word *categories=(const Word *)(aslr+CATEGORIES_OFFSET);
-        for (unsigned pos=CATEGORIES_COUNT;pos>0;--pos) {
-            Word category=categories[pos-1], category_class=read_word(category+8);
-            Word list=category_class==cls ? read_word(category+16) :
-                (category_class && read_word(category_class)==cls ? read_word(category+24) : 0);
-            Method found=method_list(list,selector);
-            if (found) return found;
-        }
         if (!in_image(cls)) {
             const char *name=host_symbol(cls);
-            struct MethodRecord *record=host_instance_record(name,selector);
-            if (record) return __atomic_load_n(&record->implementation,__ATOMIC_ACQUIRE);
             if (!name || !strncmp(name,"_OBJC_METACLASS_",16) || !strcmp(name,"_OBJC_CLASS_$_NSObject")) break;
             cls=host_superclass(cls);
             continue;
         }
-        Word ro = read_word(cls+32) & ~(Word)7;
-        Method found = method_list(read_word(ro+32), selector);
-        if (found) return found;
         cls = read_word(cls+8);
     }
     return NULL;
@@ -555,7 +584,7 @@ __attribute__((used,noinline)) static int asl_emit(struct AslClient *client,Word
 __attribute__((naked)) static void asl_darwin_log(void) { __asm__ volatile("mov x4,sp\n b asl_emit"); }
 
 struct HostClassEntry { const char *name; Word object; };
-static struct HostClassEntry host_class_index[4096];
+static struct HostClassEntry host_class_index[I2A_HOST_SYMBOL_INDEX_CAPACITY];
 static pthread_once_t host_class_once=PTHREAD_ONCE_INIT;
 static unsigned host_class_index_ready;
 static unsigned host_class_hash(const char *name) {
@@ -685,7 +714,9 @@ static Word application_main(int argc,char **argv,Word principal,Word delegate_n
 static Word shared_app(void) { if(!application.isa)application.isa=external_class("_OBJC_CLASS_$_UIApplication");return application_object; }
 static Word get_delegate(void) { return app_delegate; }
 static Word get_window(void) { return key_window; }
+#if I2A_HAS_EXTENSION
 static Word get_root(void) { return key_window ? window_controller(key_window) : 0; }
+#endif
 static void set_delegate(Word object,const char *selector,Word delegate) { app_delegate=delegate; }
 static void store_strong(Word *slot,Word value) {
     Word previous=*slot;
@@ -1183,6 +1214,7 @@ static int class_inherits(Word cls,Word target) {
 static Word is_kind_of(Word self,const char *selector,Word target) {
     return class_inherits(read_word(self),target);
 }
+static Word is_subclass_of(Word cls,const char *selector,Word target) { return class_inherits(cls,target); }
 
 static Word replace_string(Word self,const char *selector,Word old,Word replacement) {
     const char *source=string_bytes(self,selector), *needle=string_bytes(old,selector);
@@ -1635,8 +1667,6 @@ static Method framework_implementation(Word object,const char *selector,const ch
     if (found) return found;
     found=pointer_collections_method(object,selector,receiver,class_receiver);
     if (found) return found;
-    found=kvo_method(object,selector,receiver,class_receiver);
-    if (found) return found;
     found=location_method(object,selector,receiver,class_receiver);
     if (found) return found;
     found=url_components_method(object,selector,receiver,class_receiver);
@@ -1722,6 +1752,8 @@ static Method framework_implementation(Word object,const char *selector,const ch
     found=exceptions_method(object,selector,receiver,class_receiver);
     if (found) return found;
     found=foundation_method(object,selector,receiver,class_receiver);
+    if (found) return found;
+    found=kvo_method(object,selector,receiver,class_receiver);
     if (found) return found;
     return NULL;
 }
@@ -1872,7 +1904,7 @@ __attribute__((used,noinline)) static Method i2a_lookup(Word object,const char *
     const char *external=host_symbol(object);
     const char *receiver=external ? external : class_name(read_word(object));
     char detail[256];
-    snprintf(detail,sizeof(detail),"[%s %s] caller=0x%lx", receiver ? receiver : "unknown", selector,in_image(caller)?caller-aslr+GUEST_IMAGE_BASE-4:0UL);
+    snprintf(detail,sizeof(detail),"[%s %s] caller=0x%lx", receiver ? receiver : "unknown", selector,guest_native_address(caller ? caller-4 : 0));
     stop("Unimplemented message", detail);
 }
 
@@ -1887,6 +1919,24 @@ __attribute__((naked)) static void message_send(void) {
         "ldp x0,x1,[sp]\n add sp,sp,#224\n br x16");
 }
 
+/* The objc_opt_* entry points are message-send optimizations. Route through
+ * ordinary dispatch so custom overrides, +initialize and nil semantics survive. */
+static Word objc_optimized_send(Word object,const char *selector,Word argument,Word caller) {
+    if (!object) return 0;
+    Method method=i2a_lookup(object,selector,caller);
+    return method(object,selector,argument,0,0,0);
+}
+static Word objc_opt_class(Word object) { return objc_optimized_send(object,"class",0,(Word)__builtin_return_address(0)); }
+static Word objc_opt_self(Word object) { return objc_optimized_send(object,"self",0,(Word)__builtin_return_address(0)); }
+static Word objc_opt_new(Word object) { return objc_optimized_send(object,"new",0,(Word)__builtin_return_address(0)); }
+static Word objc_opt_kind(Word object,Word cls) { return objc_optimized_send(object,"isKindOfClass:",cls,(Word)__builtin_return_address(0)); }
+static Word objc_opt_responds(Word object,const char *selector) { return objc_optimized_send(object,"respondsToSelector:",(Word)selector,(Word)__builtin_return_address(0)); }
+static Word objc_alloc_bridge(Word cls) { return objc_optimized_send(cls,"alloc",0,(Word)__builtin_return_address(0)); }
+static Word objc_alloc_zone_bridge(Word cls) { return objc_optimized_send(cls,"allocWithZone:",0,(Word)__builtin_return_address(0)); }
+static Word objc_alloc_init_bridge(Word cls) {
+    Word caller=(Word)__builtin_return_address(0),object=objc_optimized_send(cls,"alloc",0,caller);
+    return objc_optimized_send(object,"init",0,caller);
+}
 static int guest_atexit(void (*callback)(void *), void *arg, void *dso) {
     extern int __cxa_atexit(void (*)(void *), void *, void *);
     extern void *__dso_handle;
@@ -1944,6 +1994,19 @@ static struct GuestExport *guest_exports;
 static pthread_mutex_t guest_export_mutex=PTHREAD_MUTEX_INITIALIZER;
 static Word guest_symbol(intptr_t handle,const char *name) {
     if (!name || !*name || strlen(name)>=191) { guest_library_fail("dlsym","invalid symbol"); return 0; }
+#ifdef I2A_GUEST_COLLECTION
+    int embedded=embedded_library_handle(handle);
+    if(embedded>=0){
+        pthread_mutex_lock(&guest_library_mutex);
+        int valid=embedded_library_handles[embedded].references!=0;
+        pthread_mutex_unlock(&guest_library_mutex);
+        if(!valid){guest_library_fail("dlsym","closed embedded handle");return 0;}
+        char symbol[256];snprintf(symbol,sizeof(symbol),"_%s",name);
+        Word result=guest_collection_export(symbol,embedded);
+        if(!result)guest_library_fail("dlsym",name);
+        return result;
+    }
+#endif
     pthread_once(&guest_library_once,guest_library_initialize);
     int main_only=handle==-5 || handle==-3;
     int global_scope=handle==-2;
@@ -1958,6 +2021,11 @@ static Word guest_symbol(intptr_t handle,const char *name) {
         if (!exported) { guest_library_fail("dlsym",name); return 0; }
     }
     if (!strcmp(name,"_mh_execute_header")) return aslr;
+#ifdef I2A_GUEST_COLLECTION
+    char native_name[256];snprintf(native_name,sizeof(native_name),"_%s",name);
+    Word native_export=guest_collection_export(native_name,main_only ? 0 : -1);
+    if(native_export)return native_export;
+#endif
     if (global_scope) {
         if (!strncmp(name,"OBJC_CLASS_$_",13) || !strncmp(name,"OBJC_METACLASS_$_",17)) {
             Word storage[4]={0},defined=guest_find_export(name,1,storage);
@@ -1989,8 +2057,14 @@ static Word guest_symbol(intptr_t handle,const char *name) {
 
 static int guest_dladdr(Word address,Dl_info *result) {
     if (!in_image(address)) return 0;
+#ifdef I2A_GUEST_COLLECTION
+    int image=guest_image_index(address);if(image<0)return 0;
+    result->dli_fname=guest_image_name(image);
+    result->dli_fbase=(void *)guest_image_header(image);
+#else
     result->dli_fname=GUEST_IMAGE_PATH;
     result->dli_fbase=(void *)aslr;
+#endif
     result->dli_sname=address==aslr ? "_mh_execute_header" : NULL;
     result->dli_saddr=address==aslr ? (void *)aslr : NULL;
     return 1;
@@ -2068,10 +2142,9 @@ struct DarwinStatfs {
     char type_name[16], mounted_on[1024], mounted_from[1024];
     uint32_t reserved[8];
 };
-static int guest_statfs(const char *path,struct DarwinStatfs *output) {
+static void translate_statfs(const struct statfs *native,struct DarwinStatfs *output) {
     _Static_assert(sizeof(*output)==2168,"iOS statfs layout");
-    struct statfs info;
-    if (statfs(path,&info)) return -1;
+    struct statfs info=*native;
     memset(output,0,sizeof(*output));
     output->block_size=info.f_bsize; output->io_size=info.f_bsize;
     output->blocks=info.f_blocks; output->free_blocks=info.f_bfree; output->available_blocks=info.f_bavail;
@@ -2080,7 +2153,27 @@ static int guest_statfs(const char *path,struct DarwinStatfs *output) {
     output->owner=getuid();
     const char *name=info.f_type==0xef53 ? "ext4" : info.f_type==0x01021994 ? "tmpfs" : info.f_type==0xf2f52010 ? "f2fs" : "unknown";
     snprintf(output->type_name,sizeof(output->type_name),"%s",name);
-    return 0;
+}
+static int guest_statfs(const char *path,struct DarwinStatfs *output) {
+    if(!output){errno=EFAULT;return -1;}struct statfs info;if(statfs(path,&info))return -1;translate_statfs(&info,output);return 0;
+}
+static int guest_rmdir(const char *path) {
+    return writable_sandbox_path(path) ? rmdir(path) : -1;
+}
+static int guest_mkdir(const char *path,mode_t mode) {
+    return writable_sandbox_path(path) ? mkdir(path,mode) : -1;
+}
+static int guest_utimes(const char *path,const struct DarwinSocketTimeval *times) {
+    if(!writable_sandbox_path(path))return -1;
+    struct timeval converted[2];
+    if(times)for(unsigned i=0;i<2;++i){
+        if(times[i].microseconds<0 || times[i].microseconds>=1000000){errno=EINVAL;return -1;}
+        converted[i]=(struct timeval){times[i].seconds,times[i].microseconds};
+    }
+    return utimes(path,times ? converted : NULL);
+}
+static int guest_fstatfs(int descriptor,struct DarwinStatfs *output) {
+    if(!output){errno=EFAULT;return -1;}struct statfs info;if(fstatfs(descriptor,&info))return -1;translate_statfs(&info,output);return 0;
 }
 
 struct DarwinTimeval { int64_t seconds; int32_t microseconds, padding; };
@@ -2186,8 +2279,32 @@ static void guest_hmac(unsigned algorithm,const void *key,size_t key_length,cons
 
 #include "../frameworks/foundation/geometry.inc"
 #include "../frameworks/foundation/crypto.inc"
+#include "darwin/compression.inc"
+static Word resolve_basic_import(const char *name) {
+    if (!strcmp(name,"_objc_opt_class")) return (Word)objc_opt_class;
+    if (!strcmp(name,"_objc_opt_self")) return (Word)objc_opt_self;
+    if (!strcmp(name,"_objc_opt_new")) return (Word)objc_opt_new;
+    if (!strcmp(name,"_objc_opt_isKindOfClass")) return (Word)objc_opt_kind;
+    if (!strcmp(name,"_objc_opt_respondsToSelector")) return (Word)objc_opt_responds;
+    if (!strcmp(name,"_objc_alloc")) return (Word)objc_alloc_bridge;
+    if (!strcmp(name,"_objc_allocWithZone")) return (Word)objc_alloc_zone_bridge;
+    if (!strcmp(name,"_objc_alloc_init")) return (Word)objc_alloc_init_bridge;
+    if (!strcmp(name,"_fstatfs")) return (Word)guest_fstatfs;
+    if (!strcmp(name,"_rmdir")) return (Word)guest_rmdir;
+    if (!strcmp(name,"_mkdir")) return (Word)guest_mkdir;
+    if (!strcmp(name,"_utimes")) return (Word)guest_utimes;
+    if (!strcmp(name,"_pwrite")) return (Word)pwrite;
+    if (!strcmp(name,"_fsync")) return (Word)fsync;
+    if (!strcmp(name,"_fdatasync")) return (Word)fdatasync;
+    if (!strcmp(name,"_ftruncate")) return (Word)ftruncate;
+    if (!strcmp(name,"_arc4random_buf")) return (Word)arc4random_buf;
+    return 0;
+}
 static Word resolve_import(unsigned index) {
     const char *name = symbols[index];
+    Word basic=resolve_basic_import(name);if(basic)return basic;
+    Word selector=resolve_selector_import(name);if(selector)return selector;
+    Word compression=resolve_compression_import(name);if(compression)return compression;
     Word exception_import=resolve_exception_import(index);
     if (exception_import) return exception_import;
     Word geometry=geometry_export(name); if (geometry) return geometry;
@@ -2382,7 +2499,7 @@ static Word resolve_import(unsigned index) {
                                       "strcat","strncat","strlcpy","strspn","strpbrk","strtok","strtok_r","strtod","strtof","strtol","strtoul","strtoll","strtoull","strcoll",
                                       "atoi","atol","atof","strerror","qsort","bsearch","getenv","rand","srand","drand48","arc4random","arc4random_uniform",
                                       "__memcpy_chk","__memmove_chk","__memset_chk","__strcpy_chk","__strncpy_chk","__strcat_chk","__strncat_chk","__strlcpy_chk",
-                                      "getpid","getppid","getuid","geteuid","write","remove","rename","unlink","mkdir",
+                                      "getpid","getppid","getuid","geteuid","write","remove","rename","unlink",
                                       "fopen","fclose","fread","fwrite","fflush","fseek","fseeko","ftell","ftello",
                                       "clearerr","feof","ferror","fgets","getc","ungetc","puts","rewind","tmpfile","setvbuf","dup","mkstemp",
                                       "time","difftime","clock","gmtime_r","localtime","localtime_r","mktime","strftime","usleep",
@@ -2425,6 +2542,7 @@ static Word guest_find_export(const char *name,int main_only,Word storage[4]) {
     Word constant=constant_export(imported,storage);
     if (constant) return constant;
     Word (*const resolvers[])(const char *)={
+        resolve_basic_import,resolve_selector_import,resolve_compression_import,
         geometry_export,resolve_accessibility_import,resolve_crypto_import,resolve_core_import,resolve_keychain_import,resolve_rsa_import,resolve_secure_transport_import,
         resolve_atomic_import,
         resolve_audio_unit_import,resolve_audio_file_import,resolve_audio_queue_import,resolve_audio_services_import,resolve_objc_import,resolve_dynamic_import,
@@ -2437,20 +2555,36 @@ static Word guest_find_export(const char *name,int main_only,Word storage[4]) {
     return 0;
 }
 
+#include "darwin/image_mapping.inc"
 static void fixups(void) {
      
     const Block_callbacks_RR callbacks={sizeof(callbacks),metal_block_retain,metal_block_release,metal_block_destruct};
     _Block_use_RR2(&callbacks);
     aslr = (Word)guest_text;
     if ((Word)guest_data-aslr != GUEST_DATA_OFFSET || (Word)guest_links-aslr != GUEST_LINKS_OFFSET) stop("Invalid ELF", "segment layout");
+    for (unsigned i=0;i<COUNT(guest_segments);++i) {
+        const struct I2AImageSegment *segment=guest_segments+i;
+        if ((Word)segment->address-aslr!=segment->offset) stop("Invalid ELF","mapped segment layout");
+    }
+    protect_guest_images(1);
     arc4random_buf(&global_guard,sizeof(global_guard));
     for (unsigned index=0;index<REBASE_COUNT;++index) {
         const unsigned char *record=rebases+12*index;
         uint32_t offset;
         memcpy(&offset,record,4);
+        const struct I2AImageSegment *segment=image_segment_for(aslr+offset,8);
+        if (!segment || !(segment->maximum&PROT_WRITE)) stop("Invalid image relocation","rebase target");
         Word pointer = aslr+read_word((Word)record+4);
         memcpy(guest_text+offset,&pointer,8);
     }
+#ifdef I2A_GUEST_COLLECTION
+    for (unsigned i=0;i<COUNT(guest_absolute_binds);++i) {
+        Word address=aslr+guest_absolute_binds[i].offset;
+        const struct I2AImageSegment *segment=image_segment_for(address,8);
+        if (!segment || !(segment->maximum&PROT_WRITE)) stop("Invalid image relocation","absolute binding target");
+        memcpy((void *)address,&guest_absolute_binds[i].value,8);
+    }
+#endif
     Word *addresses=import_addresses;
     for (unsigned index=0;index<COUNT(symbols);++index) addresses[index]=resolve_import(index);
     decimal_number_initialize();
@@ -2481,24 +2615,28 @@ static void fixups(void) {
 #endif
     for (unsigned index=0;index<BIND_COUNT;++index) {
         const uint32_t *record=(const uint32_t *)(binds+16*index);
+        const struct I2AImageSegment *segment=image_segment_for(aslr+record[0],8);
+        if (!segment || !(segment->maximum&PROT_WRITE)) stop("Invalid image relocation","binding target");
         Word pointer = addresses[record[1]]+read_word((Word)record+8);
         memcpy(guest_text+record[0],&pointer,8);
     }
-    LOG("Mach-O loaded with %d rebases, %d bindings (guest base=%p)",REBASE_COUNT,BIND_COUNT,(void *)aslr);
+    protect_guest_images(0);
+    LOG("Mach-O loaded with %zu mapped segments, %d rebases, %d bindings (guest base=%p)",COUNT(guest_segments),REBASE_COUNT,BIND_COUNT,(void *)aslr);
 }
 
-static void run_loads(void) {
+static void run_loads(unsigned classes_first,unsigned classes_count,unsigned categories_first,unsigned categories_count) {
     for (unsigned kind=0;kind<2;++kind) {
         const Word *entries=(Word *)(aslr+(kind?LOAD_CATEGORIES_OFFSET:LOAD_CLASSES_OFFSET));
-        unsigned count=kind?LOAD_CATEGORIES_COUNT:LOAD_CLASSES_COUNT;
-        for (unsigned index=0;index<count;++index) {
+        unsigned first=kind?categories_first:classes_first,count=kind?categories_count:classes_count;
+        for (unsigned index=first;index<first+count;++index) {
             Word entry=entries[index];
             Word cls=kind?read_word(entry+8):entry;
+            if(in_image(cls))realize_class_layout(cls,0);
             Word ro=kind?0:(read_word(read_word(cls)+32)&~(Word)7);
             Method load=method_list(kind?read_word(entry+24):read_word(ro+32),"load");
             if (load) {
                 const char *name=kind?(const char *)read_word(entry):class_name(cls);
-                snprintf(stage,sizeof(stage),"+[%s load] 0x%lx",name,(Word)load-aslr+GUEST_IMAGE_BASE);
+                snprintf(stage,sizeof(stage),"+[%s load] 0x%lx",name,guest_native_address((Word)load));
                 LOG("%s",stage);
                 load(cls,"load",0,0,0,0);
             }
@@ -2544,14 +2682,28 @@ JNIEXPORT jstring JNICALL HOST_JNI(HostActivity_startGuest)(JNIEnv *env,jobject 
         initialize_helpshift_bridge();
         initialize_extension();
         initialize_dispatch_loop();
-        run_loads();
         Word *inits=(Word *)(aslr+INIT_OFFSET);
         char *argv[]={GUEST_EXECUTABLE,NULL};
         char *empty[]={NULL};
+#ifdef I2A_GUEST_COLLECTION
+        for(unsigned image=0;image<COUNT(guest_initialization_order);++image){
+            LOG("Initializing guest image: %s",guest_image_name(guest_initialization_order[image].image));
+            run_loads(guest_initialization_order[image].classes_first,guest_initialization_order[image].classes_count,
+                      guest_initialization_order[image].categories_first,guest_initialization_order[image].categories_count);
+            unsigned first=guest_initialization_order[image].init_first,count=guest_initialization_order[image].init_count;
+            for(unsigned index=first;index<first+count;++index){
+                snprintf(stage,sizeof(stage),"Initializer %u/%u: %s",index-first+1,count,guest_image_name(guest_initialization_order[image].image));
+                LOG("%s",stage);
+                ((void (*)(int,char **,char **,char **))(inits[index]))(1,argv,empty,empty);
+            }
+        }
+#else
+        run_loads(0,LOAD_CLASSES_COUNT,0,LOAD_CATEGORIES_COUNT);
         for (unsigned index=0;index<INIT_COUNT;++index) {
             snprintf(stage,sizeof(stage),"Initializer %u/%d at 0x%lx",index+1,INIT_COUNT,inits[index]-aslr+GUEST_IMAGE_BASE);
             ((void (*)(int,char **,char **,char **))(inits[index]))(1,argv,empty,empty);
         }
+#endif
         snprintf(stage,sizeof(stage),"LC_MAIN at 0x%lx",GUEST_IMAGE_BASE+ENTRY);
         LOG("%s",stage);
         int code=((int (*)(int,char **))(aslr+ENTRY))(1,argv);

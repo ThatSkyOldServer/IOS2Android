@@ -21,17 +21,7 @@ static void register_class_pair(Word cls) {
 }
 static unsigned char add_class_method(Word cls,const char *selector,Method implementation,const char *types) {
     if (!class_name(cls) || !selector || !implementation || !types) return 0;
-    if (host_instance_record(host_symbol(cls),selector)) return 0;
-    if (in_image(cls)) {
-        Word ro=read_word(cls+32)&~7UL;
-        if (find_method_record(read_word(ro+32),selector)) return 0;
-    }
-    const Word *categories=(void *)(aslr+CATEGORIES_OFFSET);
-    for (unsigned i=0;i<CATEGORIES_COUNT;++i) {
-        Word category=categories[i],target=read_word(category+8);
-        Word list=target==cls ? read_word(category+16) : target && read_word(target)==cls ? read_word(category+24) : 0;
-        if (find_method_record(list,selector)) return 0;
-    }
+    if(owned_method_record(cls,selector))return 0;
     pthread_mutex_lock(&dynamic_mutex);
     if (added_method(cls,selector)) { pthread_mutex_unlock(&dynamic_mutex); return 0; }
     struct AddedMethod *entry=calloc(1,sizeof(*entry));
@@ -46,7 +36,14 @@ static Word object_superclass(Word object) {
     if (in_image(cls) || dynamic_class(cls)) return read_word(cls+8);
     return host_superclass(cls);
 }
+static Method replace_class_method(Word cls,const char *selector,Method implementation,const char *types) {
+    if(!cls || !selector || !implementation || !types)return NULL;
+    struct MethodRecord *record=owned_method_record(cls,selector);
+    if(record)return set_imp(record,implementation);
+    add_class_method(cls,selector,implementation,types);return NULL;
+}
 static Word resolve_dynamic_import(const char *name) {
+    if (!strcmp(name,"_class_replaceMethod")) return (Word)replace_class_method;
     if (!strcmp(name,"_objc_allocateClassPair")) return (Word)allocate_class_pair;
     if (!strcmp(name,"_objc_registerClassPair")) return (Word)register_class_pair;
     if (!strcmp(name,"_class_addMethod")) return (Word)add_class_method;

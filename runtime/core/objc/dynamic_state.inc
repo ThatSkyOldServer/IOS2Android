@@ -11,6 +11,8 @@ struct DynamicClass {
 struct AddedMethod { Word cls; struct MethodRecord record; struct AddedMethod *next; };
 static struct DynamicClass *dynamic_classes;
 static struct AddedMethod *added_methods;
+struct AddedProtocol { Word cls,protocol; struct AddedProtocol *next; };
+static struct AddedProtocol *added_protocols;
 static pthread_mutex_t dynamic_mutex=PTHREAD_MUTEX_INITIALIZER;
 static struct DynamicClass *dynamic_class(Word object) {
     for (struct DynamicClass *item=__atomic_load_n(&dynamic_classes,__ATOMIC_ACQUIRE);item;item=item->next)

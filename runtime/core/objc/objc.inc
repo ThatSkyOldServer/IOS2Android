@@ -22,22 +22,77 @@ static void copy_atomic_property(Word object,const char *selector,Word value,int
     metal_object_release(value);
 }
 
+typedef unsigned char (*ClassLookupHook)(const char *,Word *);
+struct NamedRuntimeObject { char *name; Word object; struct NamedRuntimeObject *next; };
+static struct NamedRuntimeObject *guest_class_names[1024],*guest_protocol_names[1024];
+static pthread_mutex_t named_runtime_mutex=PTHREAD_MUTEX_INITIALIZER;
+static Word named_runtime_find(struct NamedRuntimeObject **table,const char *name) {
+    unsigned bucket=selector_hash(name)&1023;
+    pthread_mutex_lock(&named_runtime_mutex);
+    struct NamedRuntimeObject *entry=table[bucket];
+    while(entry && strcmp(entry->name,name))entry=entry->next;
+    Word result=entry ? entry->object : 0;
+    pthread_mutex_unlock(&named_runtime_mutex);return result;
+}
+static Word named_runtime_insert(struct NamedRuntimeObject **table,const char *name,Word object) {
+    unsigned bucket=selector_hash(name)&1023;
+    pthread_mutex_lock(&named_runtime_mutex);
+    for(struct NamedRuntimeObject *entry=table[bucket];entry;entry=entry->next)
+        if(!strcmp(entry->name,name)){Word found=entry->object;pthread_mutex_unlock(&named_runtime_mutex);return found;}
+    struct NamedRuntimeObject *entry=calloc(1,sizeof(*entry));
+    if(entry)entry->name=strdup(name);
+    if(!entry || !entry->name){free(entry);pthread_mutex_unlock(&named_runtime_mutex);stop("Allocation failed","runtime name index");}
+    entry->object=object;entry->next=table[bucket];table[bucket]=entry;
+    pthread_mutex_unlock(&named_runtime_mutex);return object;
+}
+static unsigned char empty_class_lookup(const char *name,Word *result) { *result=0; return 0; }
+static ClassLookupHook class_lookup_hook=empty_class_lookup;
+static pthread_mutex_t class_lookup_hook_mutex=PTHREAD_MUTEX_INITIALIZER;
+struct ClassLookupFrame { const char *name; struct ClassLookupFrame *previous; };
+static _Thread_local struct ClassLookupFrame *class_lookup_frame;
+static void set_class_lookup_hook(ClassLookupHook hook,ClassLookupHook *old) {
+    if (!hook) stop("Invalid class lookup hook","objc_setHook_getClass");
+    pthread_mutex_lock(&class_lookup_hook_mutex);
+    if (old) *old=__atomic_load_n(&class_lookup_hook,__ATOMIC_ACQUIRE);
+    __atomic_store_n(&class_lookup_hook,hook,__ATOMIC_RELEASE);
+    pthread_mutex_unlock(&class_lookup_hook_mutex);
+}
 static Word class_from_name(const char *wanted) {
     if (!wanted) return 0;
     Word dynamic=dynamic_named_class(wanted,1);
     if (dynamic) return dynamic;
+    Word cached=named_runtime_find(guest_class_names,wanted);
+    if(cached){if(class_layouts_ready)realize_class_layout(cached,0);return cached;}
     const Word *classes=(void *)(aslr+CLASSES_OFFSET);
-    for (unsigned index=0;index<CLASSES_COUNT;++index)
-        if (!strcmp(class_name(classes[index]),wanted)) return classes[index];
+    for (unsigned index=0;index<CLASSES_COUNT;++index) {
+        if (!strcmp(class_name(classes[index]),wanted)) {
+            if (class_layouts_ready) realize_class_layout(classes[index],0);
+            return named_runtime_insert(guest_class_names,wanted,classes[index]);
+        }
+    }
     char symbol[192];
     snprintf(symbol,sizeof(symbol),"_OBJC_CLASS_$_%s",wanted);
-    return external_class(symbol);
+    Word result=external_class(symbol);
+    if (result) return result;
+    for (struct ClassLookupFrame *frame=class_lookup_frame;frame;frame=frame->previous)
+        if (!strcmp(frame->name,wanted)) return 0;
+    struct ClassLookupFrame frame={wanted,class_lookup_frame};
+    class_lookup_frame=&frame;
+    struct GuestCallBoundary call={.previous=active_guest_call_boundary};
+    active_guest_call_boundary=&call;
+    int failed=setjmp(call.environment);
+    unsigned char found=0;
+    if(!failed)found=__atomic_load_n(&class_lookup_hook,__ATOMIC_ACQUIRE)(wanted,&result);
+    active_guest_call_boundary=call.previous;
+    class_lookup_frame=frame.previous;
+    if(failed)propagate_guest_failure();
+    return found ? result : 0;
 }
 
 static const char *method_types(struct MethodRecord *method) { return method ? method->types : NULL; }
 
 static void exchange_methods(struct MethodRecord *first,struct MethodRecord *second) {
-    if (!first || !second) stop("Invalid swizzle","method_exchangeImplementations");
+    if (!first || !second) return;
     Method imp=__atomic_load_n(&first->implementation,__ATOMIC_ACQUIRE);
     Method other=__atomic_exchange_n(&second->implementation,imp,__ATOMIC_ACQ_REL);
     __atomic_store_n(&first->implementation,other,__ATOMIC_RELEASE);
@@ -48,6 +103,7 @@ static Word instance_size(Word cls) {
     struct DynamicClass *dynamic=dynamic_class(cls);
     if (dynamic) return dynamic->size;
     if (in_image(cls)) {
+        if (class_layouts_ready) return realize_class_layout(cls,0);
         Word ro=read_word(cls+32)&~(Word)7;
         uint32_t size;
         memcpy(&size,(void *)(ro+8),sizeof(size));
@@ -131,6 +187,43 @@ static char **copy_image_names(unsigned *count) {
 }
 
 static Word class_conforms(Word cls,Word protocol) { return conforms_protocol(cls,"conformsToProtocol:",protocol); }
+static unsigned char class_add_protocol(Word cls,Word protocol) {
+    if(!cls || !protocol || (!guest_class_object(cls) && !host_symbol(cls)))return 0;
+    pthread_mutex_lock(&dynamic_mutex);
+    if(class_conforms(cls,protocol)){pthread_mutex_unlock(&dynamic_mutex);return 0;}
+    struct AddedProtocol *entry=calloc(1,sizeof(*entry));
+    if(!entry){pthread_mutex_unlock(&dynamic_mutex);stop("Allocation failed","class_addProtocol");}
+    entry->cls=cls;entry->protocol=protocol;entry->next=added_protocols;
+    __atomic_store_n(&added_protocols,entry,__ATOMIC_RELEASE);
+    pthread_mutex_unlock(&dynamic_mutex);return 1;
+}
+static const char *protocol_name(Word protocol) {
+    if(!protocol)return NULL;
+    if(!image_segment_for(protocol,16))stop("Invalid protocol","protocol_getName");
+    Word name=read_word(protocol+8);
+    if(!in_image(name))stop("Invalid protocol name","protocol_getName");
+    return (const char *)name;
+}
+static Word string_from_protocol(Word protocol) {
+    const char *name=protocol_name(protocol);return name ? copy_string(name) : 0;
+}
+static Word protocol_from_name(const char *name) {
+    if(!name)return 0;
+    Word cached=named_runtime_find(guest_protocol_names,name);if(cached)return cached;
+    for(unsigned image=0;image<guest_image_count();++image){
+        const void *header=guest_image_header(image);
+        const char *segments[]={"__DATA","__DATA_CONST","__AUTH_CONST"};
+        for(unsigned s=0;s<COUNT(segments);++s){
+            unsigned long bytes=0;const Word *protocols=guest_section_data(header,segments[s],"__objc_protolist",&bytes);
+            if(!protocols)continue;
+            for(size_t i=0;i<bytes/sizeof(Word);++i){
+                Word protocol=protocols[i];if(protocol && !strcmp(protocol_name(protocol),name))return named_runtime_insert(guest_protocol_names,name,protocol);
+            }
+        }
+    }
+    return 0;
+}
+static Word protocol_from_string(Word name) { return name ? protocol_from_name(string_bytes(name,"NSProtocolFromString")) : 0; }
 
 struct InvocationType { size_t size,alignment; unsigned count; char floating,code; char *encoding; };
 struct SignatureState { struct InvocationType result,*arguments; size_t count,frame; };
@@ -336,7 +429,17 @@ static Method invocation_method(Word object,const char *selector,const char *rec
     return NULL;
 }
 
+#include "block_imp.inc"
 static Word resolve_objc_import(const char *name) {
+    if (!strcmp(name,"_NSProtocolFromString")) return (Word)protocol_from_string;
+    if (!strcmp(name,"_objc_getProtocol")) return (Word)protocol_from_name;
+    if (!strcmp(name,"_NSStringFromProtocol")) return (Word)string_from_protocol;
+    if (!strcmp(name,"_protocol_getName")) return (Word)protocol_name;
+    if (!strcmp(name,"_imp_implementationWithBlock")) return (Word)implementation_with_block;
+    if (!strcmp(name,"_imp_getBlock")) return (Word)block_for_implementation;
+    if (!strcmp(name,"_imp_removeBlock")) return (Word)remove_block_implementation;
+    if (!strcmp(name,"_objc_setHook_getClass")) return (Word)set_class_lookup_hook;
+    if (!strcmp(name,"__objc_realizeClassFromSwift")) return (Word)realize_class_from_swift;
     if (!strcmp(name,"__objc_empty_cache")) { static Word buckets[32] __attribute__((aligned(16)));return (Word)buckets; }
     if (!strcmp(name,"_NSGetSizeAndAlignment")) return (Word)encoded_size_alignment;
     if (!strcmp(name,"_objc_setProperty_nonatomic_copy")) return (Word)copy_property;
@@ -352,6 +455,7 @@ static Word resolve_objc_import(const char *name) {
     if (!strcmp(name,"_objc_copyImageNames")) return (Word)copy_image_names;
     if (!strcmp(name,"_class_getInstanceSize")) return (Word)instance_size;
     if (!strcmp(name,"_class_conformsToProtocol")) return (Word)class_conforms;
+    if (!strcmp(name,"_class_addProtocol")) return (Word)class_add_protocol;
     if (!strcmp(name,"_method_getTypeEncoding")) return (Word)method_types;
     if (!strcmp(name,"_method_exchangeImplementations")) return (Word)exchange_methods;
     if (!strcmp(name,"_object_setClass")) return (Word)change_class;

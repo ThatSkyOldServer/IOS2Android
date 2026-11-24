@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-IMAGE_ABI_VERSION = 1
+IMAGE_ABI_VERSION = 2
 RUNTIME_INTERFACE_VERSION = 2
 SHADER_PACK_VERSION = 1
 ADAPTER_INTERFACE_VERSION = 2

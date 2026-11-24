@@ -227,6 +227,33 @@ def emit_struct_array(header, c_type, name, rows):
     header.append('};')
 
 
+def pending_shader_plan(source, prefix, executable, work):
+    """Register exact bundled libraries with the runtime's explicit error state.
+
+    A library without compiled entries stays translation_pending and returns
+    MTLLibraryErrorDomain on use. Container names are inventory, not recovered
+    source or a claim that a portable shader has been generated.
+    """
+    from .metal import container
+
+    libraries, inventory = [], []
+    for path in sorted(name for name in source.namelist() if name.startswith(prefix) and name.endswith('.metallib')):
+        raw = source.read(path)
+        library = dict(name=path[len(prefix):], path=path, sha256=library_digest(raw), bytes=len(raw), entries=[])
+        row = dict(path=path, sha256=library['sha256'], bytes=len(raw), format='MTLB' if raw[:4] == b'MTLB' else 'unknown',
+                   status='translation_pending', entries=[])
+        try:
+            for entry in container(raw):
+                library['entries'].append(dict(entry=entry['name'], stage=entry['stage']))
+                row['entries'].append({key: entry[key] for key in ('name','stage','type_tag','bitcode_size')})
+        except (ValueError, KeyError, struct.error) as error:
+            row['container_inspection_error'] = str(error)
+        libraries.append(library)
+        inventory.append(row)
+    write_json(work / 'metal-library-inventory.json', dict(libraries=inventory, portable_modules=0))
+    return dict(executable=executable, libraries=libraries, shaders={})
+
+
 def assemble_shader_plan(context, source, spec):
     root=context.adapter_root
     metadata=json.loads(resolve_file(root,spec['metadata']).read_text(encoding='utf-8'))

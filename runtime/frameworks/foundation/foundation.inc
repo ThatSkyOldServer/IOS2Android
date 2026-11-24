@@ -490,14 +490,20 @@ static int protocol_list_contains(Word list,Word target,unsigned depth) {
 }
 
 static Word conforms_protocol(Word self,const char *selector,Word protocol) {
+    if(!self || !protocol)return 0;
     Word cls=guest_class_object(self) || host_symbol(self) ? self : read_word(self);
-    for (unsigned depth=0;depth<64 && in_image(cls);++depth) {
-        Word ro=read_word(cls+32)&~(Word)7;
-        if (protocol_list_contains(read_word(ro+40),protocol,0)) return 1;
-        const Word *categories=(const Word *)(aslr+CATEGORIES_OFFSET);
-        for (unsigned index=0;index<CATEGORIES_COUNT;++index)
-            if (read_word(categories[index]+8)==cls && protocol_list_contains(read_word(categories[index]+32),protocol,0)) return 1;
-        cls=read_word(cls+8);
+    for (unsigned depth=0;depth<64 && cls;++depth) {
+        for(struct AddedProtocol *p=__atomic_load_n(&added_protocols,__ATOMIC_ACQUIRE);p;p=p->next)
+            if(p->cls==cls && (p->protocol==protocol || (in_image(p->protocol) && protocol_list_contains(read_word(p->protocol+16),protocol,0))))return 1;
+        if(in_image(cls)){
+            Word ro=read_word(cls+32)&~(Word)7;
+            if(class_ro_valid(cls,ro) && protocol_list_contains(read_word(ro+40),protocol,0))return 1;
+            const Word *categories=(const Word *)(aslr+CATEGORIES_OFFSET);
+            for(unsigned index=0;index<CATEGORIES_COUNT;++index)
+                if(read_word(categories[index]+8)==cls && protocol_list_contains(read_word(categories[index]+32),protocol,0))return 1;
+            cls=read_word(cls+8);
+        } else if(dynamic_class(cls))cls=read_word(cls+8);
+        else cls=host_superclass(cls);
     }
     return 0;
 }
@@ -574,7 +580,9 @@ static Method foundation_method(Word object,const char *selector,const char *rec
     if (!class_receiver && ((!strcmp(selector,"copy") && lookup(read_word(object),"copyWithZone:")) ||
         (!strcmp(selector,"mutableCopy") && lookup(read_word(object),"mutableCopyWithZone:")))) return (Method)copy_via_zone;
     if (!strcmp(selector,"respondsToSelector:")) return (Method)responds_selector;
+    if (!strcmp(selector,"self")) return (Method)identity;
     if ((class_receiver || guest_class_object(object)) && !strcmp(selector,"instancesRespondToSelector:")) return (Method)instances_respond_selector;
+    if ((class_receiver || guest_class_object(object)) && !strcmp(selector,"isSubclassOfClass:")) return (Method)is_subclass_of;
     if (!strcmp(selector,"retain")) return (Method)metal_object_retain;
     if (!strcmp(selector,"autorelease")) return (Method)metal_object_autorelease;
     if (!strcmp(selector,"release")) return (Method)metal_object_release;

@@ -43,7 +43,13 @@ __attribute__((used,noinline)) static void guest_syslog(int priority,const char 
     free((void *)text); errno=saved;
 }
 __attribute__((naked)) static void darwin_syslog(void) { __asm__ volatile("mov x2,sp\n b guest_syslog"); }
+__attribute__((used,noinline)) static int guest_asl_message(int level,const char *format,const unsigned char *arguments) {
+    if(level<0 || level>7 || !format)return -1;
+    guest_syslog(level,format,arguments);return 0;
+}
+__attribute__((naked)) static int darwin_asl_message(int level,const char *format,...) { __asm__ volatile("mov x2,sp\n b guest_asl_message"); }
 static Word resolve_logging_import(const char *name) {
+    if (!strcmp(name,"_asl_log_message")) return (Word)darwin_asl_message;
     if (!strcmp(name,"_syslog")) return (Word)darwin_syslog;
     if (!strcmp(name,"_vsyslog")) return (Word)guest_syslog;
     if (!strcmp(name,"_openlog")) return (Word)guest_openlog;

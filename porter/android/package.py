@@ -349,6 +349,7 @@ def build_apk(context, source, manifest, resources, catalog, overlays, native, d
             "assets/licenses/Imagination-PVRTC.txt",
             compress_type=zipfile.ZIP_DEFLATED,
         )
+        package.write(ROOT/'third_party/lzfse/LICENSE','assets/licenses/Apple-LZFSE.txt',compress_type=zipfile.ZIP_DEFLATED)
     package_options = adapter.prepare_package(context, unsigned) if adapter and hasattr(adapter, "prepare_package") else None
     package_options = package_options or {}
     alignment = package_options.get("alignment", 16384)

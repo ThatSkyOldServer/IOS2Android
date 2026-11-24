@@ -115,6 +115,15 @@ def build(context, extension_sources, standalone=False, adapter=None):
     tools = {name: Path(value) for name, value in context.toolchain.items()}
     work = context.work
     dependencies(context)
+    compression=ROOT/'third_party/lzfse/src'
+    compression_sources=[compression/name for name in ('lzfse_decode.c','lzfse_decode_base.c','lzfse_fse.c','lzvn_decode_base.c')]
+    compression_objects=[work/(path.stem+'.o') for path in compression_sources]
+    compression_inputs=file_metadata([*compression_sources,*compression.glob('*.h'),tools['ndk']/'bin/clang.exe'])
+    compression_stamp=work/'compression.cache.json'
+    if not cache_matches(compression_stamp,compression_inputs,compression_objects):
+        for source,output in zip(compression_sources,compression_objects):
+            run(context,tools['ndk']/'bin/clang.exe','--target=aarch64-linux-android28','-c','-fPIC','-fvisibility=hidden','-O2',source,'-o',output)
+        write_json(compression_stamp,compression_inputs)
     output = work / ("libi2a-core.so" if standalone else "libi2a.so")
     composition = work / ("core-composition.c" if standalone else "composition.c")
     composition.write_text(
@@ -148,6 +157,7 @@ def build(context, extension_sources, standalone=False, adapter=None):
         work / "image.S",
         work / "pvrtc.o",
         work / "texture_decode.o",
+        *compression_objects,
         "-lc++_shared",
         "-L" + str(tools["dispatch"]),
         "-lBlocksRuntime",

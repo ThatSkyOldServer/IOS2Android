@@ -2,6 +2,7 @@
  * ABI specifies a scalar/structure. Notification IDs are not all strings. */
 static Word constant_export(const char *name,Word storage[4]) {
     const char *value=NULL;
+    if (!strcmp(name,"___NSArray0__")) { storage[0]=sequence_empty(external_class("_OBJC_CLASS_$_NSArray")); return (Word)storage; }
     if (!strcmp(name,"___NSDictionary0__")) { storage[0]=empty_map(external_class("_OBJC_CLASS_$_NSDictionary")); return (Word)storage; }
     if (!strcmp(name,"_CGAffineTransformIdentity")) { static const double identity[6]={1,0,0,1,0,0}; return (Word)identity; }
     if (!strcmp(name,"_CGSizeZero")) { memset(storage,0,16); return (Word)storage; }

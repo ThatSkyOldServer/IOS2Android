@@ -66,10 +66,15 @@ def _decode(data):
             raise ValueError('Compact unwind page does not start at its index')
         previous = first - 1
         for address, encoding in page_entries:
-            if not previous < address < next_first:
+            if not previous <= address < next_first:
                 raise ValueError('Unordered compact unwind function range')
             previous = address
-            entries.append((address, encoding))
+            # Native compact-unwind lookup uses the last record at a shared
+            # start address (upper_bound), including linker-coalesced aliases.
+            if entries and entries[-1][0] == address:
+                entries[-1] = (address, encoding)
+            else:
+                entries.append((address, encoding))
     if indices[-1][1] != 0:
         raise ValueError('Compact unwind index has no terminal entry')
     ends = [address for address, _ in entries[1:]] + [indices[-1][0]]
@@ -132,23 +137,28 @@ def prepare_guest_unwind(image, work):
     data = bytes(section.content)
     entries, personalities = _decode(data)
     text = image.get_segment('__TEXT')
-    writable = image.get_segment('__DATA')
     base = image.imagebase
-    text_limit = text.virtual_address - base + text.virtual_size
-    data_begin = writable.virtual_address - base
-    data_end = data_begin + writable.virtual_size
+    executable_ranges = [(s.virtual_address-base,s.virtual_address-base+s.virtual_size)
+                         for s in image.segments if s.init_protection & 4]
+    readable_ranges = [(s.virtual_address-base,s.virtual_address-base+s.virtual_size)
+                       for s in image.segments if s.init_protection & 1]
     for slot in personalities:
-        if not data_begin <= slot <= data_end - 8:
+        if not any(segment.max_protection & 2 and segment.virtual_address - base <= slot
+                   and slot + 8 <= segment.virtual_address - base + segment.virtual_size
+                   for segment in image.segments):
             raise ValueError('Guest personality slot is outside writable image data')
     assembly = ['.section .eh_frame,"a",%progbits']
     needed = {0}
-    supported, skipped = [], 0
+    supported, dwarf, skipped = [], [], 0
     for first, end, encoding, lsda in entries:
         mode = encoding & MODE_MASK
         personality = (encoding >> 28) & 3
-        if not 0 <= first < end <= text_limit or personality > len(personalities):
+        if not any(lo <= first < end <= hi for lo,hi in executable_ranges) or personality > len(personalities):
             raise ValueError('Invalid guest unwind function/personality range')
-        if bool(encoding & HAS_LSDA) != bool(lsda) or lsda and not 0 < lsda < text_limit:
+        if mode == 0x03000000:
+            dwarf.append((first, end, encoding, lsda))
+            continue
+        if bool(encoding & HAS_LSDA) != bool(lsda) or lsda and not any(lo <= lsda < hi for lo,hi in readable_ranges):
             raise ValueError('Guest compact unwind LSDA flag disagrees with its index')
         if mode == 0:
             if lsda or personality:
@@ -166,12 +176,18 @@ def prepare_guest_unwind(image, work):
         assembly += _cie(personality, personalities[personality - 1] if personality else 0)
     for index, entry in enumerate(supported):
         assembly += _fde(index, *entry)
+    dwarf_metadata = dict(cies=0, fdes=0)
+    if dwarf:
+        from .dwarf import translate_dwarf_unwind
+        translated, dwarf_metadata = translate_dwarf_unwind(image, dwarf)
+        assembly += translated
     metadata = {
         'format': 'Mach-O ARM64 compact unwind -> ELF eh_frame',
         'input_entries': len(entries), 'translated_entries': len(supported),
         'cant_unwind_entries': skipped, 'lsda_entries': sum(bool(row[3]) for row in supported),
         'modes': dict(Counter(hex(row[2] & MODE_MASK) for row in entries)),
         'personality_slots': list(personalities),
+        'dwarf': dwarf_metadata,
     }
     (work / 'guest-unwind.json').write_text(json.dumps(metadata, indent=2) + '\n', encoding='utf-8')
     return assembly

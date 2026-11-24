@@ -70,6 +70,12 @@ static struct GuestCppString *cpp_string_assign(struct GuestCppString *value,con
     if (value!=other) { struct GuestCppString copy; cpp_string_copy(&copy,other); cpp_string_destroy(value); *value=copy; }
     return value;
 }
+static struct GuestCppString *cpp_string_assign_bytes(struct GuestCppString *value,const char *bytes,size_t length) {
+    struct GuestCppString copy;cpp_string_init(&copy,bytes,length);cpp_string_destroy(value);*value=copy;return value;
+}
+static struct GuestCppString *cpp_string_assign_cstring(struct GuestCppString *value,const char *bytes) {
+    if(!bytes)stop("Null std::string source","assign");return cpp_string_assign_bytes(value,bytes,strlen(bytes));
+}
 static float cpp_stof(const struct GuestCppString *value,size_t *position) {
     const char *source=cpp_string_data(value); char *end;
     int saved=errno; errno=0; float result=strtof(source,&end); int error=errno; errno=saved;
@@ -79,6 +85,7 @@ static float cpp_stof(const struct GuestCppString *value,size_t *position) {
     return result;
 }
 static void cpp_mutex_lock(struct DarwinMutex *mutex) { if (guest_mutex_lock(mutex)) stop("std::mutex lock failed","C++ mutex"); }
+static unsigned char cpp_mutex_trylock(struct DarwinMutex *mutex) { return guest_mutex_trylock(mutex)==0; }
 static void cpp_mutex_unlock(struct DarwinMutex *mutex) { if (guest_mutex_unlock(mutex)) stop("std::mutex unlock failed","C++ mutex"); }
 static Word cpp_mutex_destroy(struct DarwinMutex *mutex) { if (guest_mutex_destroy(mutex)) stop("std::mutex destroy failed","C++ mutex"); return (Word)mutex; }
 static void *cpp_library;
@@ -186,10 +193,13 @@ static Word resolve_cpp_import(const char *name) {
         if (!strcmp(suffix,"C1ERKS5_mmRKS4_")) return (Word)cpp_string_substring;
         if (!strcmp(suffix,"D1Ev")) return (Word)cpp_string_destroy;
         if (!strcmp(suffix,"aSERKS5_")) return (Word)cpp_string_assign;
+        if (!strcmp(suffix,"6assignEPKc") || !strcmp(suffix,"aSEPKc")) return (Word)cpp_string_assign_cstring;
+        if (!strcmp(suffix,"6assignEPKcm")) return (Word)cpp_string_assign_bytes;
         return 0;
     }
     if (!strcmp(name,"__ZNSt3__14stofERKNS_12basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEEPm")) return (Word)cpp_stof;
     if (!strcmp(name,"__ZNSt3__15mutex4lockEv")) return (Word)cpp_mutex_lock;
+    if (!strcmp(name,"__ZNSt3__15mutex8try_lockEv")) return (Word)cpp_mutex_trylock;
     if (!strcmp(name,"__ZNSt3__15mutex6unlockEv")) return (Word)cpp_mutex_unlock;
     if (!strcmp(name,"__ZNSt3__15mutexD1Ev")) return (Word)cpp_mutex_destroy;
     if (!strcmp(name,"__ZNKSt3__120__vector_base_commonILb1EE20__throw_length_errorEv") || !strcmp(name,"__ZNKSt3__121__basic_string_commonILb1EE20__throw_length_errorEv")) return (Word)cpp_length_error;
