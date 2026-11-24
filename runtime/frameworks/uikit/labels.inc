@@ -1,6 +1,6 @@
 /* UIKit keeps ownership of content and positions. Android lays out the same
  * attributed runs and native attachment bounds for both sizeToFit and drawing. */
-struct LabelState { Word object,text,attributed,font,color,shadow,synced_text,synced_owner; jobject rich_text; long alignment,lines,line_break; double preferred_width;int adjusts,synced; float metrics[16]; jint options[9]; struct LabelState *next;
+struct LabelState { Word object,text,attributed,font,color,shadow,synced_text,synced_owner; jobject rich_text; long alignment,lines,line_break,baseline; double preferred_width,minimum_scale;int adjusts,synced; float metrics[17]; jint options[10]; struct LabelState *next;
 #if I2A_DEVELOPMENT
     unsigned diagnostic_traces;
 #endif
@@ -22,6 +22,7 @@ static struct LabelState *label_state(Word object) {
 static int label_object(Word object) { const char *base=object ? external_base(read_word(object)) : NULL; return base && !strcmp(base,"_OBJC_CLASS_$_UILabel"); }
 static void label_collect_order(Word object,struct Sequence *order) {
     if (label_object(object) || view_state(object)->control || view_state(object)->web || view_state(object)->input || view_state(object)->table) sequence_add(order,"UIView drawing order",object);
+    if(view_state(object)->layer)layer_collect_order(view_state(object)->layer,order);
     struct Sequence *children=(void *)view_state(object)->children;
     for (size_t i=0;i<children->count;++i) label_collect_order(children->items[i],order);
 }
@@ -151,9 +152,9 @@ static void ui_label_sync(Word object) {
     struct UIKitFont *font=s->font ? (void *)s->font : NULL; struct UIKitShadow *shadow=s->shadow ? (void *)s->shadow : NULL;
     float metrics[]={ (float)((font ? font->size : 17)*scale),(float)(x*scale),(float)(y*scale),(float)(v->frame.width*scale),(float)(v->frame.height*scale),(float)alpha,
         shadow ? (float)(shadow->blur*scale) : 0,shadow ? (float)(shadow->offset.width*scale) : 0,shadow ? (float)(shadow->offset.height*scale) : 0,
-        layer ? (float)(layer->corner*scale) : 0,layer ? (float)layer->z : 0,(float)view_window_level(object),geometry[7],geometry[8],geometry[9],geometry[10] };
+        layer ? (float)(layer->corner*scale) : 0,layer ? (float)layer->z : 0,(float)view_window_level(object),geometry[7],geometry[8],geometry[9],geometry[10],(float)s->minimum_scale };
     jint options[]={ (jint)label_argb(s->color,0xff000000),(jint)s->alignment,(jint)s->lines,(jint)label_argb(v->background,0),visible && attached,s->adjusts,
-        shadow ? (jint)label_argb(shadow->color,0x55000000) : 0,attached,(jint)s->line_break };
+        shadow ? (jint)label_argb(shadow->color,0x55000000) : 0,attached,(jint)s->line_break,(jint)s->baseline };
      
     if (s->synced && s->synced_owner==owner && s->synced_text==s->text && !memcmp(s->metrics,metrics,sizeof(metrics)) && !memcmp(s->options,options,sizeof(options))) return;
     if (!attached && (!s->synced || !s->options[7])) return;
@@ -201,6 +202,10 @@ static void label_lines(Word object,const char *selector,long value) { struct La
 static Word label_get_lines(Word object) { return label_state(object)->lines; }
 static void label_adjusts(Word object,const char *selector,Word value) { label_state(object)->adjusts=value!=0; ui_label_sync(object); }
 static Word label_get_adjusts(Word object) { return label_state(object)->adjusts; }
+static void label_set_baseline(Word object,const char *selector,Word value) { if(value>2)stop("Invalid baseline adjustment",selector);label_state(object)->baseline=(long)value;ui_label_sync(object); }
+static Word label_baseline(Word object) { return (Word)label_state(object)->baseline; }
+static void label_set_minimum_scale(Word object,const char *selector,double value) { if(!isfinite(value) || value<0 || value>1)stop("Invalid minimum label scale",selector);label_state(object)->minimum_scale=value;ui_label_sync(object); }
+static double label_minimum_scale(Word object) { return label_state(object)->minimum_scale; }
 static void label_line_break(Word object,const char *selector,Word value) { struct LabelState *state=label_state(object); if (value>5 || value==1 || (state->lines!=1 && (value==3 || value==5))) stop("Unsupported label wrapping mode",selector); state->line_break=value; view_request_layout(object,selector); ui_label_sync(object); }
 static Word label_get_line_break(Word object) { return label_state(object)->line_break; }
 static void label_set_preferred_width(Word object,const char *selector,double width) { if(!isfinite(width) || width<0)stop("Invalid preferred label width",selector);struct LabelState *state=label_state(object);if(state->preferred_width==width)return;state->preferred_width=width;view_request_layout(object,selector); }
@@ -244,6 +249,14 @@ static struct GuestSize ui_string_size(Word object,const char *selector,Word fon
     if (state.rich_text) { JNIEnv *env=attached_environment(selector); (*env)->DeleteGlobalRef(env,state.rich_text); }
     return result;
 }
+static struct GuestRect attributed_bounding_rect(Word object,const char *selector,struct GuestSize size,Word options,Word context) {
+    if(context || (options&~(Word)35))stop("Unsupported text drawing context or options",selector);if(isnan(size.width) || isnan(size.height) || size.width<0 || size.height<0)stop("Invalid text drawing size",selector);
+    if(!size.width || !size.height || !attributed_length(object,selector))return (struct GuestRect){0};static Word font;if(!font)font=ui_font_system(external_class("_OBJC_CLASS_$_UIFont"),"systemFontOfSize:",12);
+    struct LabelState state={.text=attributed_string(object),.attributed=object,.font=font,.alignment=4};JNIEnv *env=attached_environment(selector);jclass cls=(*env)->GetObjectClass(env,activity);jobject text=label_rich_text(env,cls,&state);static jmethodID measure;
+    if(!measure)measure=(*env)->GetMethodID(env,cls,"measureGuestAttributedText","(Ljava/lang/CharSequence;FFFI)[F");double scale=screen_scale();jfloatArray result=(*env)->CallObjectMethod(env,activity,measure,text,(jfloat)(12*scale),(jfloat)(size.width*scale),(jfloat)(size.height*scale),(jint)options);jfloat measured[2]={0};if(result && (*env)->GetArrayLength(env,result)==2)(*env)->GetFloatArrayRegion(env,result,0,2,measured);
+    if(result)(*env)->DeleteLocalRef(env,result);if(state.rich_text)(*env)->DeleteGlobalRef(env,state.rich_text);(*env)->DeleteLocalRef(env,cls);if((*env)->ExceptionCheck(env)){(*env)->ExceptionClear(env);stop("Android attributed text measurement failed",selector);}return (struct GuestRect){0,0,measured[0]/scale,measured[1]/scale};
+}
+static struct GuestSize attributed_size(Word object,const char *selector) { struct GuestRect rect=attributed_bounding_rect(object,selector,(struct GuestSize){INFINITY,INFINITY},0,0);return (struct GuestSize){rect.width,rect.height}; }
 static void label_fit(Word object,const char *selector) { struct ViewState *v=view_state(object); struct GuestSize size=label_size(object,selector,(struct GuestSize){v->frame.width,INFINITY}); v->frame.width=v->bounds.width=size.width; v->frame.height=v->bounds.height=size.height; ui_label_sync(object); }
 static struct ControlState *control_state(Word object) {
     struct ViewState *view=view_state(object);
@@ -284,7 +297,7 @@ static void ui_control_sync(Word object) {
     struct ViewState *view=view_state(object); struct ControlState *state=view->control;
     if(view->table)return;
     uint32_t background=ui_cell_background(object,label_argb(view->background,0));
-    if (!state && background && class_inherits(read_word(object),external_class("_OBJC_CLASS_$_UIView"))) state=control_state(object);
+    if (!state && (background || ui_layer_has_content(object)) && class_inherits(read_word(object),external_class("_OBJC_CLASS_$_UIView"))) state=control_state(object);
     if (!state) return;
     float geometry[11];int visibility[3];Word owner=view_host_geometry(object,geometry,visibility);
     double scale=screen_scale(),x=geometry[0]/scale,y=geometry[1]/scale,alpha=geometry[4];int visible=visibility[0],enabled=visibility[2] && state->enabled;
@@ -454,7 +467,7 @@ static void ui_view_request_display(Word object,const char *selector) {
 }
 static struct GuestSize image_view_size(Word object,const char *selector,struct GuestSize limit) { Word image=control_state(object)->image; struct ImageSize size=image ? ui_image_size(image) : (struct ImageSize){0}; return (struct GuestSize){size.width,size.height}; }
 static void image_view_fit(Word object,const char *selector) { struct ViewState *view=view_state(object); struct GuestSize size=image_view_size(object,selector,(struct GuestSize){0}); struct GuestRect frame=view->frame; frame.width=size.width; frame.height=size.height; view_set_frame(object,selector,frame); }
-static int ui_view_rendered(Word object) { return label_object(object) || view_state(object)->control!=NULL || view_state(object)->web!=NULL || view_state(object)->input!=NULL || view_state(object)->table!=NULL; }
+static int ui_view_rendered(Word object) { return (layer_object(object) && !view_state(object)->view) || label_object(object) || view_state(object)->control!=NULL || view_state(object)->web!=NULL || view_state(object)->input!=NULL || view_state(object)->table!=NULL; }
 static void ui_view_load_label(Word object,plist_t node){
     const char *text=plist_get_string_ptr(plist_dict_get_item(node,"text"),NULL);if(text)label_text(object,"Archived label",copy_string(text));
     plist_t color=plist_dict_get_item(node,"textColor");if(plist_get_node_type(color)==PLIST_ARRAY){double rgba[4]={0};for(unsigned i=0;i<4;++i)plist_get_real_val(plist_array_get_item(color,i),rgba+i);label_color(object,"Archived label",ui_color_rgba(external_class("_OBJC_CLASS_$_UIColor"),"colorWithRed:green:blue:alpha:",rgba[0],rgba[1],rgba[2],rgba[3]));}
@@ -506,6 +519,7 @@ static Method ui_labels_method(Word object,const char *selector,const char *rece
     if(!class_receiver && class_inherits(read_word(object),external_class("_OBJC_CLASS_$_UITextView")) && !strcmp(selector,"sizeThatFits:"))return (Method)text_editor_size;
     if (!class_receiver && !strcmp(selector,"intrinsicContentSize")){struct ViewState *state=existing_view_state(object);if(label_object(object) || (state && state->control))return (Method)ui_view_intrinsic_size;}
     Word cls=class_receiver ? object : read_word(object);
+    if(!class_receiver && class_inherits(cls,external_class("_OBJC_CLASS_$_NSAttributedString"))){if(!strcmp(selector,"boundingRectWithSize:options:context:"))return (Method)attributed_bounding_rect;if(!strcmp(selector,"size"))return (Method)attributed_size;}
     if (!class_receiver && class_inherits(cls,external_class("_OBJC_CLASS_$_UIActivityIndicatorView"))) {
         if (!strcmp(selector,"initWithActivityIndicatorStyle:")) return (Method)indicator_init;
         if (!strcmp(selector,"initWithFrame:")) return (Method)indicator_init_frame;
@@ -555,6 +569,8 @@ static Method ui_labels_method(Word object,const char *selector,const char *rece
     if (!strcmp(selector,"setTextAlignment:")) return (Method)label_alignment; if (!strcmp(selector,"textAlignment")) return (Method)label_get_alignment;
     if (!strcmp(selector,"setNumberOfLines:")) return (Method)label_lines; if (!strcmp(selector,"numberOfLines")) return (Method)label_get_lines;
     if (!strcmp(selector,"setAdjustsFontSizeToFitWidth:")) return (Method)label_adjusts; if (!strcmp(selector,"adjustsFontSizeToFitWidth")) return (Method)label_get_adjusts;
+    if(!strcmp(selector,"setBaselineAdjustment:"))return (Method)label_set_baseline;if(!strcmp(selector,"baselineAdjustment"))return (Method)label_baseline;
+    if(!strcmp(selector,"setMinimumScaleFactor:"))return (Method)label_set_minimum_scale;if(!strcmp(selector,"minimumScaleFactor"))return (Method)label_minimum_scale;
     if (!strcmp(selector,"setLineBreakMode:")) return (Method)label_line_break; if (!strcmp(selector,"lineBreakMode")) return (Method)label_get_line_break;
     if (!strcmp(selector,"sizeToFit")) return (Method)label_fit; if (!strcmp(selector,"sizeThatFits:")) return (Method)label_size;
     return NULL;

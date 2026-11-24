@@ -1,6 +1,3 @@
-struct GuestAffine { double a,b,c,d,tx,ty; };
-struct GuestTransform3D { double m[16]; };
-static const struct GuestTransform3D transform3d_identity={{1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1}};
 static struct GuestTransform3D transform3d_scale(double x,double y,double z) {
     struct GuestTransform3D result=transform3d_identity; result.m[0]=x; result.m[5]=y; result.m[10]=z; return result;
 }

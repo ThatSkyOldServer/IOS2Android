@@ -39,6 +39,24 @@ static const struct MetalFormat metal_formats[]={
     , {552,VK_FORMAT_R16G16B16A16_SFLOAT,8,1,1},{553,VK_FORMAT_R16G16B16A16_SFLOAT,8,1,1}
     , {554,VK_FORMAT_R16G16B16A16_SFLOAT,8,1,1},{555,VK_FORMAT_R16G16B16A16_SFLOAT,8,1,1}
 };
+static VkFormat metal_depth_stencil_backing(VkFormat requested) {
+    if (requested!=VK_FORMAT_D32_SFLOAT_S8_UINT) return requested;
+    static VkFormat cached;
+    VkFormat selected=__atomic_load_n(&cached,__ATOMIC_ACQUIRE);
+    if (selected) return selected;
+    PFN_vkGetPhysicalDeviceFormatProperties query=(PFN_vkGetPhysicalDeviceFormatProperties)vulkan.get_instance_proc(vulkan.instance,"vkGetPhysicalDeviceFormatProperties");
+    VkFormatProperties supported;
+    query(vulkan.physical,requested,&supported);
+    selected=requested;
+    if (!(supported.optimalTilingFeatures&VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+        query(vulkan.physical,VK_FORMAT_D24_UNORM_S8_UINT,&supported);
+        VkFormatFeatureFlags required=VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        /* D24S8 reduces GPU depth precision; preserve the Metal CPU layout. */
+        if ((supported.optimalTilingFeatures&required)==required) selected=VK_FORMAT_D24_UNORM_S8_UINT;
+    }
+    __atomic_store_n(&cached,selected,__ATOMIC_RELEASE);
+    return selected;
+}
 struct MetalTexture {
     struct MetalResource object;
     pthread_mutex_t mutex;
@@ -76,6 +94,10 @@ static Word metal_texture_new(Word device,const char *selector,struct MetalDescr
     int pvrtc=pixel>=160 && pixel<=167;
     if (pvrtc && !vulkan.pvrtc) {
         fallback=(struct MetalFormat){(unsigned)pixel,(pixel&1) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM,4,1,1,VK_IMAGE_ASPECT_COLOR_BIT};
+        format=&fallback;
+    }
+    if (format->format==VK_FORMAT_D32_SFLOAT_S8_UINT) {
+        fallback=*format; fallback.format=metal_depth_stencil_backing(format->format);
         format=&fallback;
     }
     struct MetalTexture *texture=calloc(1,sizeof(*texture)); if (!texture) return 0;
@@ -384,7 +406,13 @@ static void metal_texture_get_bytes(struct MetalTexture *texture,const char *sel
                 size_t index=(z*region.height+y)*region.width+x;
                 uint32_t value; memcpy(&value,mapped+index*4,4);
                 if (format.metal==255) { value=(value&0xffffffU)|((uint32_t)mapped[depth_plane+index]<<24); memcpy(out+x*4,&value,4); }
-                else { memcpy(out+x*8,&value,4); out[x*8+4]=mapped[depth_plane+index]; memset(out+x*8+5,0,3); }
+                else {
+                    if (format.format==VK_FORMAT_D24_UNORM_S8_UINT) {
+                        float depth_value=(float)(value&0xffffffU)/16777215.0f;
+                        memcpy(out+x*8,&depth_value,4);
+                    } else memcpy(out+x*8,&value,4);
+                    out[x*8+4]=mapped[depth_plane+index]; memset(out+x*8+5,0,3);
+                }
             }
         }
     }

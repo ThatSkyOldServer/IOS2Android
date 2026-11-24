@@ -214,7 +214,7 @@ public final class HostActivity extends Activity {
             public long[] bind(long table,int position,long previous,float width){return bindGuestTableRow(table,position,previous,width);}
             public String event(long table,int event,int position,long row,float top,float width,int state){return guestTableEvent(table,event,position,row,top,width,state);}
             public void alpha(long token,android.view.View view,float value){applyGuestAlpha(token,view,value);}
-            public void detached(long token){opacityViews.remove(token);}
+            public void detached(long token){forgetGuestComposition(token);}
             public void failure(String message){guestFailure(message);}
         });
         return tableContent;
@@ -225,89 +225,61 @@ public final class HostActivity extends Activity {
     private LabelOverlay guestOverlay(long owner) { return owner==0 ? guestLabelOverlay : tableContent==null ? null : tableContent.overlay(owner); }
     private final ConcurrentHashMap<Long, TextView> guestLabels = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Long, android.widget.ImageView> guestControls = new ConcurrentHashMap<>();
-    private final java.util.HashMap<Long, OpacityState> opacityViews = new java.util.HashMap<>();
-    private final java.util.HashMap<Long, AlphaChannel> alphaChannels = new java.util.HashMap<>();
-    private final Set<OpacityAnimation> opacityAnimations = new HashSet<>();
-    private static final class AlphaChannel {
-        final long token; final float before,after; final OpacityAnimation owner; float current;
-        AlphaChannel(long token,float before,float after,OpacityAnimation owner) { this.token=token; this.before=before; this.after=after; this.owner=owner; current=before; }
+    private ViewComposition viewComposition;
+    private native String completeViewAnimation(long token,int event,boolean completed);
+    private android.view.View guestView(long token) {
+        android.view.View view=guestLabels.get(token);if(view==null)view=guestControls.get(token);if(view==null && webContent!=null)view=webContent.view(token);if(view==null && textEditors!=null)view=textEditors.view(token);if(view==null && tableContent!=null)view=tableContent.view(token);if(view==null && viewComposition!=null)view=viewComposition.view(token);return view;
     }
-    private final class OpacityState {
-        final android.view.View view; final long[] ancestors; final float[] model; final float target;
-        AlphaChannel[] factors; float base;
-        OpacityState(android.view.View view,long[] ancestors,float[] model) {
-            this.view=view; this.ancestors=ancestors; this.model=model; float value=1; for(float alpha:model) value*=alpha; target=value; bind();
-        }
-        void bind() {
-            base=1; java.util.ArrayList<AlphaChannel> active=new java.util.ArrayList<>();
-            for(int i=0;i<ancestors.length;i++) { AlphaChannel channel=alphaChannels.get(ancestors[i]); if(channel==null) base*=model[i]; else active.add(channel); }
-            factors=active.toArray(new AlphaChannel[0]);
-        }
-        void render() {
-            float alpha=base; for(AlphaChannel channel:factors) alpha*=channel.current;
-            view.setAlpha(alpha); LabelOverlay.updateVisibility(view,view.getVisibility()==android.view.View.VISIBLE && alpha>0);
-        }
+    private ViewComposition viewComposition() {
+        if(viewComposition==null)viewComposition=new ViewComposition(this,new ViewComposition.Callback(){
+            public LabelOverlay overlay(long owner){return guestOverlay(owner);}
+            public android.view.View view(long token){return guestView(token);}
+            public String event(long token,int event,boolean completed){return completeViewAnimation(token,event,completed);}
+            public void failure(String message){guestFailure(message);}
+        });return viewComposition;
     }
-    private void applyGuestAlpha(long token,android.view.View view,float value) {
-        OpacityState state=opacityViews.get(token);
-        if(state!=null && Math.abs(state.target-value)<0.000001f) state.render(); else view.setAlpha(value);
+    private void forgetGuestComposition(long token){if(viewComposition!=null)viewComposition.remove(token);}
+    private void applyGuestAlpha(long token,android.view.View view,float value){viewComposition().alpha(token,view,value);}
+    private static final class CompositionUpdate {
+        final long owner;final boolean raw;final float[] presentation,clips;final long[] clipOwners;
+        CompositionUpdate(long owner,boolean raw,float[] presentation,float[] clips,long[] clipOwners){this.owner=owner;this.raw=raw;this.presentation=presentation;this.clips=clips;this.clipOwners=clipOwners;}
     }
-    private final class OpacityAnimation {
-        final android.animation.ValueAnimator animator=android.animation.ValueAnimator.ofFloat(0,1);
-        final AlphaChannel[] channels; final Set<Long> affected=new java.util.LinkedHashSet<>(); final long completion; boolean ended;
-        OpacityAnimation(long[] tokens,float[] before,float[] after,long completion) {
-            this.completion=completion; channels=new AlphaChannel[tokens.length];
-            for(int i=0;i<tokens.length;i++) channels[i]=new AlphaChannel(tokens[i],before[i],after[i],this);
-            animator.addUpdateListener(value-> { float fraction=value.getAnimatedFraction(); for(AlphaChannel channel:channels) channel.current=channel.before+(channel.after-channel.before)*fraction; render(); });
-            animator.addListener(new android.animation.AnimatorListenerAdapter() {
-                @Override public void onAnimationCancel(android.animation.Animator value) { finish(false); }
-                @Override public void onAnimationEnd(android.animation.Animator value) { finish(true); }
-            });
-        }
-        void render() { for(Long token:affected) { OpacityState state=opacityViews.get(token); if(state!=null) state.render(); } }
-        void finish(boolean completed) {
-            if(ended) return; ended=true;
-            for(AlphaChannel channel:channels) if(alphaChannels.get(channel.token)==channel) alphaChannels.remove(channel.token);
-            for(Long token:affected) { OpacityState state=opacityViews.get(token); if(state!=null) { state.bind(); state.render(); if(state.factors.length==0) opacityViews.remove(token); } }
-            opacityAnimations.remove(this);
-            if(completion!=0) { String failure=completeAnimation(completion,completed); if(failure!=null) guestFailure(failure); }
-        }
+    private final ConcurrentHashMap<Long,CompositionUpdate> pendingCompositions=new ConcurrentHashMap<>();
+    private void syncGuestComposition(long token,long owner,boolean raw,float[] presentation,float[] clips,long[] clipOwners) {
+        if(pendingCompositions.put(token,new CompositionUpdate(owner,raw,presentation,clips,clipOwners))!=null)return;
+        mainHandler.post(()->{CompositionUpdate update=pendingCompositions.remove(token);if(update!=null && !isDestroyed())viewComposition().sync(token,update.owner,update.raw,update.presentation,update.clips,update.clipOwners);});
     }
-    private void animateGuestOpacity(long[] changed,float[] before,float[] after,long[] tokens,int[] offsets,long[] ancestors,float[] model,long duration,long delay,int options,long completion) {
-        long requested=android.os.SystemClock.uptimeMillis();
-        mainHandler.post(()-> {
-            if(isDestroyed() || startupFailed) { if(completion!=0) completeAnimation(completion,false); return; }
-            Set<OpacityAnimation> interrupted=new HashSet<>();
-            for(int i=0;i<changed.length;i++) {
-                AlphaChannel old=alphaChannels.get(changed[i]);
-                if(old!=null) { if((options&4)!=0) before[i]=old.current; interrupted.add(old.owner); }
-            }
-            for(OpacityAnimation old:interrupted) old.animator.cancel();
-            OpacityAnimation animation=new OpacityAnimation(changed,before,after,completion);
-            for(AlphaChannel channel:animation.channels) alphaChannels.put(channel.token,channel);
-            for(int i=0;i<tokens.length;i++) {
-                android.view.View view=guestLabels.get(tokens[i]); if(view==null) view=guestControls.get(tokens[i]); if(view==null && webContent!=null)view=webContent.view(tokens[i]); if(view==null && textEditors!=null)view=textEditors.view(tokens[i]); if(view==null && tableContent!=null)view=tableContent.view(tokens[i]); if(view==null) continue;
-                opacityViews.put(tokens[i],new OpacityState(view,Arrays.copyOfRange(ancestors,offsets[i],offsets[i+1]),Arrays.copyOfRange(model,offsets[i],offsets[i+1])));
-                animation.affected.add(tokens[i]);
-            }
-            opacityAnimations.add(animation);
-            long elapsed=Math.max(0,android.os.SystemClock.uptimeMillis()-requested),playTime=Math.max(0,elapsed-delay);
-            if((options&8)==0 && elapsed>=delay && (duration==0 || playTime>=duration)) { for(AlphaChannel channel:animation.channels) channel.current=channel.after; animation.render(); animation.finish(true); return; }
-            int curve=(options>>16)&3;
-            animation.animator.setInterpolator(curve==1 ? new android.view.animation.AccelerateInterpolator() : curve==2 ? new android.view.animation.DecelerateInterpolator() : curve==3 ? new android.view.animation.LinearInterpolator() : new android.view.animation.AccelerateDecelerateInterpolator());
-            animation.animator.setDuration(duration); animation.animator.setStartDelay(Math.max(0,delay-elapsed));
-            if((options&8)!=0) { animation.animator.setRepeatCount(android.animation.ValueAnimator.INFINITE); animation.animator.setRepeatMode((options&16)!=0 ? android.animation.ValueAnimator.REVERSE : android.animation.ValueAnimator.RESTART); }
-            animation.render(); animation.animator.start(); if(playTime>0) animation.animator.setCurrentPlayTime(playTime);
-            if(BuildProfile.DEVELOPMENT) Log.i("I2AGuest","UIView opacity animation: sources="+changed.length+" views="+tokens.length+" duration="+duration+" delay="+delay);
-        });
+    private static final class LayerUpdate {
+        final long owner;final boolean raw,replace;final float[] metrics,locations;final int[] options,colors;final byte[] image;
+        LayerUpdate(long owner,boolean raw,boolean replace,float[] metrics,int[] options,int[] colors,float[] locations,byte[] image){this.owner=owner;this.raw=raw;this.replace=replace;this.metrics=metrics;this.options=options;this.colors=colors;this.locations=locations;this.image=image;}
+    }
+    private final ConcurrentHashMap<Long,LayerUpdate> pendingLayers=new ConcurrentHashMap<>();
+    private void syncGuestLayer(long token,long owner,boolean raw,boolean replace,float[] metrics,int[] options,int[] colors,float[] locations,byte[] image) {
+        final boolean[] schedule={false};pendingLayers.compute(token,(key,previous)->{schedule[0]=previous==null;return new LayerUpdate(owner,raw,replace || previous!=null && previous.replace,metrics,options,colors,locations,!replace && previous!=null ? previous.image : image);});
+        if(schedule[0])mainHandler.post(()->{LayerUpdate update=pendingLayers.remove(token);if(update!=null && !isDestroyed())try{viewComposition().layer(token,update.owner,update.raw,update.replace,update.metrics,update.options,update.colors,update.locations,update.image);}catch(RuntimeException error){guestFailure("Unable to display the supplied layer: "+error.getMessage());}});
+    }
+    private void animateGuestViews(long[] changed,float[] before,float[] after,long[] tokens,int[] offsets,long[] ancestors,float[] model,float[] framesBefore,float[] framesAfter,long duration,long delay,int options,float damping,float velocity,float repeat,long completion) {
+        long requested=android.os.SystemClock.uptimeMillis();mainHandler.post(()->{if(isDestroyed() || startupFailed){if(completion!=0)completeViewAnimation(completion,1,false);return;}viewComposition().animate(changed,before,after,tokens,offsets,ancestors,model,framesBefore,framesAfter,duration,delay,options,damping,velocity,repeat,completion,requested);});
     }
     private void reorderGuestLabels(long[] order) {
         mainHandler.post(()-> {
             if(guestLabelOverlay==null || isDestroyed()) return;
-            for(long token:order) { android.view.View view=guestLabels.get(token); if(view==null) view=guestControls.get(token); if(view==null && webContent!=null)view=webContent.view(token); if(view==null && textEditors!=null)view=textEditors.view(token); if(view==null && tableContent!=null)view=tableContent.view(token); if(view!=null && view.getParent() instanceof LabelOverlay)((LabelOverlay)view.getParent()).bringChildToFront(view); }
+            for(long token:order) { android.view.View view=guestView(token); if(view!=null && view.getParent() instanceof LabelOverlay)((LabelOverlay)view.getParent()).bringChildToFront(view); }
         });
     }
     private final TextRenderer guestText = new TextRenderer(this);
+    private static final class GuestLabel extends TextView {
+        private CharSequence source;private float originalSize,minimumScale,factor=1,originalHeight,originalBaseline,naturalWidth;private boolean adjusts;private int baseline;
+        GuestLabel(android.content.Context context){super(context);}
+        void configure(CharSequence text,float size,boolean adjusts,float minimumScale,int baseline){
+            boolean changed=source!=text || originalSize!=size;boolean settings=this.adjusts!=adjusts || this.minimumScale!=minimumScale || this.baseline!=baseline;source=text;originalSize=size;this.adjusts=adjusts;this.minimumScale=minimumScale;this.baseline=baseline;
+            if(changed){float[] metrics=TextRenderer.singleLineMetrics(text,size);naturalWidth=metrics[0];originalHeight=metrics[1];originalBaseline=metrics[2];}if(changed || settings)fit(true);
+        }
+        private void fit(boolean changed){if(source==null)return;float available=Math.max(0,getWidth()-getPaddingLeft()-getPaddingRight());float scale=adjusts && available>0 && naturalWidth>available ? Math.max(Math.max(.001f,minimumScale),available/naturalWidth) : 1;if(changed || factor!=scale){factor=scale;super.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX,originalSize*scale);super.setText(TextRenderer.scaled(source,scale));invalidate();}}
+        @Override protected void onSizeChanged(int w,int h,int oldw,int oldh){super.onSizeChanged(w,h,oldw,oldh);if(w!=oldw)fit(false);}
+        @Override protected void onDraw(android.graphics.Canvas canvas){android.text.Layout layout=getLayout();float shift=0;if(factor<1 && layout!=null){float originalTop=(getHeight()-getPaddingTop()-getPaddingBottom()-originalHeight)/2f,scaledTop=(getHeight()-getPaddingTop()-getPaddingBottom()-layout.getHeight())/2f;if(baseline==0)shift=originalTop+originalBaseline-scaledTop-layout.getLineBaseline(0);else if(baseline==2)shift=originalTop-scaledTop;}
+            if(shift==0){super.onDraw(canvas);return;}int saved=canvas.save();canvas.translate(0,shift);super.onDraw(canvas);canvas.restoreToCount(saved);}
+    }
     private android.text.SpannableStringBuilder createGuestText(String text) { return new android.text.SpannableStringBuilder(text); }
     private float addGuestTextRun(android.text.SpannableStringBuilder text,int start,int end,String name,int traits,float size,int color,int alignment,float spacing,float kern,float baseline) { return guestText.run(text,start,end,name,traits,size,color,alignment,spacing,kern,baseline); }
     private void addGuestTextAttachment(android.text.SpannableStringBuilder text,int index,byte[] png,float[] bounds,boolean template) { guestText.attachment(text,index,png,bounds,template); }
@@ -329,13 +301,13 @@ public final class HostActivity extends Activity {
             if (guestContent == null || isDestroyed()) return;
             TextView label = guestLabels.get(token);
             if (o[7] == 0) {
-                if (label != null) { opacityViews.remove(token); LabelOverlay.detach(label); guestLabels.remove(token); }
+                if (label != null) { forgetGuestComposition(token); LabelOverlay.detach(label); guestLabels.remove(token); }
                 return;
             }
             LabelOverlay overlay=guestOverlay(owner);if(overlay==null)return;
             if (label == null) {
                 if (o[4] == 0) return;
-                label = new TextView(this); label.setPadding(0, 0, 0, 0); label.setIncludeFontPadding(false);
+                label = new GuestLabel(this); label.setPadding(0, 0, 0, 0); label.setIncludeFontPadding(false);
                 label.setFallbackLineSpacing(true);
                 label.setBreakStrategy(android.text.Layout.BREAK_STRATEGY_SIMPLE); label.setHyphenationFrequency(android.text.Layout.HYPHENATION_FREQUENCY_NONE);
                 guestLabels.put(token, label);
@@ -344,12 +316,10 @@ public final class HostActivity extends Activity {
             LabelUpdate previous = (LabelUpdate)label.getTag();
             float[] p = previous == null ? null : previous.metrics;
             int[] q = previous == null ? null : previous.options;
-            if (previous == null || previous.text != text) label.setText(text);
             if (q == null || q[0] != o[0]) label.setTextColor(o[0]);
-            if (p == null || p[0] != m[0]) label.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, m[0]);
             if (q == null || q[2] != o[2]) label.setMaxLines(o[2] == 0 ? Integer.MAX_VALUE : o[2]);
-            if (q == null || q[2] != o[2] || q[8] != o[8]) {
-                label.setHorizontallyScrolling(o[2]==1 && o[8]>=2);
+            if (q == null || q[2] != o[2] || q[8] != o[8] || q[5]!=o[5]) {
+                label.setHorizontallyScrolling(o[2]==1 && (o[8]>=2 || o[5]!=0));
                 label.setEllipsize(o[8]==3 ? android.text.TextUtils.TruncateAt.START : o[8]==4 ? android.text.TextUtils.TruncateAt.END : o[8]==5 ? android.text.TextUtils.TruncateAt.MIDDLE : null);
             }
             if (q == null || q[1] != o[1]) label.setGravity(android.view.Gravity.CENTER_VERTICAL | (o[1] == 1 ? android.view.Gravity.CENTER_HORIZONTAL : o[1] == 2 ? android.view.Gravity.RIGHT : android.view.Gravity.LEFT));
@@ -365,13 +335,12 @@ public final class HostActivity extends Activity {
             label.setClipBounds(new android.graphics.Rect((int)m[12],(int)m[13],(int)Math.ceil(m[12]+m[14]),(int)Math.ceil(m[13]+m[15])));
             label.setVisibility(o[4] != 0 ? android.view.View.VISIBLE : android.view.View.GONE);
             overlay.visibility(label,o[4] != 0 && m[5] > 0);
-            if (p == null || p[0] != m[0] || q[5] != o[5]) {
-                if (Build.VERSION.SDK_INT >= 26 && o[5] != 0 && m[0] > 1) label.setAutoSizeTextTypeUniformWithConfiguration(1, Math.max(2, Math.round(m[0])), 1, android.util.TypedValue.COMPLEX_UNIT_PX);
-                else label.setAutoSizeTextTypeWithDefaults(TextView.AUTO_SIZE_TEXT_TYPE_NONE);
-            }
+            ((GuestLabel)label).configure(text,m[0],o[5]!=0 && o[2]==1,m[16],o[9]);
             label.setTag(new LabelUpdate(owner,text,m,o));
+            viewComposition().bind(token,label);
     }
     private float[] measureGuestText(CharSequence text, float size, float limit, int lines, int lineBreak) { return TextRenderer.measure(text,size,limit,lines,lineBreak); }
+    private float[] measureGuestAttributedText(CharSequence text,float size,float width,float height,int options){return TextRenderer.measureAttributed(text,size,width,height,options);}
     private float guestFontScale() { return getResources().getConfiguration().fontScale; }
     private int guestLayoutDirection() { return getResources().getConfiguration().getLayoutDirection(); }
     private native String completeControlEvent(long token, int event, boolean highlighted);
@@ -398,7 +367,7 @@ public final class HostActivity extends Activity {
         float[] m=update.metrics; int[] o=update.options;
         android.widget.ImageView view=guestControls.get(token);
         if(o[1]==0) {
-            if(view!=null) { opacityViews.remove(token); if(view.getDrawable() instanceof android.graphics.drawable.Animatable) ((android.graphics.drawable.Animatable)view.getDrawable()).stop(); LabelOverlay.detach(view); guestControls.remove(token); view.setImageDrawable(null); }
+            if(view!=null) { forgetGuestComposition(token); if(view.getDrawable() instanceof android.graphics.drawable.Animatable) ((android.graphics.drawable.Animatable)view.getDrawable()).stop(); LabelOverlay.detach(view); guestControls.remove(token); view.setImageDrawable(null); }
             pressedControls.remove(token); if(exclusiveControl==token) exclusiveControl=0; return;
         }
         LabelOverlay overlay=guestOverlay(update.owner);if(overlay==null)return;
@@ -462,6 +431,7 @@ public final class HostActivity extends Activity {
             }
         }
         view.setTag(new ControlUpdate(update.owner,null,false,m,o,update.description));
+        viewComposition().bind(token,view);
     }
     private boolean guestScreenRequested;
     private final java.util.concurrent.atomic.AtomicInteger processDisplayRequests=new java.util.concurrent.atomic.AtomicInteger();
@@ -585,7 +555,7 @@ public final class HostActivity extends Activity {
             public void selection(long token,int start,int end){editorSelection(token,start,end);}
             public void scroll(long token,float x,float y,float width,float height){editorScroll(token,x,y,width,height);}
             public void alpha(long token,android.view.View view,float value){applyGuestAlpha(token,view,value);}
-            public void detached(long token){opacityViews.remove(token);}
+            public void detached(long token){forgetGuestComposition(token);}
         });
         return textEditors;
     }
@@ -862,7 +832,7 @@ public final class HostActivity extends Activity {
         if(webContent==null)webContent=new WebContent(this,guestLabelOverlay,new WebContent.Callback() {
             @Override public long event(long token,int kind,long operation,String data) { return webViewEvent(token,kind,operation,data); }
             @Override public void alpha(long token,android.view.View view,float value) { applyGuestAlpha(token,view,value); }
-            @Override public void detached(long token) { opacityViews.remove(token); }
+            @Override public void detached(long token) { forgetGuestComposition(token); }
         });
         return webContent;
     }
@@ -1179,7 +1149,7 @@ public final class HostActivity extends Activity {
         networkServices.clear();
         synchronized(this){processActivitiesClosed=true;for(Long identifier:processActivities.keySet())processActivity(identifier,0,false);}
         closeGuestAccessibility();
-        for(OpacityAnimation animation:new java.util.ArrayList<>(opacityAnimations)) animation.animator.cancel();
+        if(viewComposition!=null)viewComposition.close();pendingCompositions.clear();pendingLayers.clear();
         if(guestLaunch!=null) { guestLaunch.release(); guestLaunch=null; }
         if(audioSession!=null) audioSession.close();
         sound.close();

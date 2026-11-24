@@ -191,7 +191,7 @@ final class TextInput implements View.OnAttachStateChangeListener,
                     else if(editor.getParent()!=null){ime.cancel();LabelOverlay.detach(editor);callback.detached(token);}
                     int width=Math.max(0,(int)Math.ceil(m[2])),height=Math.max(0,(int)Math.ceil(m[3]));android.view.ViewGroup.LayoutParams old=editor.getLayoutParams();
                     if(old==null || old.width!=width || old.height!=height)editor.setLayoutParams(new android.widget.FrameLayout.LayoutParams(width,height));
-                    editor.setTranslationX(m[0]);editor.setTranslationY(m[1]);callback.alpha(token,editor,m[4]);parent.depth(editor,m[5],m[6]);
+                    editor.setTranslationX(m[0]);editor.setTranslationY(m[1]);parent.depth(editor,m[5],m[6]);
                     editor.setClipBounds(new android.graphics.Rect((int)m[7],(int)m[8],(int)Math.ceil(m[7]+m[9]),(int)Math.ceil(m[8]+m[10])));
                     editor.setPadding(Math.round(m[12]),Math.round(m[13]),Math.round(m[14]),Math.round(m[15]));editor.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX,m[11]);
                     int type=TextInput.inputType(o[7],o[9],o[10]!=0);
@@ -206,6 +206,7 @@ final class TextInput implements View.OnAttachStateChangeListener,
                     int start=Math.min(editor.length(),Math.max(0,o[15])),end=Math.min(editor.length(),Math.max(start,o[16]));if(editor.getSelectionStart()!=start || editor.getSelectionEnd()!=end)editor.setSelection(start,end);
                     editor.setVerticalScrollBarEnabled(o[18]!=0);editor.setHorizontalScrollBarEnabled(o[19]!=0);editor.scrollTo(Math.round(m[16]),Math.round(m[17]));
                     editor.setEnabled(o[2]!=0);editor.setVisibility(o[0]!=0 ? View.VISIBLE : View.GONE);parent.visibility(editor,o[0]!=0 && m[4]>0);
+                    if(o[1]!=0)callback.alpha(token,editor,m[4]);
                 }finally{updating=false;}
             }
             void selection(){if(!updating && editor.getSelectionStart()>=0)callback.selection(token,Math.min(editor.getSelectionStart(),editor.getSelectionEnd()),Math.max(editor.getSelectionStart(),editor.getSelectionEnd()));}

@@ -77,11 +77,12 @@ final class WebContent {
             android.view.ViewGroup.LayoutParams previous=page.panel.getLayoutParams();
             if(previous==null || previous.width!=width || previous.height!=height)page.panel.setLayoutParams(new FrameLayout.LayoutParams(width,height));
             page.panel.setTranslationX(metrics[0]);page.panel.setTranslationY(metrics[1]);
-            callback.alpha(token,page.panel,metrics[4]);parent.depth(page.panel,metrics[5],metrics[6]);
+            parent.depth(page.panel,metrics[5],metrics[6]);
             page.panel.setClipBounds(new android.graphics.Rect((int)metrics[7],(int)metrics[8],(int)Math.ceil(metrics[7]+metrics[9]),(int)Math.ceil(metrics[8]+metrics[10])));
             page.panel.setVisibility(options[0]!=0 ? View.VISIBLE : View.GONE);page.enabled=options[2]!=0;page.background=options[3];
             if(page.web!=null){page.web.setEnabled(page.enabled);page.web.setBackgroundColor(page.background);}
             parent.visibility(page.panel,options[0]!=0 && metrics[4]>0);
+            callback.alpha(token,page.panel,metrics[4]);
     }
     View view(long token) { Page page=pages.get(token);return page==null ? null : page.panel; }
     void command(long token,String action,String input) {

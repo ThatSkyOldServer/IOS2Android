@@ -102,7 +102,7 @@ static VkResult metal_literal_sampler(uint64_t bits,VkSampler *output) {
 static VkFormat metal_pipeline_format(Word pixel) {
      
     if (pixel>=552 && pixel<=555) return VK_FORMAT_R16G16B16A16_SFLOAT;
-    for (unsigned i=0;i<COUNT(metal_formats);++i) if (metal_formats[i].metal==pixel) return metal_formats[i].format;
+    for (unsigned i=0;i<COUNT(metal_formats);++i) if (metal_formats[i].metal==pixel) return metal_depth_stencil_backing(metal_formats[i].format);
     return VK_FORMAT_UNDEFINED;
 }
 static VkFormat metal_vertex_format(Word format) {

@@ -100,6 +100,19 @@ final class TextRenderer {
         float actual=0; for (int i=0;i<layout.getLineCount();i++) actual=Math.max(actual,layout.getLineWidth(i));
         return new float[]{(float)Math.ceil(actual),layout.getHeight()};
     }
+    static float[] measureAttributed(CharSequence text,float size,float limit,float height,int options) {
+        TextPaint paint=new TextPaint(Paint.ANTI_ALIAS_FLAG);paint.setTextSize(size);float desired=Layout.getDesiredWidth(text,paint);int width=Float.isFinite(limit) ? Math.max(1,Math.min(1048576,(int)Math.ceil(limit))) : Math.max(1,Math.min(1048576,(int)Math.ceil(desired)));
+        if((options&1)==0)width=Math.max(1,Math.min(1048576,(int)Math.ceil(desired)));else width=Math.min(width,Math.max(1,(int)Math.ceil(desired)));
+        StaticLayout.Builder builder=StaticLayout.Builder.obtain(text,0,text.length(),paint,width).setIncludePad(false).setUseLineSpacingFromFallbacks(true).setBreakStrategy(Layout.BREAK_STRATEGY_SIMPLE).setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_NONE).setMaxLines((options&1)!=0 ? Integer.MAX_VALUE : 1);
+        StaticLayout layout=builder.build();if((options&32)!=0 && Float.isFinite(height) && layout.getHeight()>height){int lines=Math.max(1,layout.getLineForVertical(Math.max(0,(int)height)));while(lines>1 && layout.getLineBottom(lines-1)>height)--lines;layout=builder.setMaxLines(lines).setEllipsizedWidth(width).setEllipsize(TextUtils.TruncateAt.END).build();}
+        float actual=0;for(int i=0;i<layout.getLineCount();i++)actual=Math.max(actual,layout.getLineWidth(i));float measuredHeight=layout.getHeight();if((options&2)!=0){Paint.FontMetrics metrics=paint.getFontMetrics();measuredHeight+=Math.max(0,metrics.leading)*layout.getLineCount();}return new float[]{(float)Math.ceil(actual),measuredHeight};
+    }
+    static float[] singleLineMetrics(CharSequence text,float size) {
+        TextPaint paint=new TextPaint(Paint.ANTI_ALIAS_FLAG);paint.setTextSize(size);float width=Layout.getDesiredWidth(text,paint);StaticLayout layout=StaticLayout.Builder.obtain(text,0,text.length(),paint,Math.max(1,Math.min(1048576,(int)Math.ceil(width)))).setIncludePad(false).setUseLineSpacingFromFallbacks(true).setMaxLines(1).build();return new float[]{width,layout.getHeight(),layout.getLineBaseline(0)};
+    }
+    static CharSequence scaled(CharSequence text,float scale) {
+        if(scale==1 || !(text instanceof Spanned))return text;SpannableStringBuilder result=new SpannableStringBuilder(text);for(FontRun run:result.getSpans(0,result.length(),FontRun.class)){int start=result.getSpanStart(run),end=result.getSpanEnd(run),flags=result.getSpanFlags(run);result.removeSpan(run);result.setSpan(new FontRun(run.typeface,run.size*scale,run.kern*scale,run.baseline*scale),start,end,flags);}return result;
+    }
     byte[] fontBytes(String name) {
         String file=BuildProfile.fontFile(name,name.contains("Bold"),name.contains("Italic"));
         if (file==null) return null;

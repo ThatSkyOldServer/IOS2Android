@@ -16,23 +16,17 @@ static struct Sequence i2a_cancelled,i2a_delivery;
 static struct I2ATouchEvent i2a_touch_event;
 static uint64_t i2a_touch_deliveries[5];
 static struct GuestPoint touch_in_view(struct GuestPoint point,Word view) {
-    for (unsigned depth=0;view && view!=(Word)&main_window && depth<1024;++depth) {
-        struct ViewState *state=view_state(view);
-        point.x+=state->bounds.x-state->frame.x;
-        point.y+=state->bounds.y-state->frame.y;
-        view=state->parent;
-    }
-    return point;
+    if(!view)return point;point=ui_unproject_point(ui_world_matrix(view,0),point);point.x+=view_state(view)->bounds.x;point.y+=view_state(view)->bounds.y;return point;
 }
-static struct GuestPoint touch_location(struct I2ATouch *touch,const char *selector,Word view) { return touch_in_view(touch->location,view); }
-static struct GuestPoint touch_previous(struct I2ATouch *touch,const char *selector,Word view) { return touch_in_view(touch->previous,view); }
+static struct GuestPoint touch_location(struct I2ATouch *touch,const char *selector,Word view) { return touch_in_view(touch->location,view ? view : touch->window); }
+static struct GuestPoint touch_previous(struct I2ATouch *touch,const char *selector,Word view) { return touch_in_view(touch->previous,view ? view : touch->window); }
 static unsigned char touch_point_inside(Word object,const char *selector,struct GuestPoint point,Word event) {
     struct GuestRect bounds=view_state(object)->bounds;return point.x>=bounds.x && point.y>=bounds.y && point.x<bounds.x+bounds.width && point.y<bounds.y+bounds.height;
 }
 static Word touch_hit_test(Word object,const char *selector,struct GuestPoint point,Word event) {
     struct ViewState *view=view_state(object);if(view->hidden || !view->interaction || view->alpha<0.01)return 0;
     Method inside=find_implementation(object,"pointInside:withEvent:");if(!inside || !((unsigned char (*)(Word,const char *,struct GuestPoint,Word))inside)(object,"pointInside:withEvent:",point,event))return 0;
-    struct Sequence *children=(void *)view->children;for(size_t i=children->count;i>0;--i){Word child=children->items[i-1];struct ViewState *state=view_state(child);struct GuestPoint local={point.x-state->frame.x+state->bounds.x,point.y-state->frame.y+state->bounds.y};Method hit=find_implementation(child,"hitTest:withEvent:");if(hit){Word found=((Word (*)(Word,const char *,struct GuestPoint,Word))hit)(child,"hitTest:withEvent:",local,event);if(found)return found;}}
+    struct Sequence *children=(void *)view->children;for(size_t i=children->count;i>0;--i){Word child=children->items[i-1];struct GuestPoint local=view_convert_point(child,"convertPoint:fromView:",point,object);Method hit=find_implementation(child,"hitTest:withEvent:");if(hit){Word found=((Word (*)(Word,const char *,struct GuestPoint,Word))hit)(child,"hitTest:withEvent:",local,event);if(found)return found;}}
     return object;
 }
 struct GestureTarget { Word target;const char *action;struct GestureTarget *next; };
@@ -128,8 +122,8 @@ static Word gesture_get_value(Word object,const char *selector) {
 }
 static struct GuestPoint gesture_location(Word object,const char *selector,Word view) { return touch_in_view(gesture_state(object)->location,view); }
 static struct GuestPoint gesture_touch_location(Word object,const char *selector,Word index,Word view) { struct GestureState *state=gesture_state(object);for(unsigned i=0;i<I2A_TOUCH_LIMIT;++i)if(state->mask&(1U<<i)){if(!index--)return touch_in_view(i2a_touches[i].location,view);}stop("Gesture touch index out of range",selector);return (struct GuestPoint){0}; }
-static struct GuestPoint gesture_vector(Word object,const char *selector,Word view) { struct GestureState *state=gesture_state(object);return !strcmp(selector,"velocityInView:") ? state->velocity : state->translation; }
-static void gesture_set_translation(Word object,const char *selector,struct GuestPoint point,Word view) { struct GestureState *state=gesture_state(object);state->translation=point;state->origin=(struct GuestPoint){state->location.x-point.x,state->location.y-point.y}; }
+static struct GuestPoint gesture_vector(Word object,const char *selector,Word view) { struct GestureState *state=gesture_state(object);struct GuestPoint vector=!strcmp(selector,"velocityInView:") ? state->velocity : state->translation;if(!view)view=view_window(state->view);struct GuestPoint end=touch_in_view(state->location,view),start=touch_in_view((struct GuestPoint){state->location.x-vector.x,state->location.y-vector.y},view);return (struct GuestPoint){end.x-start.x,end.y-start.y}; }
+static void gesture_set_translation(Word object,const char *selector,struct GuestPoint point,Word view) { struct GestureState *state=gesture_state(object);if(!view)view=view_window(state->view);if(view){struct GuestPoint end=touch_in_view(state->location,view),start={end.x-point.x,end.y-point.y};struct ViewState *target=view_state(view);start.x-=target->bounds.x;start.y-=target->bounds.y;start=ui_project_point(ui_world_matrix(view,0),start);point=(struct GuestPoint){state->location.x-start.x,state->location.y-start.y};}state->translation=point;state->origin=(struct GuestPoint){state->location.x-point.x,state->location.y-point.y}; }
 static void view_remove_gesture(Word object,const char *selector,Word gesture) {
     struct GestureState *state=gesture_state(gesture);if(state->view!=object)return;struct Sequence *array=(void *)view_state(object)->gestures;if(array)for(size_t i=0;i<array->count;++i)if(array->items[i]==gesture){sequence_remove_at(array,selector,i);break;}state->view=0;if(state->mask)gesture_notify(state,state->state==1 || state->state==2 ? 4 : 5);state->mask=0;
 }
@@ -253,7 +247,7 @@ JNIEXPORT jstring JNICALL HOST_JNI(HostActivity_deliverTouches)(JNIEnv *env,jobj
                     for (unsigned j=0;j<I2A_TOUCH_LIMIT;++j) if (!i2a_touches[j].active) { touch=&i2a_touches[j]; break; }
                     if (!touch) stop("Touch capacity exceeded","Android MotionEvent");
                     memset(touch,0,sizeof(*touch)); touch->isa=external_class("_OBJC_CLASS_$_UITouch");
-                    touch->pointer=ids[i]; touch->active=1; touch->view=view; touch->window=(Word)&main_window; touch->taps=1;
+                    touch->pointer=ids[i]; touch->active=1; touch->view=view; touch->window=view_window(view); touch->taps=1;
                     touch->location=(struct GuestPoint){positions[i*4]/scale,positions[i*4+1]/scale};
                     struct GuestPoint local=touch_in_view(touch->location,view);Method tester=find_implementation(view,"hitTest:withEvent:");Word hit=tester ? ((Word (*)(Word,const char *,struct GuestPoint,Word))tester)(view,"hitTest:withEvent:",local,(Word)&i2a_touch_event) : view;if(hit)touch->view=hit;
                 }

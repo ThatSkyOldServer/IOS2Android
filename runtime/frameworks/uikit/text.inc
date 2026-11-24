@@ -354,6 +354,10 @@ static Word ui_font_preferred(Word cls,const char *selector,Word style) {
     Word descriptor=ui_font_preferred_descriptor(external_class("_OBJC_CLASS_$_UIFontDescriptor"),selector,style);
     return descriptor ? ui_font_create(cls,selector,(void *)descriptor,0) : 0;
 }
+static Word ui_preferred_content_category(Word object,const char *selector) {
+    static const double scales[]={.82,.88,.94,1,1.12,1.23,1.35,1.65,1.94,2.35,2.76,3.12};static const char *names[]={"UICTContentSizeCategoryXS","UICTContentSizeCategoryS","UICTContentSizeCategoryM","UICTContentSizeCategoryL","UICTContentSizeCategoryXL","UICTContentSizeCategoryXXL","UICTContentSizeCategoryXXXL","UICTContentSizeCategoryAccessibilityM","UICTContentSizeCategoryAccessibilityL","UICTContentSizeCategoryAccessibilityXL","UICTContentSizeCategoryAccessibilityXXL","UICTContentSizeCategoryAccessibilityXXXL"};
+    JNIEnv *env=attached_environment(selector);static jmethodID method;static Word categories[COUNT(scales)];if(!method){jclass cls=(*env)->GetObjectClass(env,activity);method=(*env)->GetMethodID(env,cls,"guestFontScale","()F");(*env)->DeleteLocalRef(env,cls);}double scale=(*env)->CallFloatMethod(env,activity,method);if((*env)->ExceptionCheck(env)){(*env)->ExceptionClear(env);scale=1;}unsigned index=0;if(!isfinite(scale) || scale<=0)scale=1;while(index+1<COUNT(scales) && scale>(scales[index]+scales[index+1])*.5)++index;if(!categories[index])categories[index]=copy_string(names[index]);return categories[index];
+}
 struct AttributedRun { struct GuestRange range; Word attributes; unsigned reset; };
 struct AttributedState { Word object,string; struct AttributedRun *runs; size_t count,capacity; struct AttributedState *next; };
 static struct AttributedState *attributed_states;
@@ -429,6 +433,7 @@ static void attributed_append(Word object,const char *selector,Word source) {
 static struct GuestSize ui_string_size(Word,const char *,Word);
 static Method ui_text_method(Word object,const char *selector,const char *receiver,int class_receiver) {
     if (!receiver) return NULL;
+    if(!class_receiver && !strcmp(receiver,"_OBJC_CLASS_$_UIApplication") && !strcmp(selector,"preferredContentSizeCategory"))return (Method)ui_preferred_content_category;
     if (!class_receiver && (!strcmp(receiver,"_OBJC_CLASS_$_NSString") || !strcmp(receiver,"_OBJC_CLASS_$_NSMutableString")) && !strcmp(selector,"sizeWithFont:")) return (Method)ui_string_size;
     if (!class_receiver && (!strcmp(receiver,"_OBJC_CLASS_$_NSAttributedString") || !strcmp(receiver,"_OBJC_CLASS_$_NSMutableAttributedString"))) {
         if (!strcmp(selector,"initWithString:attributes:")) return (Method)attributed_init;

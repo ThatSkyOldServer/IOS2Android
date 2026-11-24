@@ -2,6 +2,21 @@
 struct GuestPoint { double x,y; };
 struct GuestSize { double width,height; };
 struct GuestInsets { double top,left,bottom,right; };
+#define VIEW_PRESENTATION_FIELDS 25
+struct GuestAffine { double a,b,c,d,tx,ty; };
+struct GuestTransform3D { double m[16]; };
+static const struct GuestTransform3D transform3d_identity={{1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1}};
+static void ui_view_composition_sync(Word);
+static void ui_layer_sync_tree(Word);
+static int ui_layer_has_content(Word);
+static void layer_backing_remove(Word);
+static void layer_backing_add(Word,Word);
+static void layer_collect_order(Word,struct Sequence *);
+static void view_presentation(Word,float [VIEW_PRESENTATION_FIELDS]);
+static struct GuestPoint view_convert_point(Word,const char *,struct GuestPoint,Word);
+static struct GuestRect view_transformed_frame(Word);
+static struct GuestPoint view_anchor(Word);
+static unsigned label_argb(Word,unsigned);
 static void ui_label_sync(Word);
 static void ui_web_sync(Word);
 static void ui_input_sync(Word);
@@ -28,15 +43,17 @@ static void load_storyboard_view(Word,Word);
 static void window_schedule_presentation(Word);
 static void window_set_hidden(Word,const char *,unsigned char);
 static int window_lifecycle_ready;
-struct ViewOpacity { Word object; float before; struct ViewOpacity *next; };
-struct ViewAnimation { struct ViewOpacity *items,*sources; struct ViewAnimation *previous; };
+struct ViewOpacity { Word object; float before,presentation[VIEW_PRESENTATION_FIELDS]; struct ViewOpacity *next; };
+struct ViewAnimation { struct ViewOpacity *items,*sources; struct ViewAnimation *previous; double duration,delay,damping,velocity,repeat; Word options,identifier,delegate,context; const char *started,*stopped; unsigned legacy; };
 static _Thread_local struct ViewAnimation *view_animation;
+static _Atomic unsigned view_animations_enabled=1;
 static void view_animation_capture(Word);
 static void view_animation_change(Word);
 struct ViewState {
     Word object,parent,children,layer,controller,view,owner_window,image_name,background,presented,presenting,modal_alert,popover,navigation_bar,storyboard,nib_name,nib_bundle;
     Word navigation_item,title,prompt,left_item,right_item,back_item,archived_graph;
     void *control,*web,*scroll,*input,*table,*cell;
+    void *composition;
     Word host_container;
     Word accessibility_label;
     Word constraints,gestures;
@@ -53,6 +70,10 @@ struct ViewState {
     Method intrinsic_method;unsigned intrinsic_epoch,intrinsic_checked;
     unsigned display_epoch;
     unsigned appearance_pending,appeared;
+    unsigned composition_synced;
+    Word composition_owner;
+    float presentation[VIEW_PRESENTATION_FIELDS];
+    float *composition_clips;Word *composition_clip_owners;unsigned composition_clip_count;
     struct ViewState *next;
 };
 static struct ViewState *view_states;
@@ -80,6 +101,8 @@ static void view_sync_subtree(Word object) {
     ui_web_sync(object);
     ui_input_sync(object);
     ui_table_sync(object);
+    ui_view_composition_sync(object);
+    if(state->layer)ui_layer_sync_tree(state->layer);
     struct Sequence *children=(void *)state->children;
     for (size_t i=0;i<children->count;++i) view_sync_subtree(children->items[i]);
 }
@@ -93,7 +116,7 @@ static Word view_initialize(Word object,const char *selector) {
     if (!initialize) stop("Missing UIView initializer","initWithFrame:");
     return ((Word (*)(Word,const char *,struct GuestRect))initialize)(object,"initWithFrame:",(struct GuestRect){0});
 }
-static struct GuestRect view_frame(Word object) { return view_state(object)->frame; }
+static struct GuestRect view_frame(Word object) { return view_transformed_frame(object); }
 static struct GuestRect view_bounds(Word object) { return view_state(object)->bounds; }
 static struct GuestSize view_size_that_fits(Word object,const char *selector,struct GuestSize size) { struct GuestRect bounds=view_state(object)->bounds;return (struct GuestSize){bounds.width,bounds.height}; }
 static void view_size_to_fit(Word object,const char *selector) {
@@ -141,6 +164,7 @@ static void view_resize_children(struct ViewState *state,double width,double hei
 static void view_set_frame(Word object,const char *selector,struct GuestRect frame) {
     struct ViewState *state=view_state(object); double width=state->bounds.width,height=state->bounds.height;
     if (!memcmp(&state->frame,&frame,sizeof(frame))) return;
+    if(view_animation)view_animation_change(object);
     state->frame=frame; state->bounds.width=frame.width; state->bounds.height=frame.height;
     state->needs_display|=state->content_mode==3;
     view_resize_children(state,width,height); view_sync_subtree(object);
@@ -149,20 +173,22 @@ static void view_set_frame(Word object,const char *selector,struct GuestRect fra
 static void view_set_bounds(Word object,const char *selector,struct GuestRect bounds) {
     struct ViewState *state=view_state(object);
     if (!memcmp(&state->bounds,&bounds,sizeof(bounds))) return;
+    if(view_animation)view_animation_change(object);
     double width=state->bounds.width,height=state->bounds.height;
-    state->frame.x+=(state->bounds.width-bounds.width)*0.5;
-    state->frame.y+=(state->bounds.height-bounds.height)*0.5;
+    struct GuestPoint anchor=view_anchor(object);state->frame.x+=(state->bounds.width-bounds.width)*anchor.x;
+    state->frame.y+=(state->bounds.height-bounds.height)*anchor.y;
     state->frame.width=bounds.width; state->frame.height=bounds.height; state->bounds=bounds;
     view_resize_children(state,width,height); view_sync_subtree(object);
     view_request_layout(object,selector);
 }
 static struct GuestPoint view_center(Word object) {
-    struct GuestRect frame=view_state(object)->frame;
-    return (struct GuestPoint){frame.x+frame.width*0.5,frame.y+frame.height*0.5};
+    struct ViewState *view=view_state(object);struct GuestPoint anchor=view_anchor(object);
+    return (struct GuestPoint){view->frame.x+view->bounds.width*anchor.x,view->frame.y+view->bounds.height*anchor.y};
 }
 static void view_set_center(Word object,const char *selector,struct GuestPoint center) {
     struct ViewState *state=view_state(object);
-    state->frame.x=center.x-state->frame.width*0.5; state->frame.y=center.y-state->frame.height*0.5;
+    if(view_animation)view_animation_change(object);
+    struct GuestPoint anchor=view_anchor(object);state->frame.x=center.x-state->bounds.width*anchor.x; state->frame.y=center.y-state->bounds.height*anchor.y;
     view_sync_subtree(object);
 }
 static void view_hidden(Word object,const char *selector,unsigned char hidden) {if(class_inherits(read_word(object),external_class("_OBJC_CLASS_$_UIWindow"))){window_set_hidden(object,selector,hidden);return;}view_state(object)->hidden=hidden!=0; view_sync_subtree(object);}
@@ -204,6 +230,7 @@ static Word view_find_tag(Word object,const char *selector,long tag) {
 static void view_remove(Word object) {
     struct ViewState *state=view_state(object);
     if (state->parent) sequence_remove((void *)view_state(state->parent)->children,"removeFromSuperview",object);
+    layer_backing_remove(object);
     state->parent=0;
     view_sync_subtree(object);
 }
@@ -213,6 +240,7 @@ static void view_add(Word object,const char *selector,Word child) {
     view_remove(child);
     view_state(child)->parent=object;
     sequence_add((void *)view_state(object)->children,selector,child);
+    layer_backing_add(object,child);
     view_sync_subtree(child);
     ui_view_order_sync(object);
 }
@@ -266,6 +294,7 @@ static Word view_layer(Word object) {
         state->layer=host_allocate(layer);
         struct ViewState *layer_state=view_state(state->layer);
         layer_state->view=object;
+        layer_state->clips=state->clips;
         layer_state->frame=state->bounds; layer_state->bounds=state->bounds; layer_state->scale=state->scale;
     }
     return state->layer;
@@ -549,22 +578,229 @@ static void window_set_hidden(Word object,const char *selector,unsigned char hid
     if(!hidden)window_schedule_presentation(object);view_sync_subtree(object);
 }
 static void window_make_visible(Word object,const char *selector){window_make_key(object,selector);window_set_hidden(object,selector,0);}
-static void view_set_clips(Word object,const char *selector,Word clips) { struct ViewState *view=view_state(object);if(view->clips==(clips!=0))return;view->clips=clips!=0;view_sync_subtree(object); }
+static void view_set_clips(Word object,const char *selector,Word clips) { struct ViewState *view=view_state(object);if(view->clips==(clips!=0))return;view->clips=clips!=0;if(view->layer)view_state(view->layer)->clips=view->clips;view_sync_subtree(object); }
 static Word view_clips(Word object) { return view_state(object)->clips; }
-static void layer_set_masks(Word object,const char *selector,Word masks) { view_state(object)->clips=masks!=0; ui_label_sync(view_state(object)->view); }
-static void layer_set_corner(Word object,const char *selector,double radius) { view_state(object)->corner=radius; ui_label_sync(view_state(object)->view); }
-static double layer_corner(Word object) { return view_state(object)->corner; }
-static void layer_set_z(Word object,const char *selector,double z) { view_state(object)->z=z; ui_label_sync(view_state(object)->view); }
-static double layer_z(Word object) { return view_state(object)->z; }
+struct LayerState {
+    struct GuestTransform3D transform,sublayer_transform;
+    struct GuestPoint anchor,start,end;
+    struct GuestRect contents_rect;
+    Word background,border,colors,locations,contents,gravity,type,delegate,synced_background,synced_contents;
+    double border_width;
+    unsigned dirty,children_ready,layout_pending,layout_running,background_set,published;
+};
+static struct LayerState *layer_state(Word object) {
+    struct ViewState *view=view_state(object);
+    if(!view->composition){struct LayerState *layer=calloc(1,sizeof(*layer));if(!layer)stop("Allocation failed","CALayer");
+        layer->transform=layer->sublayer_transform=transform3d_identity;layer->anchor=(struct GuestPoint){.5,.5};layer->end=(struct GuestPoint){.5,1};layer->start=(struct GuestPoint){.5,0};
+        layer->contents_rect=(struct GuestRect){0,0,1,1};layer->dirty=1;view->composition=layer;if(!view->view)view->scale=1;}
+    return view->composition;
+}
+static struct LayerState *view_backing_state(Word object) { struct ViewState *view=view_state(object);return view->layer ? view_state(view->layer)->composition : NULL; }
+static struct GuestPoint view_anchor(Word object) { struct LayerState *layer=view_backing_state(object);return layer ? layer->anchor : (struct GuestPoint){.5,.5}; }
+static int layer_object(Word object) { return object && class_inherits(read_word(object),external_class("_OBJC_CLASS_$_CALayer")); }
+static struct GuestTransform3D ui_matrix_multiply(struct GuestTransform3D left,struct GuestTransform3D right) {
+    struct GuestTransform3D result={0};for(unsigned c=0;c<4;++c)for(unsigned r=0;r<4;++r)for(unsigned k=0;k<4;++k)result.m[c*4+r]+=left.m[k*4+r]*right.m[c*4+k];return result;
+}
+static struct GuestTransform3D ui_matrix_translation(double x,double y) { struct GuestTransform3D result=transform3d_identity;result.m[12]=x;result.m[13]=y;return result; }
+static struct GuestTransform3D ui_local_matrix(Word object) {
+    struct ViewState *view=view_state(object);struct LayerState *layer=layer_object(object) ? view->composition : view_backing_state(object);
+    struct GuestPoint anchor=layer ? layer->anchor : (struct GuestPoint){.5,.5};
+    struct GuestTransform3D result=ui_matrix_translation(view->frame.x+view->bounds.width*anchor.x,view->frame.y+view->bounds.height*anchor.y);
+    if(layer)result=ui_matrix_multiply(result,layer->transform);
+    return ui_matrix_multiply(result,ui_matrix_translation(-view->bounds.width*anchor.x,-view->bounds.height*anchor.y));
+}
+static struct GuestTransform3D ui_children_matrix(Word object) {
+    struct ViewState *view=view_state(object);struct LayerState *layer=layer_object(object) ? view->composition : view_backing_state(object);
+    if(layer_object(object) && view->view)view=view_state(view->view);
+    if(!layer)return ui_matrix_translation(-view->bounds.x,-view->bounds.y);
+    double x=layer->anchor.x*view->bounds.width,y=layer->anchor.y*view->bounds.height;
+    return ui_matrix_multiply(ui_matrix_multiply(ui_matrix_translation(x,y),layer->sublayer_transform),ui_matrix_translation(-x-view->bounds.x,-y-view->bounds.y));
+}
+static Word layer_owner(Word object) {
+    for(Word current=object;current;current=view_state(current)->parent){struct ViewState *view=view_state(current);if(view->view)return view->view;}return 0;
+}
+static Word view_container(Word object) { for(Word current=object;current;current=view_state(current)->parent)if(view_state(current)->host_container)return current;return 0; }
+static struct GuestTransform3D ui_world_matrix(Word object,Word container) {
+    if(!object || object==container)return transform3d_identity;
+    struct GuestTransform3D result=ui_local_matrix(object);Word parent=view_state(object)->parent;
+    for(;parent && parent!=container;parent=view_state(parent)->parent)result=ui_matrix_multiply(ui_matrix_multiply(ui_local_matrix(parent),ui_children_matrix(parent)),result);
+    if(parent)result=ui_matrix_multiply(ui_children_matrix(parent),result);return result;
+}
+static struct GuestTransform3D layer_world_matrix(Word object,Word container) {
+    struct ViewState *view=view_state(object);if(view->view)return ui_world_matrix(view->view,container);
+    struct GuestTransform3D result=ui_local_matrix(object);
+    for(Word parent=view->parent;parent;parent=view_state(parent)->parent){struct ViewState *ancestor=view_state(parent);
+        if(ancestor->view)return ui_matrix_multiply(ui_matrix_multiply(ui_world_matrix(ancestor->view,container),ui_children_matrix(parent)),result);
+        result=ui_matrix_multiply(ui_matrix_multiply(ui_local_matrix(parent),ui_children_matrix(parent)),result);
+    }return result;
+}
+static struct GuestPoint ui_project_point(struct GuestTransform3D matrix,struct GuestPoint point) {
+    double w=point.x*matrix.m[3]+point.y*matrix.m[7]+matrix.m[15];if(!isfinite(w) || fabs(w)<1e-12)return (struct GuestPoint){NAN,NAN};
+    return (struct GuestPoint){(point.x*matrix.m[0]+point.y*matrix.m[4]+matrix.m[12])/w,(point.x*matrix.m[1]+point.y*matrix.m[5]+matrix.m[13])/w};
+}
+static struct GuestPoint ui_unproject_point(struct GuestTransform3D m,struct GuestPoint p) {
+    double a=m.m[0]-p.x*m.m[3],b=m.m[4]-p.x*m.m[7],c=p.x*m.m[15]-m.m[12],d=m.m[1]-p.y*m.m[3],e=m.m[5]-p.y*m.m[7],f=p.y*m.m[15]-m.m[13],det=a*e-b*d;
+    if(!isfinite(det) || fabs(det)<1e-12)return (struct GuestPoint){NAN,NAN};return (struct GuestPoint){(c*e-b*f)/det,(a*f-c*d)/det};
+}
+static struct GuestRect ui_project_rect(struct GuestTransform3D matrix,struct GuestRect rect) {
+    double left=INFINITY,top=INFINITY,right=-INFINITY,bottom=-INFINITY;
+    for(unsigned i=0;i<4;++i){struct GuestPoint p=ui_project_point(matrix,(struct GuestPoint){rect.x+((i&1) ? rect.width : 0),rect.y+((i&2) ? rect.height : 0)});if(!isfinite(p.x) || !isfinite(p.y))return (struct GuestRect){NAN,NAN,0,0};left=fmin(left,p.x);top=fmin(top,p.y);right=fmax(right,p.x);bottom=fmax(bottom,p.y);}
+    return (struct GuestRect){left,top,right-left,bottom-top};
+}
+static struct GuestRect view_transformed_frame(Word object) {
+    struct ViewState *view=view_state(object);struct LayerState *layer=view_backing_state(object);
+    if(!layer || !memcmp(&layer->transform,&transform3d_identity,sizeof(transform3d_identity)))return view->frame;
+    return ui_project_rect(ui_local_matrix(object),(struct GuestRect){0,0,view->bounds.width,view->bounds.height});
+}
+static struct GuestPoint view_convert_point(Word object,const char *selector,struct GuestPoint point,Word other) {
+    if(!other)other=view_window(object);
+    Word from=strstr(selector,"fromView:") ? other : object,to=strstr(selector,"fromView:") ? object : other;
+    if(from){struct ViewState *view=view_state(from);point.x-=view->bounds.x;point.y-=view->bounds.y;point=ui_project_point(ui_world_matrix(from,0),point);}
+    if(to){point=ui_unproject_point(ui_world_matrix(to,0),point);point.x+=view_state(to)->bounds.x;point.y+=view_state(to)->bounds.y;}return point;
+}
+static struct GuestRect view_convert_rect(Word object,const char *selector,struct GuestRect rect,Word other) {
+    double left=INFINITY,top=INFINITY,right=-INFINITY,bottom=-INFINITY;const char *point_selector=strstr(selector,"fromView:") ? "convertPoint:fromView:" : "convertPoint:toView:";
+    for(unsigned i=0;i<4;++i){struct GuestPoint p=view_convert_point(object,point_selector,(struct GuestPoint){rect.x+((i&1) ? rect.width : 0),rect.y+((i&2) ? rect.height : 0)},other);left=fmin(left,p.x);top=fmin(top,p.y);right=fmax(right,p.x);bottom=fmax(bottom,p.y);}return (struct GuestRect){left,top,right-left,bottom-top};
+}
+static struct GuestTransform3D layer_transform(Word object) { return layer_state(object)->transform; }
+static void layer_set_transform(Word object,const char *selector,struct GuestTransform3D transform);
+static struct GuestAffine view_get_transform(Word object) {
+    struct LayerState *layer=view_backing_state(object);struct GuestTransform3D matrix=layer ? layer->transform : transform3d_identity;return (struct GuestAffine){matrix.m[0],matrix.m[1],matrix.m[4],matrix.m[5],matrix.m[12],matrix.m[13]};
+}
+static void view_set_transform(Word object,const char *selector,struct GuestAffine value) {
+    struct GuestTransform3D matrix=transform3d_identity;matrix.m[0]=value.a;matrix.m[1]=value.b;matrix.m[4]=value.c;matrix.m[5]=value.d;matrix.m[12]=value.tx;matrix.m[13]=value.ty;layer_set_transform(view_layer(object),selector,matrix);
+}
+static Word layer_initialize(Word object) { layer_state(object);return object; }
+static Word layer_create(Word cls) { return layer_initialize(host_allocate(cls)); }
+static void layer_backing_remove(Word object) {
+    Word layer=view_state(object)->layer;if(!layer)return;struct ViewState *view=view_state(layer);if(view->parent)sequence_remove((void *)view_state(view->parent)->children,"Backing layer removal",layer);view->parent=0;
+}
+static void layer_backing_add(Word parent,Word child) {
+    Word layer=view_state(parent)->layer;if(!layer || !layer_state(layer)->children_ready)return;
+    Word sublayer=view_layer(child);layer_backing_remove(child);view_state(sublayer)->parent=layer;sequence_add((void *)view_state(layer)->children,"Backing layer insertion",sublayer);
+}
+static void layer_materialize_children(Word object) {
+    struct LayerState *layer=layer_state(object);if(layer->children_ready)return;layer->children_ready=1;
+    Word owner=view_state(object)->view;if(!owner)return;struct Sequence *children=(void *)view_state(owner)->children;
+    for(size_t i=0;i<children->count;++i)layer_backing_add(owner,children->items[i]);
+}
+static Word layer_superlayer(Word object) {
+    struct ViewState *view=view_state(object);if(view->parent)return view->parent;
+    if(view->view && view_state(view->view)->parent){Word parent=view_layer(view_state(view->view)->parent);layer_materialize_children(parent);return view->parent;}return 0;
+}
+static void layer_changed(Word object) {
+    layer_state(object)->dirty=1;Word owner=layer_owner(object);if(owner){view_sync_subtree(owner);ui_view_order_sync(owner);}else ui_layer_sync_tree(object);
+}
+static Word layer_sublayers(Word object) { layer_materialize_children(object);return sequence_copy((void *)view_state(object)->children,"CALayer sublayers"); }
+static void layer_remove(Word object,const char *selector) {
+    struct ViewState *view=view_state(object);if(view->view)stop("Direct removal of a UIView backing layer is unavailable",selector);
+    Word parent=view->parent;if(parent)sequence_remove((void *)view_state(parent)->children,selector,object);view->parent=0;ui_layer_sync_tree(object);if(parent)layer_changed(parent);
+}
+static void layer_insert(Word object,const char *selector,Word child,Word index) {
+    if(!layer_object(child))stop("Invalid sublayer",selector);if(view_state(child)->view)stop("Reparenting a UIView backing layer is unavailable",selector);
+    for(Word parent=object;parent;parent=layer_superlayer(parent))if(parent==child)stop("Cyclic layer tree",selector);
+    layer_materialize_children(object);struct Sequence *children=(void *)view_state(object)->children;if(index>children->count)stop("Sublayer index out of range",selector);
+    if(view_state(child)->parent==object){size_t old=0;while(old<children->count && children->items[old]!=child)++old;if(old<children->count && old<index)--index;}
+    if(view_state(child)->parent)layer_remove(child,selector);view_state(child)->parent=object;sequence_add(children,selector,child);
+    if(index+1<children->count){memmove(children->items+index+1,children->items+index,(children->count-index-1)*sizeof(Word));children->items[index]=child;++children->mutation;}layer_changed(object);
+}
+static void layer_add(Word object,const char *selector,Word child) { layer_materialize_children(object);layer_insert(object,selector,child,((struct Sequence *)view_state(object)->children)->count); }
+static void layer_insert_relative(Word object,const char *selector,Word child,Word sibling) {
+    layer_materialize_children(object);struct Sequence *children=(void *)view_state(object)->children;size_t index=0;
+    if(!sibling)index=strstr(selector,"above:") ? children->count : 0;
+    else {while(index<children->count && children->items[index]!=sibling)++index;if(index==children->count)stop("Relative layer is not a sublayer",selector);if(child==sibling)return;if(strstr(selector,"above:"))++index;}layer_insert(object,selector,child,index);
+}
+static void layer_replace(Word object,const char *selector,Word old,Word replacement) {
+    layer_materialize_children(object);struct Sequence *children=(void *)view_state(object)->children;size_t index=0;while(index<children->count && children->items[index]!=old)++index;
+    if(index==children->count)stop("Layer to replace is not a sublayer",selector);if(old==replacement)return;layer_insert(object,selector,replacement,index);layer_remove(old,selector);
+}
+static void layer_set_children(Word object,const char *selector,Word value) {
+    layer_materialize_children(object);struct Sequence *children=(void *)view_state(object)->children,*input=value ? (void *)value : NULL;
+    if(input)for(size_t i=0;i<input->count;++i){if(!layer_object(input->items[i]) || view_state(input->items[i])->view)stop("Unsupported backing layer mutation",selector);for(Word p=object;p;p=layer_superlayer(p))if(p==input->items[i])stop("Cyclic layer tree",selector);for(size_t j=0;j<i;++j)if(input->items[j]==input->items[i])stop("Duplicate sublayer",selector);}
+    for(size_t i=0;i<children->count;++i)if(view_state(children->items[i])->view)stop("Replacing UIView backing sublayers is unavailable",selector);
+    Word copy=input ? sequence_copy(input,"copy") : sequence_empty(external_class("_OBJC_CLASS_$_NSArray"));while(children->count)layer_remove(children->items[children->count-1],selector);
+    struct Sequence *items=(void *)copy;for(size_t i=0;i<items->count;++i)layer_add(object,selector,items->items[i]);free(items->items);free(items);
+}
+static struct ViewState *layer_geometry(Word object) { struct ViewState *view=view_state(object);return view->view ? view_state(view->view) : view; }
+static struct GuestRect layer_frame(Word object) { struct ViewState *view=layer_geometry(object);return ui_project_rect(ui_local_matrix(view->object),(struct GuestRect){0,0,view->bounds.width,view->bounds.height}); }
+static struct GuestRect layer_bounds(Word object) { return layer_geometry(object)->bounds; }
+static void layer_set_frame(Word object,const char *selector,struct GuestRect frame) { struct ViewState *view=layer_geometry(object);view_set_frame(view->object,selector,frame);layer_changed(object); }
+static void layer_set_bounds(Word object,const char *selector,struct GuestRect bounds) { struct ViewState *view=layer_geometry(object);view_set_bounds(view->object,selector,bounds);layer_changed(object); }
+static struct GuestPoint layer_position(Word object) { struct ViewState *view=layer_geometry(object);struct GuestPoint anchor=layer_state(object)->anchor;return (struct GuestPoint){view->frame.x+view->bounds.width*anchor.x,view->frame.y+view->bounds.height*anchor.y}; }
+static void layer_set_position(Word object,const char *selector,struct GuestPoint point) {
+    if(!isfinite(point.x) || !isfinite(point.y))stop("Invalid layer position",selector);struct ViewState *view=layer_geometry(object);if(view_animation)view_animation_change(view->object);
+    struct GuestPoint anchor=layer_state(object)->anchor;view->frame.x=point.x-view->bounds.width*anchor.x;view->frame.y=point.y-view->bounds.height*anchor.y;layer_changed(object);
+}
+static struct GuestPoint layer_anchor(Word object) { return layer_state(object)->anchor; }
+static void layer_set_anchor(Word object,const char *selector,struct GuestPoint anchor) {
+    if(!isfinite(anchor.x) || !isfinite(anchor.y))stop("Invalid layer anchor",selector);struct LayerState *layer=layer_state(object);struct ViewState *view=layer_geometry(object);if(view_animation)view_animation_change(view->object);
+    view->frame.x+=(layer->anchor.x-anchor.x)*view->bounds.width;view->frame.y+=(layer->anchor.y-anchor.y)*view->bounds.height;layer->anchor=anchor;layer_changed(object);
+}
+static void layer_set_transform(Word object,const char *selector,struct GuestTransform3D transform) {
+    for(unsigned i=0;i<16;++i)if(!isfinite(transform.m[i]))stop("Invalid layer transform",selector);struct ViewState *view=layer_geometry(object);if(view_animation)view_animation_change(view->object);
+    layer_state(object)->transform=transform;layer_changed(object);
+}
+static struct GuestAffine layer_affine(Word object) { struct GuestTransform3D t=layer_transform(object);return (struct GuestAffine){t.m[0],t.m[1],t.m[4],t.m[5],t.m[12],t.m[13]}; }
+static void layer_set_affine(Word object,const char *selector,struct GuestAffine value) { struct GuestTransform3D t=transform3d_identity;t.m[0]=value.a;t.m[1]=value.b;t.m[4]=value.c;t.m[5]=value.d;t.m[12]=value.tx;t.m[13]=value.ty;layer_set_transform(object,selector,t); }
+static struct GuestTransform3D layer_sublayer_transform(Word object) { return layer_state(object)->sublayer_transform; }
+static void layer_set_sublayer_transform(Word object,const char *selector,struct GuestTransform3D value) {
+    for(unsigned i=0;i<16;++i)if(!isfinite(value.m[i]))stop("Invalid sublayer transform",selector);if(view_animation)view_animation_change(layer_geometry(object)->object);layer_state(object)->sublayer_transform=value;layer_changed(object);
+}
+static double layer_metric(Word object,const char *selector) {
+    struct ViewState *view=view_state(object);struct LayerState *layer=layer_state(object);
+    if(!strcmp(selector,"borderWidth"))return layer->border_width;if(!strcmp(selector,"cornerRadius"))return view->corner;if(!strcmp(selector,"zPosition"))return view->z;return view->view ? view_state(view->view)->scale : view->scale;
+}
+static void layer_set_metric(Word object,const char *selector,double value) {
+    if(!isfinite(value) || (strcmp(selector,"setZPosition:") && value<0))stop("Invalid layer metric",selector);struct ViewState *view=view_state(object);struct LayerState *layer=layer_state(object);
+    if(!strcmp(selector,"setBorderWidth:"))layer->border_width=value;else if(!strcmp(selector,"setCornerRadius:"))view->corner=value;else if(!strcmp(selector,"setZPosition:"))view->z=value;else {view->scale=value;if(view->view)view_state(view->view)->scale=value;}layer_changed(object);
+}
+static float layer_opacity(Word object) { return (float)layer_geometry(object)->alpha; }
+static void layer_set_opacity(Word object,const char *selector,float value) { if(!isfinite(value))stop("Invalid layer opacity",selector);struct ViewState *view=layer_geometry(object);if(view_animation)view_animation_change(view->object);view->alpha=fmin(1,fmax(0,value));layer_changed(object); }
+static Word layer_flag(Word object,const char *selector) { struct ViewState *view=view_state(object);return !strcmp(selector,"isHidden") ? layer_geometry(object)->hidden : view->view ? view_state(view->view)->clips : view->clips; }
+static void layer_set_flag(Word object,const char *selector,Word value) { if(!strcmp(selector,"setHidden:"))layer_geometry(object)->hidden=value!=0;else {struct ViewState *view=view_state(object);view->clips=value!=0;if(view->view)view_state(view->view)->clips=view->clips;}layer_changed(object); }
+static Word layer_value(Word object,const char *selector) {
+    struct ViewState *view=view_state(object);struct LayerState *layer=layer_state(object);
+    if(!strcmp(selector,"backgroundColor"))return view->view ? view_state(view->view)->background : layer->background;if(!strcmp(selector,"borderColor"))return layer->border;if(!strcmp(selector,"colors"))return layer->colors;if(!strcmp(selector,"locations"))return layer->locations;if(!strcmp(selector,"contents"))return layer->contents;
+    if(!strcmp(selector,"contentsGravity"))return layer->gravity ? layer->gravity : copy_string("resize");if(!strcmp(selector,"type"))return layer->type ? layer->type : copy_string("axial");return load_weak(&layer->delegate);
+}
+static void layer_set_value(Word object,const char *selector,Word value) {
+    struct ViewState *view=view_state(object);struct LayerState *layer=layer_state(object);
+    if(!strcmp(selector,"setDelegate:")){store_weak(&layer->delegate,value);return;}
+    if(!strcmp(selector,"setBackgroundColor:") || !strcmp(selector,"setBorderColor:")){if(value && !class_inherits(read_word(value),external_class("_OBJC_CLASS_$_UIColor")))stop("Unsupported layer color",selector);
+        if(!strcmp(selector,"setBorderColor:"))layer->border=value;else {layer->background_set=1;if(view->view)view_state(view->view)->background=value;else layer->background=value;}}
+    else if(!strcmp(selector,"setContents:")){if(value && !class_inherits(read_word(value),external_class("_OBJC_CLASS_$_UIImage")))stop("Unsupported layer image contents",selector);layer->contents=value;}
+    else if(!strcmp(selector,"setContentsGravity:")){const char *name=value ? string_bytes(value,selector) : "resize";const char *valid[]={"resize","resizeAspect","resizeAspectFill","center","top","bottom","left","right","topLeft","topRight","bottomLeft","bottomRight"};unsigned found=0;for(unsigned i=0;i<COUNT(valid);++i)found|=!strcmp(name,valid[i]);if(!found)stop("Unsupported layer contents gravity",selector);layer->gravity=copy_string(name);}
+    else if(!strcmp(selector,"setType:")){if(value && strcmp(string_bytes(value,selector),"axial"))stop("Unsupported gradient type",selector);layer->type=value ? text_copy(value,"copy") : 0;}
+    else {if(value && !class_inherits(read_word(value),external_class("_OBJC_CLASS_$_NSArray")))stop("Invalid gradient array",selector);struct Sequence *values=(void *)value;
+        if(values)for(size_t i=0;i<values->count;++i){if(!strcmp(selector,"setColors:")){if(!class_inherits(read_word(values->items[i]),external_class("_OBJC_CLASS_$_UIColor")))stop("Unsupported gradient color",selector);}else {if(!class_inherits(read_word(values->items[i]),external_class("_OBJC_CLASS_$_NSNumber")))stop("Invalid gradient location",selector);double p=numeric_double((void *)values->items[i]);if(!isfinite(p) || p<0 || p>1 || (i && p<numeric_double((void *)values->items[i-1])))stop("Invalid gradient stops",selector);}}
+        Word copy=value ? sequence_copy((void *)value,"copy") : 0;Word *slot=!strcmp(selector,"setColors:") ? &layer->colors : &layer->locations;Word old=*slot;*slot=copy;if(old){struct Sequence *sequence=(void *)old;free(sequence->items);free(sequence);}}
+    layer_changed(object);
+}
+static struct GuestPoint layer_gradient_point(Word object,const char *selector) { return !strcmp(selector,"startPoint") ? layer_state(object)->start : layer_state(object)->end; }
+static void layer_set_gradient_point(Word object,const char *selector,struct GuestPoint point) { if(!isfinite(point.x) || !isfinite(point.y))stop("Invalid gradient point",selector);if(!strcmp(selector,"setStartPoint:"))layer_state(object)->start=point;else layer_state(object)->end=point;layer_changed(object); }
+static struct GuestRect layer_contents_rect(Word object) { return layer_state(object)->contents_rect; }
+static void layer_set_contents_rect(Word object,const char *selector,struct GuestRect rect) { if(!isfinite(rect.x) || !isfinite(rect.y) || !isfinite(rect.width) || !isfinite(rect.height) || rect.width<0 || rect.height<0)stop("Invalid layer contents rectangle",selector);layer_state(object)->contents_rect=rect;layer_changed(object); }
+static Word layer_contains_point(Word object,const char *selector,struct GuestPoint point) { struct GuestRect bounds=layer_bounds(object);return point.x>=bounds.x && point.y>=bounds.y && point.x<bounds.x+bounds.width && point.y<bounds.y+bounds.height; }
+static int ui_layer_has_content(Word object) { struct ViewState *view=view_state(object);struct LayerState *layer=view_backing_state(object);return layer && (layer->border_width>0 || layer->contents || layer->colors || view_state(view->layer)->corner>0); }
+static void layer_layout_content(Word object,const char *selector) { struct LayerState *layer=layer_state(object);Word delegate=load_weak_retained(&layer->delegate);Method callback=delegate ? find_implementation(delegate,"layoutSublayersOfLayer:") : NULL;if(callback)callback(delegate,"layoutSublayersOfLayer:",object,0,0,0);metal_object_release(delegate); }
+static void layer_layout_if_needed(Word object,const char *selector) {
+    struct LayerState *layer=layer_state(object);if(layer->layout_running)return;
+    if(layer->layout_pending){layer->layout_pending=0;layer->layout_running=1;Method layout=find_implementation(object,"layoutSublayers");if(layout)layout(object,"layoutSublayers",0,0,0,0);else layer_layout_content(object,"layoutSublayers");layer->layout_running=0;}
+    struct Sequence *children=(void *)view_state(object)->children;for(size_t i=0;i<children->count;++i)layer_layout_if_needed(children->items[i],selector);
+}
+static void layer_layout_deliver(void *object) { layer_layout_if_needed((Word)object,"layoutIfNeeded"); }
+static void layer_needs_layout(Word object,const char *selector) { struct LayerState *layer=layer_state(object);if(layer->layout_pending)return;layer->layout_pending=1;schedule_main_function(layer_layout_deliver,(void *)object); }
+static Word layer_get_needs_layout(Word object) { return layer_state(object)->layout_pending; }
 
 static void view_animation_capture(Word object) {
-    if (ui_view_rendered(object)) {
+    if (ui_view_rendered(object) || view_state(object)->clips || (view_state(object)->layer && view_state(view_state(object)->layer)->clips)) {
         struct ViewOpacity *item=view_animation->items;
         while (item && item->object!=object) item=item->next;
-        if (!item) { item=calloc(1,sizeof(*item)); if (!item) stop("Allocation failed","UIView animation"); item->object=object; item->next=view_animation->items; view_animation->items=item; }
+        if (!item) { item=calloc(1,sizeof(*item)); if (!item) stop("Allocation failed","UIView animation"); item->object=object;view_presentation(object,item->presentation); item->next=view_animation->items; view_animation->items=item; }
     }
     struct Sequence *children=(void *)view_state(object)->children;
     for (size_t i=0;i<children->count;++i) view_animation_capture(children->items[i]);
+    if(view_state(object)->layer){struct Sequence *layers=(void *)view_state(view_state(object)->layer)->children;for(size_t i=0;i<layers->count;++i)if(!view_state(layers->items[i])->view)view_animation_capture(layers->items[i]);}
 }
 static void view_animation_change(Word object) {
     struct ViewOpacity *source=view_animation->sources;
@@ -575,31 +811,37 @@ static void view_animation_change(Word object) {
 static void view_animation_free(struct ViewAnimation *context) {
     while (context->items) { struct ViewOpacity *item=context->items; context->items=item->next; free(item); }
     while (context->sources) { struct ViewOpacity *item=context->sources; context->sources=item->next; free(item); }
-    free(context);
+    destroy_weak(&context->delegate);metal_object_release(context->identifier);free(context);
 }
 static Word view_opacity_parent(Word object) {
     struct ViewState *view=view_state(object);Word parent=view->parent;
+    if(layer_object(object) && parent && view_state(parent)->view)parent=view_state(parent)->view;
     return view->host_container ? 0 : parent;
 }
-static void view_animate(Word cls,const char *selector,double duration,double delay,Word options,Word animation,Word completion) {
-    if (!isfinite(duration) || !isfinite(delay) || duration<0 || delay<0 || duration+delay>(double)INT64_MAX/1000.0) stop("Invalid animation time",selector);
-    struct ViewAnimation *context=calloc(1,sizeof(*context)); if (!context) stop("Allocation failed",selector);
-    context->previous=view_animation; view_animation=context;
-    struct GuestCallBoundary call={.previous=active_guest_call_boundary}; active_guest_call_boundary=&call;
-    int failed=setjmp(call.environment);
-    if (!failed && animation) { struct Block_layout *block=(void *)animation; ((void (*)(Word))block->invoke)(animation); }
-    active_guest_call_boundary=call.previous; view_animation=context->previous;
-    if (failed) { char failure[sizeof(status)]; memcpy(failure,status,sizeof(failure)); view_animation_free(context); stop("UIView animation failed",failure); }
+struct ViewAnimationCompletion { Word block,delegate,identifier,context;const char *started,*stopped; };
+static void view_animation_completion_free(struct ViewAnimationCompletion *value) { if(value->block)_Block_release((void *)value->block);destroy_weak(&value->delegate);metal_object_release(value->identifier);free(value); }
+JNIEXPORT jstring JNICALL HOST_JNI(HostActivity_completeViewAnimation)(JNIEnv *env,jobject activity,jlong token,jint event,jboolean completed) {
+    struct ViewAnimationCompletion *value=(void *)token;if(!value)return NULL;may_unwind=1;snprintf(stage,sizeof(stage),"UIView animation callback");int failed=setjmp(boundary);
+    if(!failed){Word delegate=load_weak_retained(&value->delegate);const char *selector=event==0 ? value->started : value->stopped;Method method=delegate && selector ? find_implementation(delegate,selector) : NULL;
+        if(method){if(event==0)method(delegate,selector,value->identifier,value->context,0,0);else method(delegate,selector,value->identifier,completed,value->context,0);}metal_object_release(delegate);
+        if(event!=0 && value->block){struct Block_layout *block=(void *)value->block;((void (*)(Word,unsigned char))block->invoke)(value->block,completed);}}
+    if(event!=0)view_animation_completion_free(value);may_unwind=0;return failed ? (*env)->NewStringUTF(env,status) : NULL;
+}
+static void view_animation_submit(struct ViewAnimation *context,const char *selector,Word completion) {
+    double duration=context->duration,delay=context->delay;Word options=context->options;
+    if(duration+delay>(double)INT64_MAX/1000.0)stop("Invalid animation time",selector);
+    if(!view_animations_enabled){duration=delay=0;options&=~(Word)24;context->repeat=0;}
     unsigned count=0,sources=0,ancestors=0;
     for (struct ViewOpacity *item=context->items;item;item=item->next) { ++count; for (Word object=item->object;object;object=view_opacity_parent(object)) ++ancestors; }
     for (struct ViewOpacity *item=context->sources;item;item=item->next) ++sources;
-    if (!count && !completion) { view_animation_free(context); return; }
+    if (!count && !completion && !context->legacy) { view_animation_free(context); return; }
     JNIEnv *env=attached_environment(selector); static jmethodID animate;
-    if (!animate) { jclass type=(*env)->GetObjectClass(env,activity); animate=(*env)->GetMethodID(env,type,"animateGuestOpacity","([J[F[F[J[I[J[FJJIJ)V"); (*env)->DeleteLocalRef(env,type); }
+    if (!animate) { jclass type=(*env)->GetObjectClass(env,activity); animate=(*env)->GetMethodID(env,type,"animateGuestViews","([J[F[F[J[I[J[F[F[FJJIFFFJ)V"); (*env)->DeleteLocalRef(env,type); }
     jlongArray changed=(*env)->NewLongArray(env,sources),tokens=(*env)->NewLongArray(env,count),chain=(*env)->NewLongArray(env,ancestors);
     jintArray offsets=(*env)->NewIntArray(env,count+1);
     jfloatArray before=(*env)->NewFloatArray(env,sources),after=(*env)->NewFloatArray(env,sources),model=(*env)->NewFloatArray(env,ancestors);
-    if (!animate || !changed || !tokens || !chain || !offsets || !before || !after || !model) { view_animation_free(context); if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env); stop("Android animation allocation failed",selector); }
+    jfloatArray geometry_before=(*env)->NewFloatArray(env,count*VIEW_PRESENTATION_FIELDS),geometry_after=(*env)->NewFloatArray(env,count*VIEW_PRESENTATION_FIELDS);
+    if (!animate || !changed || !tokens || !chain || !offsets || !before || !after || !model || !geometry_before || !geometry_after) { view_animation_free(context); if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env); stop("Android animation allocation failed",selector); }
     unsigned i=0;
     for (struct ViewOpacity *item=context->sources;item;item=item->next,++i) {
         jlong token=item->object; jfloat target=(float)view_state(item->object)->alpha;
@@ -608,19 +850,47 @@ static void view_animate(Word cls,const char *selector,double duration,double de
     i=0; jint cursor=0;
     for (struct ViewOpacity *item=context->items;item;item=item->next,++i) {
         jlong token=item->object; (*env)->SetLongArrayRegion(env,tokens,i,1,&token); (*env)->SetIntArrayRegion(env,offsets,i,1,&cursor);
+        float presentation[VIEW_PRESENTATION_FIELDS];view_presentation(item->object,presentation);(*env)->SetFloatArrayRegion(env,geometry_before,i*VIEW_PRESENTATION_FIELDS,VIEW_PRESENTATION_FIELDS,item->presentation);(*env)->SetFloatArrayRegion(env,geometry_after,i*VIEW_PRESENTATION_FIELDS,VIEW_PRESENTATION_FIELDS,presentation);
         for (Word object=item->object;object;object=view_opacity_parent(object),++cursor) {
             token=object; jfloat alpha=(float)view_state(object)->alpha;
             (*env)->SetLongArrayRegion(env,chain,cursor,1,&token); (*env)->SetFloatArrayRegion(env,model,cursor,1,&alpha);
         }
     }
     (*env)->SetIntArrayRegion(env,offsets,count,1,&cursor);
-    Word retained=completion ? (Word)_Block_copy((void *)completion) : 0;
-    (*env)->CallVoidMethod(env,activity,animate,changed,before,after,tokens,offsets,chain,model,(jlong)(duration*1000),(jlong)(delay*1000),(jint)options,(jlong)retained);
-    (*env)->DeleteLocalRef(env,changed); (*env)->DeleteLocalRef(env,tokens); (*env)->DeleteLocalRef(env,chain); (*env)->DeleteLocalRef(env,offsets); (*env)->DeleteLocalRef(env,before); (*env)->DeleteLocalRef(env,after); (*env)->DeleteLocalRef(env,model); view_animation_free(context);
-    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); if (retained) _Block_release((void *)retained); stop("Android animation failed",selector); }
+    struct ViewAnimationCompletion *record=NULL;if(completion || context->legacy){record=calloc(1,sizeof(*record));if(!record){view_animation_free(context);stop("Allocation failed",selector);}record->block=completion ? (Word)_Block_copy((void *)completion) : 0;record->identifier=context->identifier ? metal_object_retain(context->identifier) : 0;record->context=context->context;record->started=context->started;record->stopped=context->stopped;Word delegate=load_weak_retained(&context->delegate);store_weak(&record->delegate,delegate);metal_object_release(delegate);}
+    (*env)->CallVoidMethod(env,activity,animate,changed,before,after,tokens,offsets,chain,model,geometry_before,geometry_after,(jlong)(duration*1000),(jlong)(delay*1000),(jint)options,(jfloat)context->damping,(jfloat)context->velocity,(jfloat)context->repeat,(jlong)record);
+    (*env)->DeleteLocalRef(env,changed); (*env)->DeleteLocalRef(env,tokens); (*env)->DeleteLocalRef(env,chain); (*env)->DeleteLocalRef(env,offsets); (*env)->DeleteLocalRef(env,before); (*env)->DeleteLocalRef(env,after); (*env)->DeleteLocalRef(env,model);(*env)->DeleteLocalRef(env,geometry_before);(*env)->DeleteLocalRef(env,geometry_after);view_animation_free(context);
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env);if(record)view_animation_completion_free(record);stop("Android animation failed",selector); }
 }
+static void view_animate_mode(Word cls,const char *selector,double duration,double delay,Word options,Word animation,Word completion,double damping,double velocity) {
+    if (!isfinite(duration) || !isfinite(delay) || duration<0 || delay<0 || duration+delay>(double)INT64_MAX/1000.0) stop("Invalid animation time",selector);
+    struct ViewAnimation *context=calloc(1,sizeof(*context)); if (!context) stop("Allocation failed",selector);context->previous=view_animation;context->duration=duration;context->delay=delay;context->options=options;context->damping=damping;context->velocity=velocity;
+    if(context->previous){if(!(options&32))context->duration=context->previous->duration;if(!(options&64))context->options=(options&~(Word)(3<<16))|(context->previous->options&(3<<16));}
+    view_animation=context;struct GuestCallBoundary call={.previous=active_guest_call_boundary};active_guest_call_boundary=&call;int failed=setjmp(call.environment);
+    if(!failed && animation){struct Block_layout *block=(void *)animation;((void (*)(Word))block->invoke)(animation);}active_guest_call_boundary=call.previous;view_animation=context->previous;
+    if(failed){char failure[sizeof(status)];memcpy(failure,status,sizeof(failure));view_animation_free(context);stop("UIView animation failed",failure);}view_animation_submit(context,selector,completion);
+}
+static void view_animate(Word cls,const char *selector,double duration,double delay,Word options,Word animation,Word completion) { view_animate_mode(cls,selector,duration,delay,options,animation,completion,-1,0); }
+static void view_animate_spring(Word cls,const char *selector,double duration,double delay,double damping,double velocity,Word options,Word animation,Word completion) { if(!isfinite(damping) || damping<0 || damping>1 || !isfinite(velocity))stop("Invalid spring parameters",selector);view_animate_mode(cls,selector,duration,delay,options,animation,completion,damping,velocity); }
 static void view_animate_plain(Word cls,const char *selector,double duration,Word animation,Word completion) { view_animate(cls,selector,duration,0,0,animation,completion); }
 static void view_animate_simple(Word cls,const char *selector,double duration,Word animation) { view_animate(cls,selector,duration,0,0,animation,0); }
+static void view_begin_animations(Word cls,const char *selector,Word identifier,Word context) {
+    struct ViewAnimation *value=calloc(1,sizeof(*value));if(!value)stop("Allocation failed",selector);value->previous=view_animation;value->duration=view_animation ? view_animation->duration : .2;value->damping=-1;value->identifier=identifier ? text_copy(identifier,"copy") : 0;value->context=context;value->legacy=1;view_animation=value;
+}
+static void view_commit_animations(Word cls,const char *selector) { struct ViewAnimation *value=view_animation;if(!value || !value->legacy)return;view_animation=value->previous;view_animation_submit(value,selector,0); }
+static void view_animation_time(Word cls,const char *selector,double value) { if(!isfinite(value) || value<0 || value>(double)INT64_MAX/1000.0)stop("Invalid animation time",selector);if(!view_animation || !view_animation->legacy)return;if(!strcmp(selector,"setAnimationDuration:"))view_animation->duration=value;else view_animation->delay=value; }
+static void view_animation_repeat(Word cls,const char *selector,float value) { if(!isfinite(value) || value<0 || (double)value>INT_MAX)stop("Invalid animation repeat count",selector);if(view_animation && view_animation->legacy)view_animation->repeat=value; }
+static void view_animation_setting(Word cls,const char *selector,Word value) {
+    if(!strcmp(selector,"setAnimationsEnabled:")){view_animations_enabled=value!=0;return;}if(!view_animation || !view_animation->legacy)return;
+    if(!strcmp(selector,"setAnimationDelegate:"))store_weak(&view_animation->delegate,value);
+    else if(!strcmp(selector,"setAnimationCurve:")){if(value>3)stop("Invalid animation curve",selector);view_animation->options=(view_animation->options&~(Word)(3<<16))|(value<<16);}
+    else {Word bit=!strcmp(selector,"setAnimationRepeatAutoreverses:") ? 16 : 4;if(value)view_animation->options|=bit;else view_animation->options&=~bit;}
+}
+static void view_animation_selector(Word cls,const char *selector,const char *value) { if(!view_animation || !view_animation->legacy)return;if(!strcmp(selector,"setAnimationWillStartSelector:"))view_animation->started=value;else view_animation->stopped=value; }
+static Word view_animations_state(void) { return view_animations_enabled; }
+static void view_without_animation(Word cls,const char *selector,Word value) {
+    unsigned previous=view_animations_enabled;struct ViewAnimation *previous_animation=view_animation;view_animations_enabled=0;view_animation=NULL;struct GuestCallBoundary call={.previous=active_guest_call_boundary};active_guest_call_boundary=&call;int failed=setjmp(call.environment);if(!failed && value){struct Block_layout *block=(void *)value;((void (*)(Word))block->invoke)(value);}active_guest_call_boundary=call.previous;view_animations_enabled=previous;view_animation=previous_animation;if(failed)stop("UIView animation block failed",selector);
+}
 JNIEXPORT jstring JNICALL HOST_JNI(HostActivity_completeAnimation)(JNIEnv *env,jobject activity,jlong value,jboolean completed) {
     may_unwind=1;
     snprintf(stage,sizeof(stage),"UIView animation completion");
@@ -1095,10 +1365,87 @@ static Word view_host_geometry(Word object,float metrics[11],int options[3]) {
     memcpy(metrics,values,sizeof(values));options[0]=visible && alpha>0 && right>left && bottom>top;options[1]=view_window(object)!=0;options[2]=enabled;
     return container ? view_state(container)->host_container : 0;
 }
+static void ui_plane_values(struct GuestTransform3D matrix,double scale,float values[9]) {
+    float plane[]={(float)matrix.m[0],(float)matrix.m[4],(float)(matrix.m[12]*scale),(float)matrix.m[1],(float)matrix.m[5],(float)(matrix.m[13]*scale),(float)(matrix.m[3]/scale),(float)(matrix.m[7]/scale),(float)matrix.m[15]};memcpy(values,plane,sizeof(plane));
+}
+static void view_presentation(Word object,float output[VIEW_PRESENTATION_FIELDS]) {
+    struct ViewState *view=view_state(object);double scale=screen_scale();int raw=layer_object(object) && !view->view;Word owner=raw ? layer_owner(object) : object,container=owner ? view_container(owner) : 0;int options[3]={0};
+    memset(output,0,VIEW_PRESENTATION_FIELDS*sizeof(float));struct GuestTransform3D matrix;
+    if(!raw){view_host_geometry(object,output,options);matrix=ui_world_matrix(object,container);output[2]=view->bounds.width*scale;output[3]=view->bounds.height*scale;output[20]=options[1];output[22]=options[2];
+        int visible=1;for(Word p=object;p;p=view_state(p)->parent){visible&=!view_state(p)->hidden;if(p==container)break;}output[21]=visible;}
+    else {matrix=layer_world_matrix(object,container);float parent[VIEW_PRESENTATION_FIELDS]={0};if(owner)view_presentation(owner,parent);output[2]=view->bounds.width*scale;output[3]=view->bounds.height*scale;output[4]=owner ? parent[4] : 1;output[5]=owner ? parent[5] : 0;output[6]=owner ? parent[6] : 0;output[20]=owner ? parent[20] : 0;output[21]=owner ? parent[21] : 0;
+        for(Word p=object;p && !view_state(p)->view;p=view_state(p)->parent){output[4]*=view_state(p)->alpha;output[5]+=view_state(p)->z;output[21]*=!view_state(p)->hidden;}output[9]=output[2];output[10]=output[3];struct LayerState *layer=view->composition;output[22]=layer && (layer->background || layer->border_width>0 || layer->colors || layer->contents);}
+    ui_plane_values(matrix,scale,output+11);
+    struct GuestPoint anchor=raw ? layer_state(object)->anchor : view_anchor(object);output[23]=anchor.x;output[24]=anchor.y;
+    struct GuestRect visible=ui_project_rect(matrix,(struct GuestRect){0,0,view->bounds.width,view->bounds.height}),limit=container ? (struct GuestRect){0,0,view_state(container)->bounds.width,view_state(container)->bounds.height} : screen_bounds();
+    output[21]*=isfinite(visible.x) && isfinite(visible.y) && visible.x+visible.width>limit.x && visible.y+visible.height>limit.y && visible.x<limit.x+limit.width && visible.y<limit.y+limit.height;
+}
+static unsigned view_clip_planes(Word object,float clips[64*12],Word owners[64]) {
+    int raw=layer_object(object) && !view_state(object)->view;Word owner=raw ? layer_owner(object) : object,container=owner ? view_container(owner) : 0;double scale=screen_scale();unsigned count=0;
+    for(Word p=raw ? object : 0;p && !view_state(p)->view && count<64;p=view_state(p)->parent)if(view_state(p)->clips){struct ViewState *view=view_state(p);owners[count]=p;float *clip=clips+count++*12;clip[0]=view->bounds.width*scale;clip[1]=view->bounds.height*scale;clip[2]=view->corner*scale;ui_plane_values(layer_world_matrix(p,container),scale,clip+3);}
+    for(Word p=owner;p && count<64;p=view_state(p)->parent){struct ViewState *view=view_state(p),*layer=view->layer ? view_state(view->layer) : NULL;
+        if(view->clips || (layer && layer->clips)){owners[count]=p;float *clip=clips+count++*12;clip[0]=view->bounds.width*scale;clip[1]=view->bounds.height*scale;clip[2]=layer ? layer->corner*scale : 0;ui_plane_values(ui_world_matrix(p,container),scale,clip+3);}if(p==container)break;}
+    return count;
+}
+static void ui_view_composition_sync(Word object) {
+    struct ViewState *view=view_state(object);int raw=layer_object(object) && !view->view;if(!raw && !ui_view_rendered(object) && !view->clips && !(view->layer && view_state(view->layer)->clips))return;float values[VIEW_PRESENTATION_FIELDS],clips[64*12];Word clip_owners[64];view_presentation(object,values);unsigned count=view_clip_planes(object,clips,clip_owners);Word owner=raw ? layer_owner(object) : object,container=owner ? view_container(owner) : 0,host=container ? view_state(container)->host_container : 0;
+    if(view->composition_synced && view->composition_owner==host && !memcmp(values,view->presentation,sizeof(values)) && view->composition_clip_count==count && (!count || (!memcmp(clips,view->composition_clips,count*12*sizeof(float)) && !memcmp(clip_owners,view->composition_clip_owners,count*sizeof(Word)))))return;
+    if(!values[20] && (!view->composition_synced || !view->presentation[20]))return;
+    if(layer_object(object) && view->composition && values[20]!=view->presentation[20])layer_state(object)->dirty=1;
+    if(view->layer && view_state(view->layer)->composition && values[20]!=view->presentation[20]){struct LayerState *layer=layer_state(view->layer);layer->dirty=1;layer->published=0;}
+    float *copy=count ? realloc(view->composition_clips,count*12*sizeof(float)) : NULL;if(count && !copy)stop("Allocation failed","View clipping");if(!count)free(view->composition_clips);else memcpy(copy,clips,count*12*sizeof(float));view->composition_clips=copy;view->composition_clip_count=count;
+    Word *owner_copy=count ? realloc(view->composition_clip_owners,count*sizeof(Word)) : NULL;if(count && !owner_copy)stop("Allocation failed","View clip owners");if(!count)free(view->composition_clip_owners);else memcpy(owner_copy,clip_owners,count*sizeof(Word));view->composition_clip_owners=owner_copy;
+    view->composition_synced=1;view->composition_owner=host;memcpy(view->presentation,values,sizeof(values));
+    JNIEnv *env=attached_environment("View composition");static jmethodID method;if(!method){jclass cls=(*env)->GetObjectClass(env,activity);method=(*env)->GetMethodID(env,cls,"syncGuestComposition","(JJZ[F[F[J)V");(*env)->DeleteLocalRef(env,cls);}
+    jfloatArray presentation=(*env)->NewFloatArray(env,VIEW_PRESENTATION_FIELDS),bounds=count ? (*env)->NewFloatArray(env,count*12) : NULL;(*env)->SetFloatArrayRegion(env,presentation,0,VIEW_PRESENTATION_FIELDS,values);if(bounds)(*env)->SetFloatArrayRegion(env,bounds,0,count*12,clips);
+    jlongArray owners=count ? (*env)->NewLongArray(env,count) : NULL;if(owners)(*env)->SetLongArrayRegion(env,owners,0,count,(const jlong *)clip_owners);
+    (*env)->CallVoidMethod(env,activity,method,(jlong)object,(jlong)host,(jboolean)raw,presentation,bounds,owners);(*env)->DeleteLocalRef(env,presentation);if(bounds)(*env)->DeleteLocalRef(env,bounds);if(owners)(*env)->DeleteLocalRef(env,owners);if((*env)->ExceptionCheck(env)){(*env)->ExceptionClear(env);stop("Android view composition failed","UIView");}
+}
+static void ui_layer_publish(Word object) {
+    struct ViewState *view=view_state(object);struct LayerState *layer=view->composition;if(!layer)return;Word owner=view->view,background=owner ? view_state(owner)->background : layer->background;
+    if(!layer->dirty && layer->synced_background==background)return;Word token=owner ? owner : object;float presentation[VIEW_PRESENTATION_FIELDS];view_presentation(token,presentation);if(!presentation[20]){layer->dirty=1;layer->published=0;return;}
+    struct Sequence *colors=(void *)layer->colors,*locations=(void *)layer->locations;double scale=screen_scale();float metrics[]={(float)(layer->border_width*scale),(float)(view->corner*scale),(float)layer->start.x,(float)layer->start.y,(float)layer->end.x,(float)layer->end.y,(float)layer->contents_rect.x,(float)layer->contents_rect.y,(float)layer->contents_rect.width,(float)layer->contents_rect.height,(float)(scale/fmax(1e-6,layer_metric(object,"contentsScale")))};
+    const char *gravities[]={"resize","resizeAspect","resizeAspectFill","center","top","bottom","left","right","topLeft","topRight","bottomLeft","bottomRight"};unsigned gravity=0;if(layer->gravity)for(unsigned i=0;i<COUNT(gravities);++i)if(!strcmp(gravities[i],string_bytes(layer->gravity,"contentsGravity")))gravity=i;
+    jint options[]={(jint)label_argb(background,0),(jint)label_argb(layer->border,0xff000000),(jint)gravity,(jint)(background || layer->background_set)};JNIEnv *env=attached_environment("CALayer composition");static jmethodID method;
+    if(!method){jclass cls=(*env)->GetObjectClass(env,activity);method=(*env)->GetMethodID(env,cls,"syncGuestLayer","(JJZZ[F[I[I[F[B)V");(*env)->DeleteLocalRef(env,cls);}
+    jfloatArray m=(*env)->NewFloatArray(env,COUNT(metrics)),stops=locations && locations->count ? (*env)->NewFloatArray(env,locations->count) : NULL;jintArray o=(*env)->NewIntArray(env,COUNT(options)),palette=colors && colors->count ? (*env)->NewIntArray(env,colors->count) : NULL;
+    (*env)->SetFloatArrayRegion(env,m,0,COUNT(metrics),metrics);(*env)->SetIntArrayRegion(env,o,0,COUNT(options),options);
+    if(palette)for(size_t i=0;i<colors->count;++i){jint color=label_argb(colors->items[i],0);(*env)->SetIntArrayRegion(env,palette,i,1,&color);}if(stops)for(size_t i=0;i<locations->count;++i){jfloat value=numeric_double((void *)locations->items[i]);(*env)->SetFloatArrayRegion(env,stops,i,1,&value);}
+    unsigned replace=!layer->published || layer->contents!=layer->synced_contents;jbyteArray bytes=NULL;if(replace && layer->contents){struct HostObject *data=(void *)image_png((void *)layer->contents);if(data){bytes=(*env)->NewByteArray(env,data->content[0]);(*env)->SetByteArrayRegion(env,bytes,0,data->content[0],(void *)data_buffer(data));}}
+    Word container=view_container(owner ? owner : layer_owner(object)),host=container ? view_state(container)->host_container : 0;(*env)->CallVoidMethod(env,activity,method,(jlong)token,(jlong)host,(jboolean)!owner,(jboolean)replace,m,o,palette,stops,bytes);
+    (*env)->DeleteLocalRef(env,m);(*env)->DeleteLocalRef(env,o);if(palette)(*env)->DeleteLocalRef(env,palette);if(stops)(*env)->DeleteLocalRef(env,stops);if(bytes)(*env)->DeleteLocalRef(env,bytes);
+    if((*env)->ExceptionCheck(env)){(*env)->ExceptionClear(env);stop("Android layer drawing failed","CALayer");}layer->dirty=0;layer->synced_background=background;layer->synced_contents=layer->contents;layer->published=1;
+}
+static void ui_layer_sync_tree(Word object) {
+    struct ViewState *view=view_state(object);if(!view->view)ui_view_composition_sync(object);ui_layer_publish(object);
+    struct Sequence *children=(void *)view->children;for(size_t i=0;i<children->count;++i)if(!view_state(children->items[i])->view)ui_layer_sync_tree(children->items[i]);
+}
+static void layer_collect_order(Word object,struct Sequence *order) {
+    struct Sequence *children=(void *)view_state(object)->children;for(size_t i=0;i<children->count;++i){Word child=children->items[i];if(!view_state(child)->view){sequence_add(order,"Layer drawing order",child);layer_collect_order(child,order);}}
+}
+static Method layer_method(Word object,const char *selector,int class_receiver) {
+    Word cls=class_receiver ? object : read_word(object);if(!class_inherits(cls,external_class("_OBJC_CLASS_$_CALayer")))return NULL;
+    if(class_receiver)return !strcmp(selector,"layer") ? (Method)layer_create : NULL;
+    if(!strcmp(selector,"init"))return (Method)layer_initialize;
+    if(!strcmp(selector,"frame"))return (Method)layer_frame;if(!strcmp(selector,"setFrame:"))return (Method)layer_set_frame;if(!strcmp(selector,"bounds"))return (Method)layer_bounds;if(!strcmp(selector,"setBounds:"))return (Method)layer_set_bounds;
+    if(!strcmp(selector,"position"))return (Method)layer_position;if(!strcmp(selector,"setPosition:"))return (Method)layer_set_position;if(!strcmp(selector,"anchorPoint"))return (Method)layer_anchor;if(!strcmp(selector,"setAnchorPoint:"))return (Method)layer_set_anchor;
+    if(!strcmp(selector,"transform"))return (Method)layer_transform;if(!strcmp(selector,"setTransform:"))return (Method)layer_set_transform;if(!strcmp(selector,"affineTransform"))return (Method)layer_affine;if(!strcmp(selector,"setAffineTransform:"))return (Method)layer_set_affine;
+    if(!strcmp(selector,"sublayerTransform"))return (Method)layer_sublayer_transform;if(!strcmp(selector,"setSublayerTransform:"))return (Method)layer_set_sublayer_transform;
+    const char *metrics[]={"borderWidth","cornerRadius","zPosition","contentsScale"},*set_metrics[]={"setBorderWidth:","setCornerRadius:","setZPosition:","setContentsScale:"};for(unsigned i=0;i<COUNT(metrics);++i){if(!strcmp(selector,metrics[i]))return (Method)layer_metric;if(!strcmp(selector,set_metrics[i]))return (Method)layer_set_metric;}
+    if(!strcmp(selector,"opacity"))return (Method)layer_opacity;if(!strcmp(selector,"setOpacity:"))return (Method)layer_set_opacity;if(!strcmp(selector,"isHidden") || !strcmp(selector,"masksToBounds"))return (Method)layer_flag;if(!strcmp(selector,"setHidden:") || !strcmp(selector,"setMasksToBounds:"))return (Method)layer_set_flag;
+    const char *values[]={"backgroundColor","borderColor","contents","contentsGravity","delegate"},*set_values[]={"setBackgroundColor:","setBorderColor:","setContents:","setContentsGravity:","setDelegate:"};for(unsigned i=0;i<COUNT(values);++i){if(!strcmp(selector,values[i]))return (Method)layer_value;if(!strcmp(selector,set_values[i]))return (Method)layer_set_value;}
+    if(!strcmp(selector,"contentsRect"))return (Method)layer_contents_rect;if(!strcmp(selector,"setContentsRect:"))return (Method)layer_set_contents_rect;
+    if(!strcmp(selector,"superlayer"))return (Method)layer_superlayer;if(!strcmp(selector,"sublayers"))return (Method)layer_sublayers;if(!strcmp(selector,"setSublayers:"))return (Method)layer_set_children;if(!strcmp(selector,"addSublayer:"))return (Method)layer_add;if(!strcmp(selector,"removeFromSuperlayer"))return (Method)layer_remove;
+    if(!strcmp(selector,"insertSublayer:atIndex:"))return (Method)layer_insert;if(!strcmp(selector,"insertSublayer:above:") || !strcmp(selector,"insertSublayer:below:"))return (Method)layer_insert_relative;if(!strcmp(selector,"replaceSublayer:with:"))return (Method)layer_replace;
+    if(!strcmp(selector,"setNeedsLayout"))return (Method)layer_needs_layout;if(!strcmp(selector,"needsLayout"))return (Method)layer_get_needs_layout;if(!strcmp(selector,"layoutIfNeeded"))return (Method)layer_layout_if_needed;if(!strcmp(selector,"layoutSublayers"))return (Method)layer_layout_content;if(!strcmp(selector,"containsPoint:"))return (Method)layer_contains_point;
+    if(class_inherits(cls,external_class("_OBJC_CLASS_$_CAGradientLayer"))){const char *gradient[]={"colors","locations","type"},*set_gradient[]={"setColors:","setLocations:","setType:"};for(unsigned i=0;i<COUNT(gradient);++i){if(!strcmp(selector,gradient[i]))return (Method)layer_value;if(!strcmp(selector,set_gradient[i]))return (Method)layer_set_value;}if(!strcmp(selector,"startPoint") || !strcmp(selector,"endPoint"))return (Method)layer_gradient_point;if(!strcmp(selector,"setStartPoint:") || !strcmp(selector,"setEndPoint:"))return (Method)layer_set_gradient_point;}
+    return NULL;
+}
 static Method views_method(Word object,const char *selector,const char *receiver,int class_receiver) {
     if (!receiver) return NULL;
     if(!class_receiver && object==application_object && !strcmp(selector,"windows"))return (Method)application_windows;
     Word cls=class_receiver ? object : read_word(object);
+    Method layer=layer_method(object,selector,class_receiver);if(layer)return layer;
     const char *base=external_base(cls);
     int view=class_inherits(cls,external_class("_OBJC_CLASS_$_UIView")) || (base && !strcmp(base,"_OBJC_CLASS_$__UILayoutGuide"));
     int navigation=class_inherits(cls,external_class("_OBJC_CLASS_$_UINavigationController"));
@@ -1124,6 +1471,15 @@ static Method views_method(Word object,const char *selector,const char *receiver
         if (view && !strcmp(selector,"animateWithDuration:delay:options:animations:completion:")) return (Method)view_animate;
         if (view && !strcmp(selector,"animateWithDuration:animations:completion:")) return (Method)view_animate_plain;
         if (view && !strcmp(selector,"animateWithDuration:animations:")) return (Method)view_animate_simple;
+        if(view && !strcmp(selector,"animateWithDuration:delay:usingSpringWithDamping:initialSpringVelocity:options:animations:completion:"))return (Method)view_animate_spring;
+        if(view && !strcmp(selector,"beginAnimations:context:"))return (Method)view_begin_animations;
+        if(view && !strcmp(selector,"commitAnimations"))return (Method)view_commit_animations;
+        if(view && (!strcmp(selector,"setAnimationDuration:") || !strcmp(selector,"setAnimationDelay:")))return (Method)view_animation_time;
+        if(view && !strcmp(selector,"setAnimationRepeatCount:"))return (Method)view_animation_repeat;
+        if(view && (!strcmp(selector,"setAnimationDelegate:") || !strcmp(selector,"setAnimationCurve:") || !strcmp(selector,"setAnimationRepeatAutoreverses:") || !strcmp(selector,"setAnimationBeginsFromCurrentState:") || !strcmp(selector,"setAnimationsEnabled:")))return (Method)view_animation_setting;
+        if(view && (!strcmp(selector,"setAnimationWillStartSelector:") || !strcmp(selector,"setAnimationDidStopSelector:")))return (Method)view_animation_selector;
+        if(view && !strcmp(selector,"areAnimationsEnabled"))return (Method)view_animations_state;
+        if(view && !strcmp(selector,"performWithoutAnimation:"))return (Method)view_without_animation;
         return NULL;
     }
     if (navigation) {
@@ -1201,14 +1557,6 @@ static Method views_method(Word object,const char *selector,const char *receiver
         if (!strcmp(selector,"setPermittedArrowDirections:")) return (Method)popover_set_arrows;
         if (!strcmp(selector,"permittedArrowDirections")) return (Method)popover_arrows;
     }
-    if (!strcmp(receiver,"_OBJC_CLASS_$_CALayer")) {
-        if (!strcmp(selector,"setMasksToBounds:")) return (Method)layer_set_masks;
-        if (!strcmp(selector,"masksToBounds")) return (Method)view_clips;
-        if (!strcmp(selector,"setCornerRadius:")) return (Method)layer_set_corner;
-        if (!strcmp(selector,"cornerRadius")) return (Method)layer_corner;
-        if (!strcmp(selector,"setZPosition:")) return (Method)layer_set_z;
-        if (!strcmp(selector,"zPosition")) return (Method)layer_z;
-    }
     if (!view) return NULL;
     if(!strcmp(selector,"intrinsicContentSize"))return (Method)ui_view_intrinsic_size;
     if(!strcmp(selector,"invalidateIntrinsicContentSize"))return (Method)view_invalidate_intrinsic;
@@ -1252,6 +1600,10 @@ static Method views_method(Word object,const char *selector,const char *receiver
     if (!strcmp(selector,"setFrame:")) return (Method)view_set_frame;
     if (!strcmp(selector,"setBounds:")) return (Method)view_set_bounds;
     if (!strcmp(selector,"setCenter:")) return (Method)view_set_center;
+    if (!strcmp(selector,"transform")) return (Method)view_get_transform;
+    if (!strcmp(selector,"setTransform:")) return (Method)view_set_transform;
+    if (!strcmp(selector,"convertPoint:toView:") || !strcmp(selector,"convertPoint:fromView:")) return (Method)view_convert_point;
+    if (!strcmp(selector,"convertRect:toView:") || !strcmp(selector,"convertRect:fromView:")) return (Method)view_convert_rect;
     if (!strcmp(selector,"setHidden:")) return (Method)view_hidden;
     if (!strcmp(selector,"isHidden")) return (Method)view_is_hidden;
     if (!strcmp(selector,"setAlpha:")) return (Method)view_alpha;

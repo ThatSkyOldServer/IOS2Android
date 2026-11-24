@@ -1,5 +1,12 @@
 /* APK file descriptors need entry-relative positions and EOF boundaries. */
-struct BundleFile { off_t start,length,position; ino_t inode; unsigned references,region; pthread_mutex_t mutex; };
+struct BundleFile {
+    off_t start,length,position;
+    ino_t inode;
+    unsigned references;
+    unsigned region;
+    pthread_mutex_t mutex;
+    AAsset *asset; /* Keeps borrowed backing alive until the last descriptor use. */
+};
 struct BundleDescriptor { int fd; struct BundleFile *file; struct BundleDescriptor *next; };
 static struct BundleDescriptor *bundle_descriptors[64];
 static pthread_mutex_t bundle_descriptors_mutex=PTHREAD_MUTEX_INITIALIZER;
@@ -28,7 +35,12 @@ static Word bundle_data(Word cls,const char *relative){
 }
 static ino_t bundle_inode(const char *name){uint64_t value=UINT64_C(14695981039346656037);for(const unsigned char *p=(const void *)name;*p;++p)value=(value^*p)*UINT64_C(1099511628211);return (ino_t)(value ? value : 1);}
 static void bundle_stat_info(struct stat *info,off_t length,ino_t inode,mode_t kind){*info=bundle_archive_info;info->st_size=length;info->st_ino=inode;info->st_mode=kind|(kind==S_IFDIR ? 0555 : 0444);info->st_uid=getuid();info->st_gid=getgid();info->st_nlink=1;info->st_blocks=(length+511)/512;}
-static void bundle_file_release(struct BundleFile *file){if(__atomic_sub_fetch(&file->references,1,__ATOMIC_ACQ_REL)==0){pthread_mutex_destroy(&file->mutex);free(file);}}
+static void bundle_file_release(struct BundleFile *file){
+    if(__atomic_sub_fetch(&file->references,1,__ATOMIC_ACQ_REL)!=0)return;
+    int code=errno;
+    if(file->asset)AAsset_close(file->asset);
+    pthread_mutex_destroy(&file->mutex);free(file);errno=code;
+}
 static struct BundleFile *bundle_fd_acquire(int fd){
     if(fd<0 || !__atomic_load_n(&bundle_descriptor_count,__ATOMIC_ACQUIRE))return NULL;
     pthread_mutex_lock(&bundle_descriptors_mutex);struct BundleDescriptor *entry=bundle_descriptors[(unsigned)fd%COUNT(bundle_descriptors)];
@@ -92,10 +104,11 @@ static int bundle_open(const char *relative){
             free(buffer);close(writer);if(error){close(fd);fd=-1;errno=error;}
         }
     }
-    int code=errno;AAsset_close(asset);if(fd<0){errno=code;return -1;}
-    if(start<0 || length<0 || start>INT64_MAX-length){close(fd);errno=EOVERFLOW;return -1;}
-    fcntl(fd,F_SETFD,FD_CLOEXEC);struct BundleFile *file=calloc(1,sizeof(*file));if(!file){close(fd);errno=ENOMEM;return -1;}
-    file->start=start;file->length=length;file->inode=inode;file->references=1;file->region=region;pthread_mutex_init(&file->mutex,NULL);
+    int code=errno;if(fd<0){AAsset_close(asset);errno=code;return -1;}
+    if(start<0 || length<0 || start>INT64_MAX-length){close(fd);AAsset_close(asset);errno=EOVERFLOW;return -1;}
+    fcntl(fd,F_SETFD,FD_CLOEXEC);struct BundleFile *file=calloc(1,sizeof(*file));if(!file){close(fd);AAsset_close(asset);errno=ENOMEM;return -1;}
+    if(!region){AAsset_close(asset);asset=NULL;}
+    file->start=start;file->length=length;file->inode=inode;file->references=1;file->region=region;file->asset=asset;pthread_mutex_init(&file->mutex,NULL);
     if(bundle_fd_register(fd,file)<0){code=errno;close(fd);bundle_file_release(file);errno=code;return -1;}return fd;
 }
 static int io_open(const char *path,int flags,mode_t mode){

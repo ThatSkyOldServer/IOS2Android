@@ -93,7 +93,7 @@ final class TableContent {
             boolean reattach=!attached;attached=true;
             LabelOverlay.attach(parent,panel);
             int width=Math.max(0,(int)Math.ceil(m[2])),height=Math.max(0,(int)Math.ceil(m[3]));ViewGroup.LayoutParams old=panel.getLayoutParams();if(old==null || old.width!=width || old.height!=height)panel.setLayoutParams(new FrameLayout.LayoutParams(width,height));
-            panel.setTranslationX(m[0]);panel.setTranslationY(m[1]);callback.alpha(token,panel,m[4]);parent.depth(panel,m[5],m[6]);
+            panel.setTranslationX(m[0]);panel.setTranslationY(m[1]);parent.depth(panel,m[5],m[6]);
             panel.setClipBounds(new android.graphics.Rect((int)m[7],(int)m[8],(int)Math.ceil(m[7]+m[9]),(int)Math.ceil(m[8]+m[10])));
             panel.setBackgroundColor(o[3]);panel.setVisibility(o[0]!=0 ? View.VISIBLE : View.GONE);parent.visibility(panel,o[0]!=0 && m[4]>0);
             list.setEnabled(o[2]!=0);list.setPadding(Math.round(m[13]),Math.round(m[12]),Math.round(m[15]),Math.round(m[14]));list.setVerticalScrollBarEnabled(o[12]!=0);list.setHorizontalScrollBarEnabled(o[13]!=0);
@@ -101,6 +101,7 @@ final class TableContent {
             if(this.backgroundToken!=backgroundToken){if(owners.get(this.backgroundToken)==background)owners.remove(this.backgroundToken);background.removeAllViews();this.backgroundToken=backgroundToken;if(backgroundToken!=0)owners.put(backgroundToken,background);}
             if(reattach || widthChanged || count!=o[4] || generation!=o[9]){count=o[4];generation=o[9];adapter.notifyDataSetChanged();}
             else for(Row row:rows)row.invalidate();
+            callback.alpha(token,panel,m[4]);
         }
         void close(){closing=true;for(Row row:rows.toArray(new Row[0]))row.recycle();rows.clear();list.setOnScrollListener(null);list.setAdapter(null);if(owners.get(backgroundToken)==background)owners.remove(backgroundToken);LabelOverlay.detach(panel);background.removeAllViews();callback.detached(token);}
     }
