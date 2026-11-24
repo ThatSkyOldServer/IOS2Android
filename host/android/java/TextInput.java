@@ -150,6 +150,7 @@ final class TextInput implements View.OnAttachStateChangeListener,
             String edit(long token,String text);
             boolean focus(long token,boolean focused);
             void selection(long token,int start,int end);
+            void submit(long token);
             void scroll(long token,float x,float y,float width,float height);
             void alpha(long token,View view,float alpha);
             void detached(long token);
@@ -160,7 +161,7 @@ final class TextInput implements View.OnAttachStateChangeListener,
         private final java.util.HashMap<Long,Entry> entries=new java.util.HashMap<>();
         Editors(android.app.Activity activity,LabelOverlay overlay,Callback callback){this.activity=activity;this.overlay=overlay;this.callback=callback;}
         View view(long token){Entry entry=entries.get(token);return entry==null ? null : entry.editor;}
-        void sync(long token,LabelOverlay parent,CharSequence text,float[] metrics,int[] options){Entry entry=entries.get(token);if(entry==null){entry=new Entry(token);entries.put(token,entry);}entry.sync(parent,text,metrics,options);}
+        void sync(long token,LabelOverlay parent,CharSequence text,String hint,float[] metrics,int[] options){Entry entry=entries.get(token);if(entry==null){if(options[1]==0)return;entry=new Entry(token);entries.put(token,entry);}entry.sync(parent,text,hint,metrics,options);}
         boolean focus(long token,boolean focused){Entry entry=entries.get(token);if(entry==null)return false;entry.updating=true;try{if(focused){if(entry.editable)entry.ime.requestShow();else entry.editor.requestFocus();}else{entry.ime.cancel();((InputMethodManager)activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE)).hideSoftInputFromWindow(entry.editor.getWindowToken(),0);entry.editor.clearFocus();}}finally{entry.updating=false;}return true;}
         void remove(long token){Entry entry=entries.remove(token);if(entry!=null)entry.close();}
         void close(){for(Entry entry:entries.values())entry.close();entries.clear();}
@@ -182,11 +183,14 @@ final class TextInput implements View.OnAttachStateChangeListener,
                     public void afterTextChanged(android.text.Editable text){if(updating || !editable)return;String accepted=callback.edit(token,text.toString());if(accepted!=null && !accepted.contentEquals(text)){updating=true;try{editor.setText(accepted);editor.setSelection(Math.min(accepted.length(),Math.max(0,editor.getSelectionStart())));}finally{updating=false;}}selection();}
                 });
                 editor.setOnFocusChangeListener((view,focused)->{if(updating)return;if(!callback.focus(token,focused)){updating=true;try{if(focused)editor.clearFocus();else editor.requestFocus();}finally{updating=false;}}});
+                editor.setOnEditorActionListener((view,action,event)->{if(entrySingle && (event==null || event.getAction()==android.view.KeyEvent.ACTION_UP))callback.submit(token);return entrySingle;});
             }
-            void sync(LabelOverlay parent,CharSequence text,float[] m,int[] o){
+            boolean entrySingle;
+            void sync(LabelOverlay parent,CharSequence text,String hint,float[] m,int[] o){
                 updating=true;
                 try{
                     scale=m[18];insetX=m[19];insetY=m[20];editable=o[3]!=0;selectable=o[4]!=0;scrolling=o[17]!=0;directional=o[20]!=0;
+                    entrySingle=o[22]!=0;
                     if(o[1]!=0)LabelOverlay.attach(parent,editor);
                     else if(editor.getParent()!=null){ime.cancel();LabelOverlay.detach(editor);callback.detached(token);}
                     int width=Math.max(0,(int)Math.ceil(m[2])),height=Math.max(0,(int)Math.ceil(m[3]));android.view.ViewGroup.LayoutParams old=editor.getLayoutParams();
@@ -195,8 +199,9 @@ final class TextInput implements View.OnAttachStateChangeListener,
                     editor.setClipBounds(new android.graphics.Rect((int)m[7],(int)m[8],(int)Math.ceil(m[7]+m[9]),(int)Math.ceil(m[8]+m[10])));
                     editor.setPadding(Math.round(m[12]),Math.round(m[13]),Math.round(m[14]),Math.round(m[15]));editor.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX,m[11]);
                     int type=TextInput.inputType(o[7],o[9],o[10]!=0);
-                    if((type&InputType.TYPE_MASK_CLASS)==InputType.TYPE_CLASS_TEXT){type|=InputType.TYPE_TEXT_FLAG_MULTI_LINE;if(o[5]==1)type|=InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS;else type|=InputType.TYPE_TEXT_FLAG_AUTO_CORRECT;if(o[6]==1)type|=InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS;}
+                    if((type&InputType.TYPE_MASK_CLASS)==InputType.TYPE_CLASS_TEXT){if(!entrySingle)type|=InputType.TYPE_TEXT_FLAG_MULTI_LINE;if(o[5]==1)type|=InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS;else type|=InputType.TYPE_TEXT_FLAG_AUTO_CORRECT;if(o[6]==1)type|=InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS;}
                     if(configuredType!=type){editor.setInputType(type);keyListener=editor.getKeyListener();configuredType=type;}
+                    editor.setSingleLine(entrySingle);editor.setGravity((entrySingle ? android.view.Gravity.CENTER_VERTICAL : android.view.Gravity.TOP)|android.view.Gravity.START);editor.setHint(hint);
                     editor.setTextIsSelectable(selectable && !editable);editor.setKeyListener(editable ? keyListener : null);editor.setCursorVisible(editable);editor.setShowSoftInputOnFocus(editable);
                     editor.setImeOptions(o[8]==0 ? EditorInfo.IME_ACTION_NONE|EditorInfo.IME_FLAG_NO_FULLSCREEN|EditorInfo.IME_FLAG_NO_EXTRACT_UI : TextInput.options(o[8]));
                     editor.setTextColor(o[13]);editor.setBackgroundColor(o[14]);editor.setTextAlignment(o[12]==1 ? View.TEXT_ALIGNMENT_CENTER : o[12]==2 ? View.TEXT_ALIGNMENT_TEXT_END : View.TEXT_ALIGNMENT_TEXT_START);

@@ -69,7 +69,7 @@ final class ViewComposition {
         long owner;boolean raw,clipsChanged;View view;float[] model,clips;Clip[] clipSources;Layer layer;Decoration background,foreground;Opacity opacity;Geometry geometry;
         Node(long token) { this.token=token; }
         void bind() {
-            if(view==null)return;LabelOverlay parent=callback.overlay(owner);if(parent!=null)LabelOverlay.attach(parent,view);
+            if(view==null)return;LabelOverlay parent=callback.overlay(owner);if(parent!=null && (raw || view.getParent()==null))LabelOverlay.attach(parent,view);
             if(layer!=null){if(background==null){background=new Decoration(false);foreground=new Decoration(true);}Drawable previous=view.getBackground();if(previous!=background){background.fallback=previous;view.setBackground(background);}previous=view.getForeground();if(previous!=foreground){foreground.fallback=previous;view.setForeground(foreground);}if(background.layer!=layer){background.layer=foreground.layer=layer;background.shaderWidth=foreground.shaderWidth=-1;view.invalidate();}}
         }
         void render() {

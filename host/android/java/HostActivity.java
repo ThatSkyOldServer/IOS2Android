@@ -207,6 +207,19 @@ public final class HostActivity extends Activity {
     private android.widget.FrameLayout guestContent;
     private LabelOverlay guestLabelOverlay;
     private TableContent tableContent;
+    private final java.util.HashMap<Long,ModalPresenter.ControllerPanel> controllerPanels=new java.util.HashMap<>();
+    private native String guestControllerEvent(long token,int event,int width,int height);
+    private native boolean guestControllerCanDismiss(long token);
+    private void showGuestController(long token,int style,float width,float height,float[] anchor,int arrows,boolean animated){mainHandler.post(()->{
+        if(isDestroyed()){guestControllerEvent(token,4,0,0);return;}
+        try{ModalPresenter.ControllerPanel panel=new ModalPresenter.ControllerPanel(this,style,width,height,anchor,arrows,new ModalPresenter.ControllerCallback(){
+            public void event(int event,int width,int height){String failure=guestControllerEvent(token,event,width,height);if(failure!=null)guestFailure(failure);if(event==3 || event==4)controllerPanels.remove(token);}
+            public boolean canDismiss(){return guestControllerCanDismiss(token);}
+        });controllerPanels.put(token,panel);panel.show(animated);}
+        catch(RuntimeException error){ModalPresenter.ControllerPanel failed=controllerPanels.remove(token);if(failed!=null)failed.close();else guestControllerEvent(token,4,0,0);guestFailure("Unable to present this controller: "+error.getMessage());}
+    });}
+    private void dismissGuestController(long token,boolean animated){mainHandler.post(()->{ModalPresenter.ControllerPanel panel=controllerPanels.get(token);if(panel!=null)panel.dismiss(animated);else guestControllerEvent(token,3,0,0);});}
+    private void resizeGuestController(long token,float width,float height,float dim){mainHandler.post(()->{ModalPresenter.ControllerPanel panel=controllerPanels.get(token);if(panel!=null)try{panel.resize(width,height,dim);}catch(RuntimeException error){panel.close();guestFailure("Unable to resize this controller: "+error.getMessage());}});}
     private native long[] bindGuestTableRow(long table,int position,long previous,float width);
     private native String guestTableEvent(long table,int event,int position,long row,float top,float width,int state);
     private TableContent tableContent() {
@@ -222,7 +235,7 @@ public final class HostActivity extends Activity {
     private void syncGuestTable(long token,long owner,long background,float[] metrics,int[] options){mainHandler.post(()->{LabelOverlay parent=guestOverlay(owner);if(!isDestroyed() && parent!=null)tableContent().sync(token,parent,background,metrics,options);});}
     private void syncGuestTableRow(long table,long row,float[] metrics,int[] options){mainHandler.post(()->{if(tableContent!=null)tableContent.appearance(table,row,metrics,options);});}
     private void commandGuestTable(long token,int action,int position,float offset,boolean animated,int mode){mainHandler.post(()->{if(tableContent!=null && !isDestroyed())tableContent.command(token,action,position,offset,animated,mode);});}
-    private LabelOverlay guestOverlay(long owner) { return owner==0 ? guestLabelOverlay : tableContent==null ? null : tableContent.overlay(owner); }
+    private LabelOverlay guestOverlay(long owner) { if(owner==0)return guestLabelOverlay;ModalPresenter.ControllerPanel panel=controllerPanels.get(owner);return panel!=null ? panel.overlay() : tableContent==null ? null : tableContent.overlay(owner); }
     private final ConcurrentHashMap<Long, TextView> guestLabels = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Long, android.widget.ImageView> guestControls = new ConcurrentHashMap<>();
     private ViewComposition viewComposition;
@@ -342,6 +355,7 @@ public final class HostActivity extends Activity {
     private float[] measureGuestText(CharSequence text, float size, float limit, int lines, int lineBreak) { return TextRenderer.measure(text,size,limit,lines,lineBreak); }
     private float[] measureGuestAttributedText(CharSequence text,float size,float width,float height,int options){return TextRenderer.measureAttributed(text,size,width,height,options);}
     private float guestFontScale() { return getResources().getConfiguration().fontScale; }
+    private int[] guestInterfaceColors(){ModalPresenter.Palette palette=new ModalPresenter.Palette(this);return new int[]{palette.surface,palette.foreground,palette.muted,palette.accent,palette.field};}
     private int guestLayoutDirection() { return getResources().getConfiguration().getLayoutDirection(); }
     private native String completeControlEvent(long token, int event, boolean highlighted);
     private static final class ControlUpdate {
@@ -553,13 +567,14 @@ public final class HostActivity extends Activity {
             public String edit(long token,String text){return editGuestInput(token,text,false);}
             public boolean focus(long token,boolean focused){return editorFocus(token,focused);}
             public void selection(long token,int start,int end){editorSelection(token,start,end);}
+            public void submit(long token){editGuestInput(token,"",true);}
             public void scroll(long token,float x,float y,float width,float height){editorScroll(token,x,y,width,height);}
             public void alpha(long token,android.view.View view,float value){applyGuestAlpha(token,view,value);}
             public void detached(long token){forgetGuestComposition(token);}
         });
         return textEditors;
     }
-    private void syncGuestEditor(long token,long owner,CharSequence text,float[] metrics,int[] options){mainHandler.post(()->{LabelOverlay overlay=guestOverlay(owner);if(!isDestroyed() && overlay!=null)textEditors().sync(token,overlay,text,metrics,options);});}
+    private void syncGuestEditor(long token,long owner,CharSequence text,String hint,float[] metrics,int[] options){mainHandler.post(()->{LabelOverlay overlay=guestOverlay(owner);if(!isDestroyed() && overlay!=null)textEditors().sync(token,overlay,text,hint,metrics,options);});}
     private void focusGuestEditor(long token,boolean show){mainHandler.post(()->{if(!isDestroyed() && textEditors!=null)textEditors.focus(token,show);});}
     private void closeGuestEditor(long token){mainHandler.post(()->{if(textEditors!=null)textEditors.remove(token);});}
     private native String updateGuestKeyboard(boolean visible, int x, int y, int width, int height);
@@ -1149,6 +1164,7 @@ public final class HostActivity extends Activity {
         networkServices.clear();
         synchronized(this){processActivitiesClosed=true;for(Long identifier:processActivities.keySet())processActivity(identifier,0,false);}
         closeGuestAccessibility();
+        for(ModalPresenter.ControllerPanel panel:new java.util.ArrayList<>(controllerPanels.values()))panel.close();controllerPanels.clear();
         if(viewComposition!=null)viewComposition.close();pendingCompositions.clear();pendingLayers.clear();
         if(guestLaunch!=null) { guestLaunch.release(); guestLaunch=null; }
         if(audioSession!=null) audioSession.close();

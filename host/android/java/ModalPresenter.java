@@ -5,6 +5,7 @@ import android.app.Dialog;
 import android.content.res.ColorStateList;
 import android.content.res.Configuration;
 import android.graphics.Typeface;
+import android.graphics.Rect;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.os.Build;
@@ -196,6 +197,35 @@ final class ModalPresenter extends Dialog {
     }
     void actionEnabled(int index, boolean enabled) { if (index>=0 && index<buttons.size()) buttons.get(index).setEnabled(enabled); }
 
+    interface ControllerCallback { void event(int event,int width,int height);boolean canDismiss(); }
+    static final class ControllerPanel extends Dialog {
+        private final Activity activity;private final Palette palette;private final ControllerCallback callback;private final LabelOverlay root;private final int style;private final float[] anchor;private float preferredWidth,preferredHeight;private boolean closed,closing,notified;private android.window.OnBackInvokedCallback back;
+        private int dp(float value){return Math.round(value*activity.getResources().getDisplayMetrics().density);}
+        ControllerPanel(Activity activity,int style,float width,float height,float[] anchor,int arrows,ControllerCallback callback){
+            super(activity,theme(activity,"HostPanelTheme"));this.activity=activity;this.style=style;this.preferredWidth=width;this.preferredHeight=height;this.anchor=anchor;this.callback=callback;palette=new Palette(activity);
+            root=new LabelOverlay(activity){@Override protected void onSizeChanged(int w,int h,int oldw,int oldh){super.onSizeChanged(w,h,oldw,oldh);if(!closed && w>0 && h>0 && (w!=oldw || h!=oldh))callback.event(0,w,h);}};root.setFocusableInTouchMode(true);
+            if(style==1 || style==2 || style==7){GradientDrawable shape=new GradientDrawable();shape.setColor(palette.surface);shape.setCornerRadius(dp(style==7 ? 16 : 28));root.setBackground(shape);root.setClipToOutline(true);}else root.setBackgroundColor(palette.surface);
+            setContentView(root);setCancelable(true);setCanceledOnTouchOutside(style==1 || style==2 || style==7);Window window=getWindow();window.setBackgroundDrawableResource(android.R.color.transparent);window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);window.setDimAmount(style==7 ? .25f : .4f);if(style==1 || style==2 || style==7)window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+            if(Build.VERSION.SDK_INT>=30){window.setDecorFitsSystemWindows(false);root.setOnApplyWindowInsetsListener((view,insets)->{android.graphics.Insets safe=insets.getInsets(WindowInsets.Type.systemBars()|WindowInsets.Type.displayCutout()|WindowInsets.Type.ime());layout(safe.left,safe.top,safe.right,safe.bottom);return insets;});}else root.setFitsSystemWindows(true);
+        }
+        LabelOverlay overlay(){return root;}
+        private void layout(int left,int top,int right,int bottom){if(closed)return;Window window=getWindow();Rect bounds=Build.VERSION.SDK_INT>=30 ? activity.getWindowManager().getCurrentWindowMetrics().getBounds() : new Rect(0,0,activity.getResources().getDisplayMetrics().widthPixels,activity.getResources().getDisplayMetrics().heightPixels);int margin=style==1 || style==2 || style==7 ? dp(16) : 0;
+            int availableWidth=Math.max(1,bounds.width()-left-right-margin*2),availableHeight=Math.max(1,bounds.height()-top-bottom-margin*2);int width=availableWidth,height=availableHeight;if(style==1 || style==2 || style==7){width=Math.min(availableWidth,preferredWidth>0 ? Math.round(preferredWidth) : dp(style==7 ? 320 : 640));height=Math.min(availableHeight,preferredHeight>0 ? Math.round(preferredHeight) : style==7 ? dp(320) : Math.round(availableHeight*.9f));}
+            int x=left+(bounds.width()-left-right-width)/2,y=top+(bounds.height()-top-bottom-height)/2;if(style==1)y=bounds.height()-bottom-margin-height;
+            if(style==7 && anchor!=null){x=Math.max(left+margin,Math.min(bounds.width()-right-margin-width,Math.round(anchor[0]+anchor[2]/2-width/2)));int below=Math.round(anchor[1]+anchor[3]+dp(8)),above=Math.round(anchor[1]-dp(8)-height);y=below+height<=bounds.height()-bottom-margin ? below : Math.max(top+margin,above);}
+            WindowManager.LayoutParams attributes=window.getAttributes();if(attributes.width!=width || attributes.height!=height || attributes.x!=x || attributes.y!=y || attributes.gravity!=(Gravity.TOP|Gravity.LEFT)){attributes.width=width;attributes.height=height;attributes.gravity=Gravity.TOP|Gravity.LEFT;attributes.x=x;attributes.y=y;window.setAttributes(attributes);}
+        }
+        void resize(float width,float height,float dim){preferredWidth=width;preferredHeight=height;Window window=getWindow();if(dim>0){window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);window.setDimAmount(dim);}else window.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);applyInsets();}
+        private void applyInsets(){if(Build.VERSION.SDK_INT>=30){android.graphics.Insets safe=activity.getWindowManager().getCurrentWindowMetrics().getWindowInsets().getInsets(WindowInsets.Type.systemBars()|WindowInsets.Type.displayCutout()|WindowInsets.Type.ime());layout(safe.left,safe.top,safe.right,safe.bottom);root.requestApplyInsets();}else layout(0,0,0,0);}
+        void show(boolean animated){super.show();applyInsets();Window window=getWindow();if(Build.VERSION.SDK_INT>=30){WindowInsetsController controller=window.getInsetsController();if(controller!=null){int mask=WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS|WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;controller.setSystemBarsAppearance(palette.dark ? 0 : mask,mask);}}if(Build.VERSION.SDK_INT>=33 && back==null){back=this::cancel;window.getOnBackInvokedDispatcher().registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,back);}
+            root.setAlpha(animated ? 0 : 1);root.post(()->{if(closed || closing)return;callback.event(0,root.getWidth(),root.getHeight());if(animated)root.animate().alpha(1).setDuration(200).withEndAction(this::shown).start();else shown();});}
+        private void shown(){if(closed || closing || notified)return;notified=true;callback.event(1,root.getWidth(),root.getHeight());}
+        @Override public void cancel(){if(!closed && !closing && callback.canDismiss())callback.event(2,0,0);}
+        @Override public void onBackPressed(){cancel();}
+        void dismiss(boolean animated){if(closed || closing)return;closing=true;root.animate().cancel();if(animated)root.animate().alpha(0).setDuration(150).withEndAction(()->finish(3)).start();else finish(3);}
+        void close(){if(!closed)finish(4);}
+        private void finish(int event){if(closed)return;closed=true;root.animate().cancel();if(Build.VERSION.SDK_INT>=33 && back!=null){getWindow().getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(back);back=null;}super.dismiss();callback.event(event,0,0);root.removeAllViews();}
+    }
     static final class WebPanel extends Dialog {
         private WebView web;
         private final LinearLayout content;

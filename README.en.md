@@ -79,6 +79,7 @@ The runtime targets ARM64 Android 9 and later. Window, picker, and permission AP
 - System Swift libraries are not supplied automatically. Dynamic class relocation, full bridging between Swift objects and host Foundation objects, and Core Data persistence remain unimplemented.
 - Full CoreUI trait selection remains unimplemented. Ambiguous atlases or default rendition aliases remain unavailable, and original catalogs are retained.
 - Scene lifecycle, complex NIBs, Auto Layout, general scrolling, and text editing still have compatibility gaps.
+- Navigation and modal presentation still lack complete native transitions, popover arrows, custom presentation controllers, and complex multi-window behavior.
 - Full CoreAnimation, three-dimensional layer composition, and layer-group ordering remain unimplemented. Attributed-text drawing contexts and some text layout options are unsupported.
 - Tables still lack constraint-based automatic row heights, NIB cells, editing/reordering, insertion/deletion animations, and complete grouped styling. Offscreen row geometry may use estimated heights.
 - Web pages support basic loading and interaction. Multiple windows, downloads, and some navigation and scripting APIs remain unsupported.

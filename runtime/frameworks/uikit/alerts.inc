@@ -91,6 +91,64 @@ static struct UIKitAlert *extension_modal(Word controller,const char *selector) 
     alert->custom=description;
     return alert;
 }
+struct ControllerPresentation {
+    Word token,controller,presenter,root,window,original_parent,original_owner,original_container,present_completion,dismiss_completion,legacy;
+    struct GuestRect original_frame;double width,height;
+    unsigned style,animated,shown,closing,resizing,disappears,presenter_hidden,interactive;
+    struct ControllerPresentation *next;
+};
+static struct ControllerPresentation *controller_presentations;
+static Word controller_presentation_sequence;
+static struct ControllerPresentation *controller_presentation_for_token(Word token) { for(struct ControllerPresentation *p=controller_presentations;p;p=p->next)if(p->token==token)return p;return NULL; }
+static void controller_appearance(Word object,const char *selector,unsigned animated) { Method method=find_implementation(object,selector);if(method)method(object,selector,animated,0,0,0); }
+static void controller_presentation_resize(Word object) {
+    struct ControllerPresentation *p=view_state(object)->presentation_host;if(!p || p->closing || p->resizing)return;p->resizing=1;
+    if(p->width>0 && p->height>0){view_set_frame(p->root,"Presented controller geometry",(struct GuestRect){0,0,p->width,p->height});view_layout_if_needed(p->root,"Presented controller layout");ui_search_geometry(object);}
+    struct GuestSize size=view_state(object)->preferred_size;JNIEnv *env=attached_environment("Controller preferred size");static jmethodID method;if(!method){jclass cls=(*env)->GetObjectClass(env,activity);method=(*env)->GetMethodID(env,cls,"resizeGuestController","(JFFF)V");(*env)->DeleteLocalRef(env,cls);}(*env)->CallVoidMethod(env,activity,method,(jlong)p->token,(jfloat)(size.width*screen_scale()),(jfloat)(size.height*screen_scale()),(jfloat)ui_search_dimming(object,p->style==1 || p->style==2 || p->style==7 ? .4 : 0));p->resizing=0;
+}
+static void controller_presentation_finish(struct ControllerPresentation *p,unsigned notify) {
+    struct ViewState *controller=view_state(p->controller),*presenter=view_state(p->presenter);Word root=p->root;
+    controller->presentation_host=NULL;controller->presenting=0;controller->presenting_transition=controller->dismissing_transition=0;controller->appeared=0;if(presenter->presented==p->controller)presenter->presented=0;
+    view_remove(root);view_state(root)->host_container=p->original_container;controller->owner_window=p->original_owner;view_set_frame(root,"Controller presentation cleanup",p->original_frame);if(p->original_parent)view_add(p->original_parent,"Controller presentation cleanup",root);
+    if(p->disappears){Word previous=controller_loaded_view(p->presenter);if(previous){view_state(previous)->hidden=p->presenter_hidden;view_sync_subtree(previous);}}
+    if(notify){controller_appearance(p->controller,"viewDidDisappear:",p->animated);if(p->disappears)controller_appearance(p->presenter,"viewDidAppear:",p->animated);}
+    ui_search_modal_event(p->controller,notify ? 3 : 4);
+    if(notify && p->interactive && p->legacy){struct HostObject *popover=(void *)p->legacy;Word delegate=load_weak_retained(&popover->content[1]);Method method=delegate ? find_implementation(delegate,"popoverControllerDidDismissPopover:") : NULL;if(method)method(delegate,"popoverControllerDidDismissPopover:",p->legacy,0,0,0);metal_object_release(delegate);}
+    else if(notify && p->interactive && controller->popover){Word delegate=load_weak_retained(&view_state(controller->popover)->controller);Method method=delegate ? find_implementation(delegate,"popoverPresentationControllerDidDismissPopover:") : NULL;if(method)method(delegate,"popoverPresentationControllerDidDismissPopover:",controller->popover,0,0,0);metal_object_release(delegate);}
+    struct ControllerPresentation **slot=&controller_presentations;while(*slot && *slot!=p)slot=&(*slot)->next;if(*slot)*slot=p->next;
+    if(p->present_completion)_Block_release((void *)p->present_completion);if(p->dismiss_completion){Word block=p->dismiss_completion;p->dismiss_completion=0;if(notify)((void (*)(Word))read_word(block+16))(block);_Block_release((void *)block);}metal_object_release(p->root);metal_object_release(p->presenter);metal_object_release(p->controller);free(p);
+}
+static void controller_presentation_begin(Word presenter,Word object,const char *selector,unsigned animated,Word completion) {
+    struct ViewState *controller=view_state(object);Word root=controller_view(object),window=view_window(controller_loaded_view(presenter));if(!window)window=key_window;if(!root || !window)stop("Controller presentation requires an attached window",selector);
+    if(controller->modal_style<0 || controller->modal_style>7 || controller->modal_style==4)stop("Unsupported controller presentation style",selector);
+    struct ControllerPresentation *p=calloc(1,sizeof(*p));if(!p)stop("Allocation failed",selector);p->token=++controller_presentation_sequence;p->controller=metal_object_retain(object);p->presenter=metal_object_retain(presenter);p->root=metal_object_retain(root);p->window=window;p->style=controller->modal_style;p->animated=animated;p->disappears=p->style==0;
+    p->original_parent=view_state(root)->parent;p->original_frame=view_state(root)->frame;p->original_owner=controller->owner_window;p->original_container=view_state(root)->host_container;p->present_completion=completion ? (Word)_Block_copy((void *)completion) : 0;
+    p->next=controller_presentations;controller_presentations=p;controller->presentation_host=p;controller->owner_window=window;controller->presenting=presenter;controller->presenting_transition=1;view_state(presenter)->presented=object;
+    ui_search_modal_event(object,0);ui_table_controller_appear(object);controller_appearance(object,"viewWillAppear:",animated);if(p->disappears){controller_appearance(presenter,"viewWillDisappear:",animated);Word previous=controller_loaded_view(presenter);if(previous)p->presenter_hidden=view_state(previous)->hidden;}
+    if(p->closing)return;
+    float anchor[4]={0};Word popover=controller->popover;if(popover){struct ViewState *source=view_state(popover);Word view=source->right_item ? bar_item_view(source->right_item) : source->view;struct GuestRect rect=source->right_item && view ? view_bounds(view) : source->frame;if(view){rect=view_convert_rect(view,"convertRect:toView:",rect,0);double scale=screen_scale();anchor[0]=rect.x*scale;anchor[1]=rect.y*scale;anchor[2]=rect.width*scale;anchor[3]=rect.height*scale;}}
+    struct GuestSize size=controller->preferred_size;JNIEnv *env=attached_environment(selector);static jmethodID show;if(!show){jclass cls=(*env)->GetObjectClass(env,activity);show=(*env)->GetMethodID(env,cls,"showGuestController","(JIFF[FIZ)V");(*env)->DeleteLocalRef(env,cls);}jfloatArray point=(*env)->NewFloatArray(env,4);(*env)->SetFloatArrayRegion(env,point,0,4,anchor);(*env)->CallVoidMethod(env,activity,show,(jlong)p->token,(jint)p->style,(jfloat)(size.width*screen_scale()),(jfloat)(size.height*screen_scale()),point,(jint)(popover ? view_state(popover)->tag : 0),(jboolean)animated);(*env)->DeleteLocalRef(env,point);
+    if((*env)->ExceptionCheck(env)){(*env)->ExceptionClear(env);controller_presentation_finish(p,0);stop("Android controller presentation failed",selector);}
+    view_state(root)->host_container=p->token;if(view_state(root)->parent!=window)view_add(window,selector,root);else view_sync_subtree(root);
+}
+static void controller_presentation_dismiss(Word object,const char *selector,unsigned animated,Word copied) {
+    struct ControllerPresentation *p=view_state(object)->presentation_host;if(!p){if(copied)_Block_release((void *)copied);return;}if(p->closing){if(copied)_Block_release((void *)copied);return;}p->closing=1;p->animated=animated;p->dismiss_completion=copied;view_state(object)->dismissing_transition=1;
+    ui_search_modal_event(object,2);controller_appearance(object,"viewWillDisappear:",animated);if(p->disappears)controller_appearance(p->presenter,"viewWillAppear:",animated);
+    JNIEnv *env=attached_environment(selector);static jmethodID method;if(!method){jclass cls=(*env)->GetObjectClass(env,activity);method=(*env)->GetMethodID(env,cls,"dismissGuestController","(JZ)V");(*env)->DeleteLocalRef(env,cls);}(*env)->CallVoidMethod(env,activity,method,(jlong)p->token,(jboolean)animated);
+}
+JNIEXPORT jboolean JNICALL HOST_JNI(HostActivity_guestControllerCanDismiss)(JNIEnv *env,jobject instance,jlong token) {
+    struct ControllerPresentation *p=controller_presentation_for_token(token);if(!p || p->closing)return JNI_FALSE;if(view_state(p->controller)->modal_in_popover)return JNI_FALSE;may_unwind=1;int failed=setjmp(boundary);Word allowed=1;
+    if(!failed){Word delegate=0,object=0;const char *selector=NULL;if(p->legacy){object=p->legacy;delegate=load_weak_retained(&((struct HostObject *)object)->content[1]);selector="popoverControllerShouldDismissPopover:";}else if(view_state(p->controller)->popover){object=view_state(p->controller)->popover;delegate=load_weak_retained(&view_state(object)->controller);selector="popoverPresentationControllerShouldDismissPopover:";}Method method=delegate && selector ? find_implementation(delegate,selector) : NULL;if(method)allowed=method(delegate,selector,object,0,0,0)&255;metal_object_release(delegate);}
+    may_unwind=0;return !failed && allowed ? JNI_TRUE : JNI_FALSE;
+}
+JNIEXPORT jstring JNICALL HOST_JNI(HostActivity_guestControllerEvent)(JNIEnv *env,jobject instance,jlong token,jint event,jint width,jint height) {
+    struct ControllerPresentation *p=controller_presentation_for_token(token);if(!p)return NULL;may_unwind=1;snprintf(stage,sizeof(stage),"UIViewController presentation event");int failed=setjmp(boundary);Word block=0;
+    if(!failed){if(event==0 && !p->closing && width>0 && height>0){p->width=width/screen_scale();p->height=height/screen_scale();controller_presentation_resize(p->controller);}
+        else if(event==1 && !p->shown && !p->closing){p->shown=1;view_state(p->controller)->presenting_transition=0;view_state(p->controller)->appeared=1;if(p->disappears){Word previous=controller_loaded_view(p->presenter);if(previous){view_state(previous)->hidden=1;view_sync_subtree(previous);}controller_appearance(p->presenter,"viewDidDisappear:",p->animated);}controller_appearance(p->controller,"viewDidAppear:",p->animated);ui_search_modal_event(p->controller,1);block=p->present_completion;p->present_completion=0;if(block)((void (*)(Word))read_word(block+16))(block);}
+        else if(event==2){p->interactive=1;controller_presentation_dismiss(p->controller,"System controller dismissal",1,0);}
+        else if(event==3 || event==4){controller_presentation_finish(p,event==3);}}
+    if(block)_Block_release((void *)block);may_unwind=0;return failed ? (*env)->NewStringUTF(env,status) : NULL;
+}
 static void ui_controller_present(Word object,const char *selector,Word controller,Word animated,Word completion) {
     if (controller && (view_state(controller)->modal_style==3 || view_state(controller)->modal_style==6)) {
         Word context=object;
@@ -105,7 +163,7 @@ static void ui_controller_present(Word object,const char *selector,Word controll
     unsigned external_modal=0;
     if (class_inherits(read_word(controller),external_class("_OBJC_CLASS_$_UIAlertController"))) alert=(void *)controller;
     else if (view_state(controller)->deferred_storyboard) alert=storyboard_capability_alert(controller);
-    else { alert=extension_modal(controller,selector); if (!alert) stop("Unsupported modal controller",class_name(read_word(controller)) ? class_name(read_word(controller)) : selector); external_modal=1; }
+    else { alert=extension_modal(controller,selector); if (!alert){controller_presentation_begin(object,controller,selector,animated!=0,completion);return;} external_modal=1; }
     alert->external_modal=external_modal;
     alert->animated=animated!=0;
     alert->controller=controller; alert->presented=1; alert->presenter=object;
@@ -296,6 +354,7 @@ static void ui_controller_dismiss(Word object,const char *selector,Word animated
     if (target) {
         if (read_word(target)==external_class("_OBJC_CLASS_$_UIActivityViewController")) { ui_share_dismiss(target,selector,copied); return; }
         if(class_inherits(read_word(target),external_class("_OBJC_CLASS_$_UIImagePickerController"))){photo_dismiss(target,selector,copied);return;}
+        if(view_state(target)->presentation_host){controller_presentation_dismiss(target,selector,animated!=0,copied);return;}
         struct UIKitAlert *alert=(void *)view_state(target)->modal_alert;
         if (!alert) stop("Unsupported modal controller",selector);
         ui_alert_clear(alert);
@@ -306,6 +365,19 @@ static void ui_controller_dismiss(Word object,const char *selector,Word animated
     }
     if (copied) schedule_main_function(ui_alert_completion_deliver,(void *)copied);
 }
+static Word legacy_popover_init(Word object,const char *selector,Word controller) {
+    if(!controller || !class_inherits(read_word(controller),external_class("_OBJC_CLASS_$_UIViewController")))stop("Invalid popover content controller",selector);view_strong_property(&((struct HostObject *)object)->content[0],controller);return object;
+}
+static Word legacy_popover_property(Word object,const char *selector) { struct HostObject *popover=(void *)object;return !strcmp(selector,"contentViewController") ? popover->content[0] : !strcmp(selector,"delegate") ? load_weak(&popover->content[1]) : popover->content[0] && view_state(popover->content[0])->presenting!=0; }
+static void legacy_popover_set(Word object,const char *selector,Word value) { struct HostObject *popover=(void *)object;if(!strcmp(selector,"setDelegate:")){store_weak(&popover->content[1],value);return;}if(popover->content[0] && view_state(popover->content[0])->presenting)stop("Changing visible popover content is unavailable",selector);legacy_popover_init(object,selector,value); }
+static struct GuestSize legacy_popover_size(Word object) { struct HostObject *popover=(void *)object;return popover->content[0] ? controller_preferred_size(popover->content[0]) : (struct GuestSize){0}; }
+static void legacy_popover_set_size(Word object,const char *selector,struct GuestSize value) { struct HostObject *popover=(void *)object;if(popover->content[0])controller_set_preferred_size(popover->content[0],selector,value); }
+static void legacy_popover_present(Word object,const char *selector,struct GuestRect rect,Word source,Word arrows,Word animated) {
+    struct HostObject *legacy=(void *)object;Word controller=legacy->content[0];if(!controller || !source || !view_window(source))stop("Popover requires attached source content",selector);view_state(controller)->modal_style=7;Word popover=controller_popover(controller);popover_set_source(popover,"setSourceView:",source);view_set_frame(popover,"setSourceRect:",rect);popover_set_arrows(popover,"setPermittedArrowDirections:",arrows);
+    Word presenter=0;for(Word current=source;current;current=view_state(current)->parent)if(view_state(current)->controller){presenter=view_state(current)->controller;break;}if(!presenter)presenter=window_controller(view_window(source));if(!presenter)stop("Popover source has no controller",selector);ui_controller_present(presenter,selector,controller,animated,0);if(view_state(controller)->presentation_host)view_state(controller)->presentation_host->legacy=object;
+}
+static void legacy_popover_present_item(Word object,const char *selector,Word item,Word arrows,Word animated) { if(!item || !class_inherits(read_word(item),external_class("_OBJC_CLASS_$_UIBarButtonItem")))stop("Invalid popover bar item",selector);Word source=bar_item_view(item);if(!source)stop("Popover bar item has no visible view",selector);legacy_popover_present(object,selector,view_bounds(source),source,arrows,animated); }
+static void legacy_popover_dismiss(Word object,const char *selector,Word animated) { Word controller=((struct HostObject *)object)->content[0];if(controller && view_state(controller)->presenting)ui_controller_dismiss(controller,selector,animated,0); }
 JNIEXPORT jstring JNICALL HOST_JNI(HostActivity_completeModalDismiss)(JNIEnv *env,jobject instance,jlong value) {
     may_unwind=1; snprintf(stage,sizeof(stage),"Original modal dismiss completion"); int failed=setjmp(boundary);
     if (!failed && value) ((void (*)(Word))read_word((Word)value+16))((Word)value);
@@ -356,6 +428,7 @@ JNIEXPORT jstring JNICALL HOST_JNI(HostActivity_completeAlert)(JNIEnv *env,jobje
 static Method ui_alerts_method(Word object,const char *selector,const char *receiver,int class_receiver) {
     if (!receiver) return NULL;
     Word cls=class_receiver ? object : read_word(object);
+    if(!class_receiver && class_inherits(cls,external_class("_OBJC_CLASS_$_UIPopoverController"))){if(!strcmp(selector,"initWithContentViewController:"))return (Method)legacy_popover_init;if(!strcmp(selector,"contentViewController") || !strcmp(selector,"delegate") || !strcmp(selector,"isPopoverVisible"))return (Method)legacy_popover_property;if(!strcmp(selector,"setDelegate:") || !strcmp(selector,"setContentViewController:") || !strcmp(selector,"setContentViewController:animated:"))return (Method)legacy_popover_set;if(!strcmp(selector,"popoverContentSize"))return (Method)legacy_popover_size;if(!strcmp(selector,"setPopoverContentSize:") || !strcmp(selector,"setPopoverContentSize:animated:"))return (Method)legacy_popover_set_size;if(!strcmp(selector,"presentPopoverFromRect:inView:permittedArrowDirections:animated:"))return (Method)legacy_popover_present;if(!strcmp(selector,"presentPopoverFromBarButtonItem:permittedArrowDirections:animated:"))return (Method)legacy_popover_present_item;if(!strcmp(selector,"dismissPopoverAnimated:"))return (Method)legacy_popover_dismiss;}
     int legacy_sheet=class_inherits(cls,external_class("_OBJC_CLASS_$_UIActionSheet"));
     if (!class_receiver && (legacy_sheet || class_inherits(cls,external_class("_OBJC_CLASS_$_UIAlertView")))) {
         if (!strcmp(selector,"init")) return (Method)ui_legacy_initialize;

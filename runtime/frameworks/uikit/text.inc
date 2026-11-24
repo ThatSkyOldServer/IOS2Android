@@ -48,12 +48,12 @@ static Method ui_paragraph_method(Word object,const char *selector,const char *r
 }
 
 struct TextFieldState {
-    Word object,properties[17],attributed,detection,synced_owner;
+    Word object,properties[17],attributed,detection,synced_owner,search_owner;
     struct GuestInsets insets;
     struct GuestRange selection;
-    unsigned multiline,editable,selectable,revision,synced_revision,synced,closed,delegate_epoch,delegate_cached;
+    unsigned multiline,editable,selectable,revision,synced_revision,synced,closed,delegate_epoch,delegate_cached,visual;
     Method callbacks[8];
-    float metrics[21];int options[22];
+    float metrics[21];int options[23];
     struct TextFieldState *next;
 };
 static struct TextFieldState *text_fields;
@@ -183,7 +183,7 @@ static void text_field_set(Word object,const char *selector,Word value) {
     field->properties[index]=value;++field->revision;
     if(index==0){field->attributed=0;size_t length=string_length(value,"Text input");if(field->selection.location>length)field->selection=(struct GuestRange){length,0};else if(field->selection.length>length-field->selection.location)field->selection.length=length-field->selection.location;}
     if(index==12){field->delegate_cached=0;if(field->multiline)ui_scroll_input_delegate(object,value);}
-    if(field->multiline)ui_input_sync(object);else if (text_first_responder==object) text_field_sync(object);
+    if(field->multiline || field->visual)ui_input_sync(object);else if (text_first_responder==object) text_field_sync(object);if(field->search_owner)ui_search_field_sync(field->search_owner);
 }
 static Word text_editor_init(Word object,const char *selector,struct GuestRect frame,Word container) {
     if(container)stop("Custom text containers are unavailable",selector);
@@ -358,6 +358,111 @@ static Word ui_preferred_content_category(Word object,const char *selector) {
     static const double scales[]={.82,.88,.94,1,1.12,1.23,1.35,1.65,1.94,2.35,2.76,3.12};static const char *names[]={"UICTContentSizeCategoryXS","UICTContentSizeCategoryS","UICTContentSizeCategoryM","UICTContentSizeCategoryL","UICTContentSizeCategoryXL","UICTContentSizeCategoryXXL","UICTContentSizeCategoryXXXL","UICTContentSizeCategoryAccessibilityM","UICTContentSizeCategoryAccessibilityL","UICTContentSizeCategoryAccessibilityXL","UICTContentSizeCategoryAccessibilityXXL","UICTContentSizeCategoryAccessibilityXXXL"};
     JNIEnv *env=attached_environment(selector);static jmethodID method;static Word categories[COUNT(scales)];if(!method){jclass cls=(*env)->GetObjectClass(env,activity);method=(*env)->GetMethodID(env,cls,"guestFontScale","()F");(*env)->DeleteLocalRef(env,cls);}double scale=(*env)->CallFloatMethod(env,activity,method);if((*env)->ExceptionCheck(env)){(*env)->ExceptionClear(env);scale=1;}unsigned index=0;if(!isfinite(scale) || scale<=0)scale=1;while(index+1<COUNT(scales) && scale>(scales[index]+scales[index+1])*.5)++index;if(!categories[index])categories[index]=copy_string(names[index]);return categories[index];
 }
+static Word ui_interface_color(unsigned index) { JNIEnv *env=attached_environment("Interface palette");static jmethodID method;if(!method){jclass cls=(*env)->GetObjectClass(env,activity);method=(*env)->GetMethodID(env,cls,"guestInterfaceColors","()[I");(*env)->DeleteLocalRef(env,cls);}jintArray colors=(*env)->CallObjectMethod(env,activity,method);jint palette[]={0xfff8f5fc,0xff211e28,0xff57515e,0xff6750a4,0xffe8e2ec};if(colors && (*env)->GetArrayLength(env,colors)==5)(*env)->GetIntArrayRegion(env,colors,0,5,palette);if(colors)(*env)->DeleteLocalRef(env,colors);if((*env)->ExceptionCheck(env))(*env)->ExceptionClear(env);unsigned value=palette[index<5 ? index : 0];return ui_color_rgba(external_class("_OBJC_CLASS_$_UIColor"),"Interface palette",((value>>16)&255)/255.0,((value>>8)&255)/255.0,(value&255)/255.0,1); }
+struct SearchBarState {
+    Word object,field,controller,delegate,prompt,prompt_view,tint,bar_tint,cancel,scope_titles,scope_buttons,surface;
+    unsigned shows_cancel,shows_scope,selected_scope,bar_style,style,translucent,closed,layout_running,cached,epoch;
+    Method callbacks[10];
+};
+struct SearchControllerState {
+    Word object,bar,results,delegate,updater,cached_updater,original_bar_parent,hidden_navigation,borrowed_view,borrowed_parent;struct GuestRect original_bar_frame,borrowed_frame;unsigned navigation_hidden,updater_epoch;Method updater_method;
+    unsigned active,dims,hides_navigation,transition,layout_running,cached,epoch,focus_requested;
+    Method callbacks[5];
+};
+static struct SearchBarState *search_bar_state(Word object) {
+    struct ViewState *view=view_state(object);if(view->search)return view->search;struct SearchBarState *bar=calloc(1,sizeof(*bar));if(!bar)stop("Allocation failed","UISearchBar");bar->object=object;bar->translucent=1;view->search=bar;return bar;
+}
+static struct SearchControllerState *search_controller_state(Word object) {
+    struct ViewState *view=view_state(object);if(view->search)return view->search;struct SearchControllerState *state=calloc(1,sizeof(*state));if(!state)stop("Allocation failed","UISearchController");state->object=object;state->dims=state->hides_navigation=1;view->search=state;return state;
+}
+static Word control_factory(Word,const char *,Word);
+static void control_set_content(Word,const char *,Word,Word);
+static void control_add_target(Word,const char *,Word,const char *,Word);
+static void ui_control_sync(Word);
+static Word text_become(Word);
+static Word input_replace(Word,Word);
+static void search_controller_active(Word,const char *,Word);
+static void search_bar_cache(struct SearchBarState *bar) {
+    if(bar->cached && bar->epoch==method_cache_epoch)return;const char *names[]={"searchBarShouldBeginEditing:","searchBarTextDidBeginEditing:","searchBarShouldEndEditing:","searchBarTextDidEndEditing:","searchBar:textDidChange:","searchBar:shouldChangeTextInRange:replacementText:","searchBarSearchButtonClicked:","searchBarCancelButtonClicked:","searchBar:selectedScopeButtonIndexDidChange:",NULL};Word delegate=load_weak_retained(&bar->delegate);for(unsigned i=0;i<COUNT(names);++i)bar->callbacks[i]=delegate && names[i] ? find_implementation(delegate,names[i]) : NULL;metal_object_release(delegate);bar->cached=1;bar->epoch=method_cache_epoch;
+}
+static void search_bar_notify(struct SearchBarState *bar,unsigned index,Word argument) {
+    search_bar_cache(bar);Word delegate=load_weak_retained(&bar->delegate);Method method=delegate ? bar->callbacks[index] : NULL;const char *names[]={"searchBarShouldBeginEditing:","searchBarTextDidBeginEditing:","searchBarShouldEndEditing:","searchBarTextDidEndEditing:","searchBar:textDidChange:","searchBar:shouldChangeTextInRange:replacementText:","searchBarSearchButtonClicked:","searchBarCancelButtonClicked:","searchBar:selectedScopeButtonIndexDidChange:"};if(method)method(delegate,names[index],bar->object,argument,0,0);metal_object_release(delegate);
+}
+static void search_results_update(struct SearchControllerState *state) {
+    Word updater=load_weak_retained(&state->updater);if(updater){if(state->cached_updater!=updater || state->updater_epoch!=method_cache_epoch){state->cached_updater=updater;state->updater_epoch=method_cache_epoch;state->updater_method=find_implementation(updater,"updateSearchResultsForSearchController:");}if(state->updater_method)state->updater_method(updater,"updateSearchResultsForSearchController:",state->object,0,0,0);}metal_object_release(updater);
+}
+static void search_controller_notify(struct SearchControllerState *state,unsigned event) {
+    if(!state->cached || state->epoch!=method_cache_epoch){const char *names[]={"willPresentSearchController:","didPresentSearchController:","willDismissSearchController:","didDismissSearchController:","presentSearchController:"};Word delegate=load_weak_retained(&state->delegate);for(unsigned i=0;i<COUNT(names);++i)state->callbacks[i]=delegate ? find_implementation(delegate,names[i]) : NULL;metal_object_release(delegate);state->cached=1;state->epoch=method_cache_epoch;}
+    Word delegate=load_weak_retained(&state->delegate);Method method=delegate ? state->callbacks[event] : NULL;const char *names[]={"willPresentSearchController:","didPresentSearchController:","willDismissSearchController:","didDismissSearchController:","presentSearchController:"};if(method)method(delegate,names[event],state->object,0,0,0);metal_object_release(delegate);
+}
+static Word search_bar_field(struct SearchBarState *bar) {
+    if(bar->field)return bar->field;Word field=host_allocate(external_class("_OBJC_CLASS_$_UITextField"));struct TextFieldState *input=text_field_state(field);input->visual=input->editable=input->selectable=1;input->properties[6]=6;input->properties[9]=0;input->properties[10]=1;input->properties[14]=1;input->search_owner=bar->object;view_state(field)->input=input;
+    JNIEnv *env=attached_environment("Search palette");jclass cls=(*env)->GetObjectClass(env,activity);jmethodID colors=(*env)->GetMethodID(env,cls,"guestInterfaceColors","()[I");jintArray palette=(*env)->CallObjectMethod(env,activity,colors);jint values[]={0xfff8f5fc,0xff211e28,0xff57515e,0xff6750a4,0xffe8e2ec};if(palette && (*env)->GetArrayLength(env,palette)==5)(*env)->GetIntArrayRegion(env,palette,0,5,values);if(palette)(*env)->DeleteLocalRef(env,palette);(*env)->DeleteLocalRef(env,cls);if((*env)->ExceptionCheck(env))(*env)->ExceptionClear(env);
+    Word color_class=external_class("_OBJC_CLASS_$_UIColor");input->properties[2]=ui_color_rgba(color_class,"Search text",((values[1]>>16)&255)/255.0,((values[1]>>8)&255)/255.0,(values[1]&255)/255.0,1);input->properties[3]=ui_font_system(external_class("_OBJC_CLASS_$_UIFont"),"systemFontOfSize:",17);
+    view_state(field)->background=ui_color_rgba(color_class,"Search field",((values[4]>>16)&255)/255.0,((values[4]>>8)&255)/255.0,(values[4]&255)/255.0,1);bar->tint=ui_color_rgba(color_class,"Search tint",((values[3]>>16)&255)/255.0,((values[3]>>8)&255)/255.0,(values[3]&255)/255.0,1);
+    bar->surface=ui_color_rgba(color_class,"Search surface",((values[0]>>16)&255)/255.0,((values[0]>>8)&255)/255.0,(values[0]&255)/255.0,1);bar->field=field;view_add(bar->object,"Search input",field);return field;
+}
+static Word search_bar_initialize(Word object,const char *selector,struct GuestRect frame) { view_init_frame(object,selector,frame);search_bar_field(search_bar_state(object));ui_search_sync(object);return object; }
+static Word search_bar_initialize_plain(Word object,const char *selector) { return search_bar_initialize(object,selector,(struct GuestRect){0,0,0,56}); }
+static int ui_search_input_should(Word object,unsigned index) {
+    struct SearchBarState *bar=search_bar_state(object);search_bar_cache(bar);unsigned event=index==0 ? 0 : index==2 ? 2 : 6;Word delegate=load_weak_retained(&bar->delegate);Method method=delegate ? bar->callbacks[event] : NULL;int allowed=1;
+    if(index==7){metal_object_release(delegate);search_bar_notify(bar,6,0);return 1;}if(method)allowed=method(delegate,event==0 ? "searchBarShouldBeginEditing:" : "searchBarShouldEndEditing:",object,0,0,0)&255;metal_object_release(delegate);return allowed;
+}
+static int ui_search_input_replace(Word object,struct GuestRange range,Word replacement) {
+    struct SearchBarState *bar=search_bar_state(object);search_bar_cache(bar);Word delegate=load_weak_retained(&bar->delegate);Method method=delegate ? bar->callbacks[5] : NULL;int allowed=!method || (((Word (*)(Word,const char *,Word,struct GuestRange,Word))method)(delegate,"searchBar:shouldChangeTextInRange:replacementText:",object,range,replacement)&255);metal_object_release(delegate);return allowed;
+}
+static void ui_search_input_notify(Word object,unsigned event) {
+    if(event!=1 && event!=3)return;struct SearchBarState *bar=search_bar_state(object);search_bar_notify(bar,event,0);if(event==1 && bar->controller && !search_controller_state(bar->controller)->active){search_controller_state(bar->controller)->focus_requested=1;search_controller_active(bar->controller,"setActive:",1);}
+}
+static void ui_search_input_changed(Word object) { struct SearchBarState *bar=search_bar_state(object);search_bar_notify(bar,4,text_field_state(bar->field)->properties[0]);if(bar->controller)search_results_update(search_controller_state(bar->controller)); }
+static void ui_search_field_sync(Word object) { ui_search_sync(object); }
+static void search_bar_cancel(Word object,const char *selector,Word sender) { struct SearchBarState *bar=search_bar_state(object);search_bar_notify(bar,7,0);if(bar->controller)search_controller_active(bar->controller,"setActive:",0);else text_resign(bar->field); }
+static void search_scope_action(Word object,const char *selector,Word sender) { struct SearchBarState *bar=search_bar_state(object);struct Sequence *buttons=(void *)bar->scope_buttons;for(size_t i=0;buttons && i<buttons->count;++i)if(buttons->items[i]==sender){bar->selected_scope=(unsigned)i;ui_search_sync(object);search_bar_notify(bar,8,i);if(bar->controller)search_results_update(search_controller_state(bar->controller));return;} }
+static Word search_bar_get(Word object,const char *selector) {
+    struct SearchBarState *bar=search_bar_state(object);if(!strcmp(selector,"searchTextField"))return search_bar_field(bar);if(!strcmp(selector,"text"))return text_field_state(search_bar_field(bar))->properties[0];if(!strcmp(selector,"placeholder"))return text_field_state(search_bar_field(bar))->properties[1];if(!strcmp(selector,"delegate"))return load_weak(&bar->delegate);if(!strcmp(selector,"prompt"))return bar->prompt;if(!strcmp(selector,"tintColor"))return bar->tint;if(!strcmp(selector,"barTintColor"))return bar->bar_tint;if(!strcmp(selector,"showsCancelButton"))return bar->shows_cancel;if(!strcmp(selector,"showsScopeBar"))return bar->shows_scope;if(!strcmp(selector,"scopeButtonTitles"))return bar->scope_titles;if(!strcmp(selector,"selectedScopeButtonIndex"))return bar->selected_scope;if(!strcmp(selector,"barStyle"))return bar->bar_style;if(!strcmp(selector,"searchBarStyle"))return bar->style;return bar->translucent;
+}
+static void search_bar_set(Word object,const char *selector,Word value) {
+    struct SearchBarState *bar=search_bar_state(object);if(!strcmp(selector,"setDelegate:")){store_weak(&bar->delegate,value);bar->cached=0;return;}if(!strcmp(selector,"setText:") || !strcmp(selector,"setPlaceholder:")){text_field_set(search_bar_field(bar),selector,value);return;}
+    if(!strcmp(selector,"setPrompt:"))bar->prompt=value ? text_copy(value,"copy") : 0;else if(!strcmp(selector,"setTintColor:"))bar->tint=value;else if(!strcmp(selector,"setBarTintColor:")){bar->bar_tint=value;view_state(object)->background=value;}else if(!strncmp(selector,"setShowsCancelButton:",21))bar->shows_cancel=value!=0;
+    else if(!strcmp(selector,"setShowsScopeBar:"))bar->shows_scope=value!=0;else if(!strcmp(selector,"setSelectedScopeButtonIndex:")){struct Sequence *titles=(void *)bar->scope_titles;if(!titles || value>=titles->count)stop("Invalid search scope index",selector);bar->selected_scope=value;}
+    else if(!strcmp(selector,"setScopeButtonTitles:")){if(value && !class_inherits(read_word(value),external_class("_OBJC_CLASS_$_NSArray")))stop("Invalid search scopes",selector);struct Sequence *titles=(void *)value;if(titles)for(size_t i=0;i<titles->count;++i)if(!class_inherits(read_word(titles->items[i]),external_class("_OBJC_CLASS_$_NSString")))stop("Invalid search scope title",selector);Word copy=value ? sequence_copy(titles,"copy") : 0;if(bar->scope_titles){struct Sequence *old=(void *)bar->scope_titles;free(old->items);free(old);}bar->scope_titles=copy;bar->selected_scope=0;if(bar->scope_buttons){struct Sequence *buttons=(void *)bar->scope_buttons;for(size_t i=0;i<buttons->count;++i)view_remove(buttons->items[i]);free(buttons->items);free(buttons);bar->scope_buttons=0;}}
+    else if(!strcmp(selector,"setBarStyle:")){if(value>1)stop("Unsupported search bar style",selector);bar->bar_style=value;Word cls=external_class("_OBJC_CLASS_$_UIColor");struct TextFieldState *field=text_field_state(search_bar_field(bar));field->properties[2]=ui_color_white(cls,"Search text",value ? 1 : 0,1);view_state(bar->field)->background=ui_color_white(cls,"Search field",value ? .2 : .9,1);bar->surface=ui_color_white(cls,"Search surface",value ? .1 : 1,1);++field->revision;}else if(!strcmp(selector,"setSearchBarStyle:")){if(value>2)stop("Invalid search bar style",selector);bar->style=value;}else bar->translucent=value!=0;ui_search_sync(object);
+}
+static Word search_bar_input_get(Word object,const char *selector) { return text_field_get(search_bar_field(search_bar_state(object)),selector); }
+static void search_bar_input_set(Word object,const char *selector,Word value) { text_field_set(search_bar_field(search_bar_state(object)),selector,value); }
+static Word search_bar_first(Word object,const char *selector) { Word field=search_bar_field(search_bar_state(object));return !strcmp(selector,"becomeFirstResponder") ? text_become(field) : !strcmp(selector,"resignFirstResponder") ? text_resign(field) : !strcmp(selector,"isFirstResponder") ? text_first_responder==field : 1; }
+static struct GuestSize search_bar_size(Word object,const char *selector,struct GuestSize limit) { struct SearchBarState *bar=search_bar_state(object);return (struct GuestSize){limit.width,56+(bar->prompt ? 24 : 0)+(bar->shows_scope ? 44 : 0)}; }
+static Word search_controller_init(Word object,const char *selector,Word results) {
+    if(results && !class_inherits(read_word(results),external_class("_OBJC_CLASS_$_UIViewController")))stop("Invalid search results controller",selector);struct SearchControllerState *state=search_controller_state(object);state->results=metal_object_retain(results);
+    if(!state->bar){state->bar=search_bar_initialize_plain(host_allocate(external_class("_OBJC_CLASS_$_UISearchBar")),"init");search_bar_state(state->bar)->controller=object;}view_state(object)->modal_style=6;return object;
+}
+static Word search_controller_plain(Word object,const char *selector) { return search_controller_init(object,selector,0); }
+static Word ui_search_controller_load(Word object) {
+    if(!class_inherits(read_word(object),external_class("_OBJC_CLASS_$_UISearchController")))return 0;struct SearchControllerState *state=search_controller_state(object);if(!state->bar)search_controller_init(object,"initWithSearchResultsController:",0);Word root=view_state(object)->view;if(!root)return 0;view_add(root,"Search bar presentation",state->bar);
+    if(state->results){controller_add_child(object,"Search results containment",state->results);Word results=controller_view(state->results);view_add(root,"Search results presentation",results);Method did=find_implementation(state->results,"didMoveToParentViewController:");if(did)did(state->results,"didMoveToParentViewController:",object,0,0,0);}ui_search_geometry(object);return root;
+}
+static void ui_search_geometry(Word object) {
+    if(!class_inherits(read_word(object),external_class("_OBJC_CLASS_$_UISearchController")))return;struct SearchControllerState *state=search_controller_state(object);Word root=controller_loaded_view(object);if(!root || !state->bar || state->layout_running)return;state->layout_running=1;struct GuestRect bounds=view_state(root)->bounds;struct GuestSize bar_size=search_bar_size(state->bar,"sizeThatFits:",(struct GuestSize){bounds.width,bounds.height});
+    if(view_state(state->bar)->parent==root)view_set_frame(state->bar,"Search bar layout",(struct GuestRect){0,0,bounds.width,bar_size.height});Word results=state->results ? controller_loaded_view(state->results) : state->borrowed_view;if(results)view_set_frame(results,"Search results layout",(struct GuestRect){0,bar_size.height,bounds.width,fmax(0,bounds.height-bar_size.height)});state->layout_running=0;
+}
+static void ui_search_modal_event(Word object,unsigned event) {
+    if(!class_inherits(read_word(object),external_class("_OBJC_CLASS_$_UISearchController")))return;struct SearchControllerState *state=search_controller_state(object);if(event==2 && state->bar)text_resign(search_bar_state(state->bar)->field);if(event==1){state->active=1;state->transition=0;}if(event>=3)state->active=state->transition=0;
+    if(event==1){state->active=1;state->transition=0;search_results_update(state);if(state->focus_requested && state->bar){state->focus_requested=0;text_become(search_bar_state(state->bar)->field);}}if(event>=3){state->active=state->transition=state->focus_requested=0;if(state->borrowed_view){Word view=state->borrowed_view;view_remove(view);view_set_frame(view,"Search content restoration",state->borrowed_frame);if(state->borrowed_parent)view_add(state->borrowed_parent,"Search content restoration",view);state->borrowed_view=state->borrowed_parent=0;}if(state->hidden_navigation){view_hidden(state->hidden_navigation,"Search navigation restoration",state->navigation_hidden);state->hidden_navigation=0;}if(state->bar){struct SearchBarState *bar=search_bar_state(state->bar);bar->shows_cancel=0;ui_search_sync(state->bar);if(state->original_bar_parent){view_remove(state->bar);view_set_frame(state->bar,"Search bar restoration",state->original_bar_frame);view_add(state->original_bar_parent,"Search bar restoration",state->bar);state->original_bar_parent=0;}}}
+    if(event<4){if(state->results){const char *names[]={"viewWillAppear:","viewDidAppear:","viewWillDisappear:","viewDidDisappear:"};Method method=find_implementation(state->results,names[event]);if(method)method(state->results,names[event],1,0,0,0);}search_controller_notify(state,event);}
+}
+static Word search_controller_get(Word object,const char *selector) { struct SearchControllerState *state=search_controller_state(object);if(!state->bar)search_controller_init(object,"init",0);if(!strcmp(selector,"searchBar"))return state->bar;if(!strcmp(selector,"searchResultsController"))return state->results;if(!strcmp(selector,"searchResultsUpdater"))return load_weak(&state->updater);if(!strcmp(selector,"delegate"))return load_weak(&state->delegate);if(!strcmp(selector,"isActive"))return state->active;if(!strcmp(selector,"hidesNavigationBarDuringPresentation"))return state->hides_navigation;return state->dims; }
+static void search_controller_active(Word object,const char *selector,Word active) {
+    struct SearchControllerState *state=search_controller_state(object);if(!state->bar)search_controller_init(object,"init",0);if(state->active==(active!=0) || state->transition)return;
+    if(!active){state->active=0;state->transition=1;text_resign(search_bar_state(state->bar)->field);if(view_state(object)->presentation_host)ui_controller_dismiss(object,"dismissViewControllerAnimated:completion:",1,0);else{ui_search_modal_event(object,2);ui_search_modal_event(object,3);}return;}
+    Word presenter=0;for(Word current=state->bar;current;current=view_state(current)->parent){Word controller=view_state(current)->controller;if(controller && controller!=object){presenter=controller;break;}}if(!presenter)presenter=root_controller;if(!presenter)stop("Search activation requires a presenting controller",selector);
+    state->original_bar_parent=view_state(state->bar)->parent;state->original_bar_frame=view_state(state->bar)->frame;state->active=state->transition=1;search_bar_state(state->bar)->shows_cancel=1;
+    if(state->hides_navigation){Word navigation=controller_navigation(presenter);if(navigation){state->hidden_navigation=controller_navigation_bar(navigation);state->navigation_hidden=view_state(state->hidden_navigation)->hidden;view_hidden(state->hidden_navigation,"Search navigation hidden",1);}}
+    Word root=controller_view(object);if(view_state(state->bar)->parent!=root)view_add(root,"Search bar activation",state->bar);if(!state->results){Word contents=controller_loaded_view(presenter);if(contents && contents!=root){state->borrowed_view=contents;state->borrowed_parent=view_state(contents)->parent;state->borrowed_frame=view_state(contents)->frame;view_add(root,"Search existing results",contents);view_reorder(root,"bringSubviewToFront:",state->bar);}}ui_search_geometry(object);Word delegate=load_weak_retained(&state->delegate);Method custom=delegate ? find_implementation(delegate,"presentSearchController:") : NULL;if(custom)custom(delegate,"presentSearchController:",object,0,0,0);else ui_controller_present(presenter,"presentViewController:animated:completion:",object,1,0);metal_object_release(delegate);
+}
+static void search_controller_set(Word object,const char *selector,Word value) {
+    struct SearchControllerState *state=search_controller_state(object);if(!strcmp(selector,"setActive:")){search_controller_active(object,selector,value);return;}if(!strcmp(selector,"setDelegate:")){store_weak(&state->delegate,value);state->cached=0;}else if(!strcmp(selector,"setSearchResultsUpdater:"))store_weak(&state->updater,value);else if(!strcmp(selector,"setHidesNavigationBarDuringPresentation:"))state->hides_navigation=value!=0;else {state->dims=value!=0;controller_presentation_resize(object);}
+}
+static double ui_search_dimming(Word object,double fallback) { return class_inherits(read_word(object),external_class("_OBJC_CLASS_$_UISearchController")) ? search_controller_state(object)->dims ? .4 : 0 : fallback; }
 struct AttributedRun { struct GuestRange range; Word attributes; unsigned reset; };
 struct AttributedState { Word object,string; struct AttributedRun *runs; size_t count,capacity; struct AttributedState *next; };
 static struct AttributedState *attributed_states;
@@ -434,6 +539,17 @@ static struct GuestSize ui_string_size(Word,const char *,Word);
 static Method ui_text_method(Word object,const char *selector,const char *receiver,int class_receiver) {
     if (!receiver) return NULL;
     if(!class_receiver && !strcmp(receiver,"_OBJC_CLASS_$_UIApplication") && !strcmp(selector,"preferredContentSizeCategory"))return (Method)ui_preferred_content_category;
+    Word cls=class_receiver ? object : read_word(object);
+    if(!class_receiver && class_inherits(cls,external_class("_OBJC_CLASS_$_UISearchBar"))){
+        if(!strcmp(selector,"init"))return (Method)search_bar_initialize_plain;if(!strcmp(selector,"initWithFrame:"))return (Method)search_bar_initialize;
+        const char *getters[]={"text","placeholder","prompt","delegate","tintColor","barTintColor","showsCancelButton","showsScopeBar","scopeButtonTitles","selectedScopeButtonIndex","barStyle","searchBarStyle","isTranslucent","searchTextField"};const char *setters[]={"setText:","setPlaceholder:","setPrompt:","setDelegate:","setTintColor:","setBarTintColor:","setShowsCancelButton:","setShowsCancelButton:animated:","setShowsScopeBar:","setScopeButtonTitles:","setSelectedScopeButtonIndex:","setBarStyle:","setSearchBarStyle:","setTranslucent:"};for(unsigned i=0;i<COUNT(getters);++i)if(!strcmp(selector,getters[i]))return (Method)search_bar_get;for(unsigned i=0;i<COUNT(setters);++i)if(!strcmp(selector,setters[i]))return (Method)search_bar_set;
+        const char *input[]={"keyboardType","autocapitalizationType","autocorrectionType","spellCheckingType","returnKeyType","secureTextEntry"};for(unsigned i=0;i<COUNT(input);++i){if(!strcmp(selector,input[i]))return (Method)search_bar_input_get;char setter[80];snprintf(setter,sizeof(setter),"set%c%s:",(char)(input[i][0]-'a'+'A'),input[i]+1);if(!strcmp(selector,setter))return (Method)search_bar_input_set;}
+        if(!strcmp(selector,"becomeFirstResponder") || !strcmp(selector,"resignFirstResponder") || !strcmp(selector,"isFirstResponder") || !strcmp(selector,"canBecomeFirstResponder") || !strcmp(selector,"canResignFirstResponder"))return (Method)search_bar_first;
+        if(!strcmp(selector,"sizeThatFits:"))return (Method)search_bar_size;if(!strcmp(selector,"cancelSearch:"))return (Method)search_bar_cancel;if(!strcmp(selector,"selectSearchScope:"))return (Method)search_scope_action;
+    }
+    if(!class_receiver && class_inherits(cls,external_class("_OBJC_CLASS_$_UISearchController"))){if(!strcmp(selector,"initWithSearchResultsController:"))return (Method)search_controller_init;if(!strcmp(selector,"init"))return (Method)search_controller_plain;
+        const char *getters[]={"searchBar","searchResultsController","searchResultsUpdater","delegate","isActive","dimsBackgroundDuringPresentation","obscuresBackgroundDuringPresentation","hidesNavigationBarDuringPresentation"},*setters[]={"setSearchResultsUpdater:","setDelegate:","setActive:","setDimsBackgroundDuringPresentation:","setObscuresBackgroundDuringPresentation:","setHidesNavigationBarDuringPresentation:"};for(unsigned i=0;i<COUNT(getters);++i)if(!strcmp(selector,getters[i]))return (Method)search_controller_get;for(unsigned i=0;i<COUNT(setters);++i)if(!strcmp(selector,setters[i]))return (Method)search_controller_set;
+    }
     if (!class_receiver && (!strcmp(receiver,"_OBJC_CLASS_$_NSString") || !strcmp(receiver,"_OBJC_CLASS_$_NSMutableString")) && !strcmp(selector,"sizeWithFont:")) return (Method)ui_string_size;
     if (!class_receiver && (!strcmp(receiver,"_OBJC_CLASS_$_NSAttributedString") || !strcmp(receiver,"_OBJC_CLASS_$_NSMutableAttributedString"))) {
         if (!strcmp(selector,"initWithString:attributes:")) return (Method)attributed_init;

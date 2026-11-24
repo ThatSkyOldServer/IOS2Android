@@ -24,6 +24,21 @@ static void ui_table_sync(Word);
 static void ui_table_scroll(Word,unsigned);
 static void ui_table_controller_load(Word,Word);
 static void ui_table_controller_appear(Word);
+static void ui_search_sync(Word);
+static void ui_toolbar_sync(Word);
+static Word ui_search_controller_load(Word);
+static void ui_search_modal_event(Word,unsigned);
+static void ui_search_geometry(Word);
+static void ui_search_field_sync(Word);
+static int ui_search_input_should(Word,unsigned);
+static int ui_search_input_replace(Word,struct GuestRange,Word);
+static void ui_search_input_notify(Word,unsigned);
+static void ui_search_input_changed(Word);
+static double ui_search_dimming(Word,double);
+static void ui_controller_present(Word,const char *,Word,Word,Word);
+static void ui_controller_dismiss(Word,const char *,Word,Word);
+struct ControllerPresentation;
+static void controller_presentation_resize(Word);
 static uint32_t ui_cell_background(Word,uint32_t);
 static void ui_scroll_input_options(Word,float *,int *);
 static void ui_scroll_input_delegate(Word,Word);
@@ -52,7 +67,9 @@ static void view_animation_change(Word);
 struct ViewState {
     Word object,parent,children,layer,controller,view,owner_window,image_name,background,presented,presenting,modal_alert,popover,navigation_bar,storyboard,nib_name,nib_bundle;
     Word navigation_item,title,prompt,left_item,right_item,back_item,archived_graph;
-    void *control,*web,*scroll,*input,*table,*cell;
+    void *control,*web,*scroll,*input,*table,*cell,*search,*bar;
+    struct ControllerPresentation *presentation_host;
+    struct GuestSize preferred_size;
     void *composition;
     Word host_container;
     Word accessibility_label;
@@ -101,6 +118,8 @@ static void view_sync_subtree(Word object) {
     ui_web_sync(object);
     ui_input_sync(object);
     ui_table_sync(object);
+    ui_search_sync(object);
+    ui_toolbar_sync(object);
     ui_view_composition_sync(object);
     if(state->layer)ui_layer_sync_tree(state->layer);
     struct Sequence *children=(void *)state->children;
@@ -168,6 +187,7 @@ static void view_set_frame(Word object,const char *selector,struct GuestRect fra
     state->frame=frame; state->bounds.width=frame.width; state->bounds.height=frame.height;
     state->needs_display|=state->content_mode==3;
     view_resize_children(state,width,height); view_sync_subtree(object);
+    if(state->controller)ui_search_geometry(state->controller);
     view_request_layout(object,selector);
 }
 static void view_set_bounds(Word object,const char *selector,struct GuestRect bounds) {
@@ -306,6 +326,7 @@ static void controller_load_view(Word object,const char *selector) {
     Word cls=read_word(object),view_cls=external_class(class_inherits(cls,external_class("_OBJC_CLASS_$_UITableViewController")) ? "_OBJC_CLASS_$_UITableView" : "_OBJC_CLASS_$_UIView");
     state->view=view_init_frame(host_allocate(view_cls),selector,screen_bounds());
     ui_table_controller_load(object,state->view);
+    ui_search_controller_load(object);
 }
 static Word controller_view(Word object) {
     struct ViewState *state=view_state(object);
@@ -390,7 +411,7 @@ static void controller_set_view(Word object,const char *selector,Word view) {
 }
 static Word controller_loaded(Word object) { return view_state(object)->view!=0; }
 static void controller_geometry(Word object) {
-    struct ViewState *controller=view_state(object); if (!controller->view || !controller->owner_window) return;
+    struct ViewState *controller=view_state(object);if(controller->presentation_host){controller_presentation_resize(object);return;} if (!controller->view || !controller->owner_window) return;
     struct ViewState *window=view_state(controller->owner_window); struct GuestRect frame={0,0,window->bounds.width,window->bounds.height};
     JNIEnv *env=attached_environment("UIViewController extended layout"); static jmethodID insets_method;
     if (!insets_method) { jclass cls=(*env)->GetObjectClass(env,activity); insets_method=(*env)->GetMethodID(env,cls,"guestSafeInsets","()[I"); (*env)->DeleteLocalRef(env,cls); }
@@ -508,16 +529,20 @@ static void controller_transition_style(Word object,const char *selector,long st
 static Word controller_get_transition_style(Word object) { return view_state(object)->transition_style; }
 static Word controller_popover(Word object) {
     struct ViewState *state=view_state(object);
-    if (state->modal_style!=6) return 0;
+    if (state->modal_style!=7) return 0;
     if (!state->popover) state->popover=host_allocate(external_class("_OBJC_CLASS_$_UIPopoverPresentationController"));
     return state->popover;
 }
 static void popover_set_source(Word object,const char *selector,Word source) { view_state(object)->view=source; }
 static Word popover_source(Word object) { return view_state(object)->view; }
-static void popover_set_delegate(Word object,const char *selector,Word delegate) { view_state(object)->controller=delegate; }
-static Word popover_delegate(Word object) { return view_state(object)->controller; }
+static void popover_set_delegate(Word object,const char *selector,Word delegate) { store_weak(&view_state(object)->controller,delegate); }
+static Word popover_delegate(Word object) { return load_weak(&view_state(object)->controller); }
 static void popover_set_arrows(Word object,const char *selector,Word directions) { view_state(object)->tag=directions; }
 static Word popover_arrows(Word object) { return view_state(object)->tag; }
+static void popover_set_bar_item(Word object,const char *selector,Word value) { if(value && !class_inherits(read_word(value),external_class("_OBJC_CLASS_$_UIBarButtonItem")))stop("Invalid popover bar item",selector);view_strong_property(&view_state(object)->right_item,value); }
+static Word popover_bar_item(Word object) { return view_state(object)->right_item; }
+static struct GuestSize controller_preferred_size(Word object) { return view_state(object)->preferred_size; }
+static void controller_set_preferred_size(Word object,const char *selector,struct GuestSize value) { if(!isfinite(value.width) || !isfinite(value.height) || value.width<0 || value.height<0)stop("Invalid preferred content size",selector);view_state(object)->preferred_size=value;controller_presentation_resize(object); }
 static Word view_descendant(Word object,const char *selector,Word ancestor) {
     if (!ancestor) return 0;
     for (unsigned depth=0;object && depth<1024;++depth) {
@@ -752,12 +777,13 @@ static double layer_metric(Word object,const char *selector) {
 }
 static void layer_set_metric(Word object,const char *selector,double value) {
     if(!isfinite(value) || (strcmp(selector,"setZPosition:") && value<0))stop("Invalid layer metric",selector);struct ViewState *view=view_state(object);struct LayerState *layer=layer_state(object);
+    const char *getter=!strcmp(selector,"setBorderWidth:") ? "borderWidth" : !strcmp(selector,"setCornerRadius:") ? "cornerRadius" : !strcmp(selector,"setZPosition:") ? "zPosition" : "contentsScale";if(layer_metric(object,getter)==value)return;
     if(!strcmp(selector,"setBorderWidth:"))layer->border_width=value;else if(!strcmp(selector,"setCornerRadius:"))view->corner=value;else if(!strcmp(selector,"setZPosition:"))view->z=value;else {view->scale=value;if(view->view)view_state(view->view)->scale=value;}layer_changed(object);
 }
 static float layer_opacity(Word object) { return (float)layer_geometry(object)->alpha; }
 static void layer_set_opacity(Word object,const char *selector,float value) { if(!isfinite(value))stop("Invalid layer opacity",selector);struct ViewState *view=layer_geometry(object);if(view_animation)view_animation_change(view->object);view->alpha=fmin(1,fmax(0,value));layer_changed(object); }
 static Word layer_flag(Word object,const char *selector) { struct ViewState *view=view_state(object);return !strcmp(selector,"isHidden") ? layer_geometry(object)->hidden : view->view ? view_state(view->view)->clips : view->clips; }
-static void layer_set_flag(Word object,const char *selector,Word value) { if(!strcmp(selector,"setHidden:"))layer_geometry(object)->hidden=value!=0;else {struct ViewState *view=view_state(object);view->clips=value!=0;if(view->view)view_state(view->view)->clips=view->clips;}layer_changed(object); }
+static void layer_set_flag(Word object,const char *selector,Word value) { if(layer_flag(object,!strcmp(selector,"setHidden:") ? "isHidden" : "masksToBounds")== (value!=0))return;if(!strcmp(selector,"setHidden:"))layer_geometry(object)->hidden=value!=0;else {struct ViewState *view=view_state(object);view->clips=value!=0;if(view->view)view_state(view->view)->clips=view->clips;}layer_changed(object); }
 static Word layer_value(Word object,const char *selector) {
     struct ViewState *view=view_state(object);struct LayerState *layer=layer_state(object);
     if(!strcmp(selector,"backgroundColor"))return view->view ? view_state(view->view)->background : layer->background;if(!strcmp(selector,"borderColor"))return layer->border;if(!strcmp(selector,"colors"))return layer->colors;if(!strcmp(selector,"locations"))return layer->locations;if(!strcmp(selector,"contents"))return layer->contents;
@@ -1521,6 +1547,8 @@ static Method views_method(Word object,const char *selector,const char *receiver
         }
         if (!strcmp(selector,"title")) return (Method)navigation_item_title;
         if (!strcmp(selector,"setTitle:")) return (Method)controller_set_title;
+        if (!strcmp(selector,"preferredContentSize"))return (Method)controller_preferred_size;
+        if (!strcmp(selector,"setPreferredContentSize:"))return (Method)controller_set_preferred_size;
         if (!strcmp(selector,"navigationItem")) return (Method)controller_navigation_item;
         if (!strcmp(selector,"nibName")) return (Method)controller_nib_name;
         if (!strcmp(selector,"nibBundle")) return (Method)controller_nib_bundle;
@@ -1556,6 +1584,8 @@ static Method views_method(Word object,const char *selector,const char *receiver
         if (!strcmp(selector,"delegate")) return (Method)popover_delegate;
         if (!strcmp(selector,"setPermittedArrowDirections:")) return (Method)popover_set_arrows;
         if (!strcmp(selector,"permittedArrowDirections")) return (Method)popover_arrows;
+        if (!strcmp(selector,"setBarButtonItem:"))return (Method)popover_set_bar_item;
+        if (!strcmp(selector,"barButtonItem"))return (Method)popover_bar_item;
     }
     if (!view) return NULL;
     if(!strcmp(selector,"intrinsicContentSize"))return (Method)ui_view_intrinsic_size;

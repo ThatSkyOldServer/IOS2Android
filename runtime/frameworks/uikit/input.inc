@@ -42,15 +42,15 @@ static Method input_callback(struct TextFieldState *field,unsigned index) {
         field->delegate_cached=1;field->delegate_epoch=method_cache_epoch;}
     return field->callbacks[index];
 }
-static int input_delegate_bool(Word object,unsigned index){struct TextFieldState *field=text_field_state(object);Method method=input_callback(field,index);const char *selector=(field->multiline ? input_delegate_views : input_delegate_fields)[index];return !method || (method(field->properties[12],selector,object,0,0,0)&255);}
-static void input_delegate_notify(Word object,unsigned index){struct TextFieldState *field=text_field_state(object);Method method=input_callback(field,index);if(method)method(field->properties[12],(field->multiline ? input_delegate_views : input_delegate_fields)[index],object,0,0,0);}
+static int input_delegate_bool(Word object,unsigned index){struct TextFieldState *field=text_field_state(object);if(field->search_owner && !ui_search_input_should(field->search_owner,index))return 0;Method method=input_callback(field,index);const char *selector=(field->multiline ? input_delegate_views : input_delegate_fields)[index];return !method || (method(field->properties[12],selector,object,0,0,0)&255);}
+static void input_delegate_notify(Word object,unsigned index){struct TextFieldState *field=text_field_state(object);Method method=input_callback(field,index);if(method)method(field->properties[12],(field->multiline ? input_delegate_views : input_delegate_fields)[index],object,0,0,0);if(field->search_owner)ui_search_input_notify(field->search_owner,index);}
 static void input_selection_changed(Word object){input_delegate_notify(object,6);}
 static void input_release_content(Word);
 static void input_content_changed(Word);
 static void input_report_failure(JNIEnv *env){jclass cls=(*env)->GetObjectClass(env,activity);jmethodID report=(*env)->GetMethodID(env,cls,"guestFailure","(Ljava/lang/String;)V");jstring error=(*env)->NewStringUTF(env,status);(*env)->CallVoidMethod(env,activity,report,error);(*env)->DeleteLocalRef(env,error);(*env)->DeleteLocalRef(env,cls);}
 static void text_field_sync_input(Word object,int show_keyboard) {
     struct TextFieldState *field=text_field_state(object);
-    if(field->multiline){ui_input_sync(object);JNIEnv *env=attached_environment("UITextView focus");static jmethodID method;if(!method){jclass cls=(*env)->GetObjectClass(env,activity);method=(*env)->GetMethodID(env,cls,"focusGuestEditor","(JZ)V");(*env)->DeleteLocalRef(env,cls);}(*env)->CallVoidMethod(env,activity,method,(jlong)object,(jboolean)show_keyboard);return;}
+    if(field->multiline || field->visual){ui_input_sync(object);JNIEnv *env=attached_environment("Text editor focus");static jmethodID method;if(!method){jclass cls=(*env)->GetObjectClass(env,activity);method=(*env)->GetMethodID(env,cls,"focusGuestEditor","(JZ)V");(*env)->DeleteLocalRef(env,cls);}(*env)->CallVoidMethod(env,activity,method,(jlong)object,(jboolean)show_keyboard);return;}
     JNIEnv *env=attached_environment("UITextField input");
     jclass cls=(*env)->GetObjectClass(env,activity);
     jmethodID method=(*env)->GetMethodID(env,cls,"syncGuestInput","(JLjava/lang/String;IIIZZ)V");
@@ -93,6 +93,7 @@ static Word input_replace(Word object,Word value) {
     while (suffix<old.length-prefix && suffix<next.length-prefix && old.units[old.length-1-suffix]==next.units[next.length-1-suffix]) ++suffix;
     Word replacement=text_from_units(external_class("_OBJC_CLASS_$_NSString"),next.units+prefix,next.length-prefix-suffix);
     struct GuestRange range={prefix,old.length-prefix-suffix}; free(old.owned); free(next.owned);
+    if(field->search_owner && !ui_search_input_replace(field->search_owner,range,replacement))return field->properties[0];
     Word delegate=field->properties[12];const char *selector=(field->multiline ? input_delegate_views : input_delegate_fields)[4];Method method=input_callback(field,4);
     if (method && !(((Word (*)(Word,const char *,Word,struct GuestRange,Word))method)(delegate,selector,object,range,replacement)&255)) return field->properties[0];
     if(same_objects(field->properties[0],value))return field->properties[0];

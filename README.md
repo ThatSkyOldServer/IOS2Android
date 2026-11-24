@@ -79,6 +79,7 @@ APK 输出到外部工作区的 `out/<application-id>/<CFBundleVersion>/dev|rele
 - Swift 系统库不会自动补充；动态类迁移、Swift 对象与宿主 Foundation 对象的完整桥接、Core Data 持久化仍未实现。
 - CoreUI 的完整 trait 选择尚未实现；无法唯一解析的 atlas 或默认图像变体保持不可用，原始 catalog 保留。
 - Scene 生命周期、复杂 NIB、Auto Layout、通用滚动和文本编辑仍有兼容缺口。
+- 导航与模态尚缺完整原生转场、Popover 箭头、自定义呈现控制器和复杂多窗口行为。
 - 完整 CoreAnimation、三维图层合成和层组排序尚未实现；富文本绘图上下文及部分文字排版选项仍不支持。
 - 表格尚缺约束驱动的自动行高、NIB 单元格、编辑/移动、插删动画和完整分组样式；离屏行几何可能使用估计高度。
 - 网页支持基本加载和交互，多窗口、下载及部分导航和脚本接口仍未实现。
