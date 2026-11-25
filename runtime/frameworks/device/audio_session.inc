@@ -35,7 +35,7 @@ static Word audio_session_preferred(Word object,const char *selector,double valu
 static Word audio_session_channels(Word object,const char *selector,Word value,Word *error) { return audio_session_configure(3,(double)value,selector,error); }
 static double audio_session_value(Word object,const char *selector) {
     int property=!strcmp(selector,"sampleRate") ? 0 : (!strcmp(selector,"maximumOutputNumberOfChannels") || !strcmp(selector,"outputNumberOfChannels")) ? 1 :
-        !strcmp(selector,"IOBufferDuration") ? 2 : (!strcmp(selector,"secondaryAudioShouldBeSilencedHint") || !strcmp(selector,"isOtherAudioPlaying")) ? 3 :
+        !strcmp(selector,"IOBufferDuration") ? 2 : !strcmp(selector,"secondaryAudioShouldBeSilencedHint") ? 8 : !strcmp(selector,"isOtherAudioPlaying") ? 3 :
         !strcmp(selector,"preferredSampleRate") ? 4 : !strcmp(selector,"preferredIOBufferDuration") ? 5 : !strcmp(selector,"preferredOutputNumberOfChannels") ? 6 : 7;
     JNIEnv *env=attached_environment(selector);
     jclass type=(*env)->GetObjectClass(env,activity);

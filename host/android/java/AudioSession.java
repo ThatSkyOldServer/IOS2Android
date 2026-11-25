@@ -26,29 +26,46 @@ final class AudioSession {
         .setUsage(AudioAttributes.USAGE_GAME).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build();
     private double preferredRate, preferredBuffer;
     private int preferredChannels;
-    private boolean active, otherAudio;
+    private boolean active, otherAudio, silenceSecondaryAudio;
     private final AudioDeviceCallback devices = new AudioDeviceCallback() {
         @Override public void onAudioDevicesAdded(AudioDeviceInfo[] added) { notifyGuest(0, 1); }
         @Override public void onAudioDevicesRemoved(AudioDeviceInfo[] removed) { notifyGuest(0, 2); }
     };
     private final AudioManager.AudioPlaybackCallback playback = new AudioManager.AudioPlaybackCallback() {
         @Override public void onPlaybackConfigChanged(List<AudioPlaybackConfiguration> configurations) {
-            boolean next = externalPlayback(configurations);
-            if (next != otherAudio) { otherAudio = next; if (active) notifyGuest(1, next ? 1 : 0); }
+            int state = externalPlayback(configurations);
+            boolean notify, next = (state & 2) != 0;
+            synchronized (AudioSession.this) {
+                notify = active && next != silenceSecondaryAudio;
+                otherAudio = (state & 1) != 0;
+                silenceSecondaryAudio = next;
+            }
+            if (notify) {
+                if (BuildProfile.DEVELOPMENT) Log.i("I2AGuest", "Audio session secondary audio hint: " + next);
+                notifyGuest(1, next ? 1 : 0);
+            }
         }
     };
-    private boolean externalPlayback(List<AudioPlaybackConfiguration> configurations) {
+    private int externalPlayback(List<AudioPlaybackConfiguration> configurations) {
         int owned=sound.outputCount()+(loaded.getAsBoolean() ? ownedOutputs() : 0);
+        int state=0;
         for(AudioPlaybackConfiguration configuration:configurations) {
-            if(configuration.getAudioAttributes().getUsage()==AudioAttributes.USAGE_GAME && owned>0) --owned;
-            else return true;
+            AudioAttributes attributes=configuration.getAudioAttributes();
+            int usage=attributes.getUsage(), content=attributes.getContentType();
+            if(usage==AudioAttributes.USAGE_GAME && owned>0) { --owned; continue; }
+            state|=1;
+            // Public playback configurations omit client identity and audio focus.
+            if(content!=AudioAttributes.CONTENT_TYPE_SONIFICATION &&
+                (usage==AudioAttributes.USAGE_MEDIA || usage==AudioAttributes.USAGE_GAME ||
+                 (usage==AudioAttributes.USAGE_UNKNOWN && (content==AudioAttributes.CONTENT_TYPE_MUSIC || content==AudioAttributes.CONTENT_TYPE_MOVIE)))) state|=2;
         }
-        return false;
+        return state;
     }
     AudioSession(Context context, Handler main, AudioOutput sound, BooleanSupplier loaded, HttpTransport.FailureSink failures) {
         this.manager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
         this.sound = sound; this.loaded = loaded; this.failures = failures;
-        otherAudio = externalPlayback(manager.getActivePlaybackConfigurations());
+        int state = externalPlayback(manager.getActivePlaybackConfigurations());
+        otherAudio = (state & 1) != 0; silenceSecondaryAudio = (state & 2) != 0;
         manager.registerAudioDeviceCallback(devices, main);
         manager.registerAudioPlaybackCallback(playback, main);
     }
@@ -81,8 +98,13 @@ final class AudioSession {
             if (value == 0 && sound.anyPlaying()) return -50;
             if (value != 0 && outputRate() <= 0) return -50;
             active = value != 0;
+            if (active) {
+                int state = externalPlayback(manager.getActivePlaybackConfigurations());
+                otherAudio = (state & 1) != 0; silenceSecondaryAudio = (state & 2) != 0;
+            }
             if (active) Log.i("I2AGuest", "Audio session: output=" + outputRate() + " Hz, " + outputChannels()
-                + " channels; preferred=" + preferredRate + " Hz, " + preferredBuffer + " s");
+                + " channels; preferred=" + preferredRate + " Hz, " + preferredBuffer + " s; otherAudio=" + otherAudio
+                + "; secondaryAudio=" + silenceSecondaryAudio);
         } else if (property == 1) {
             if (value < 8000 || value > 192000 || value != Math.rint(value)) return -50;
             if (AudioTrack.getMinBufferSize((int) value, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT) <= 0) return -50;
@@ -113,6 +135,7 @@ final class AudioSession {
             int maximum = manager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
             return maximum == 0 ? 0 : manager.getStreamVolume(AudioManager.STREAM_MUSIC) / (double) maximum;
         }
+        if (property == 8) return silenceSecondaryAudio ? 1 : 0;
         return 0;
     }
     String[][] route() {

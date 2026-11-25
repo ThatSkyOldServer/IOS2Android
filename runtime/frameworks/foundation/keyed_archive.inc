@@ -156,8 +156,7 @@ static Word archived_data(Word cls,const char *selector,Word object) {
     struct ArchiveGraph *graph=archive_graph();
     plist_dict_set_item(graph->top,"root",archive_encode(graph,object));
     Word data=archive_finish(graph);
-    static unsigned logged;
-    if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<8) LOG("Keyed archive %s: %u objects, %lu bytes",object ? class_name(read_word(object)) : "nil",plist_array_get_size(graph->objects),read_word(data+8));
+    LOG_LIMITED(8,"Keyed archive %s: %u objects, %lu bytes",object ? class_name(read_word(object)) : "nil",plist_array_get_size(graph->objects),read_word(data+8));
     return data;
 }
 static Word archived_file(Word cls,const char *selector,Word root,Word file) {

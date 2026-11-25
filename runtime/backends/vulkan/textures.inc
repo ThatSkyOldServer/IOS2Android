@@ -83,7 +83,11 @@ static void metal_texture_dispose(struct MetalTexture *texture) {
     pthread_mutex_destroy(&texture->mutex); free(texture);
 }
 static void metal_texture_destroy(Word value) { metal_texture_dispose((void *)value); }
+static _Thread_local VkResult metal_texture_creation_result;
+static _Thread_local size_t metal_texture_creation_reclaimed;
 static Word metal_texture_new(Word device,const char *selector,struct MetalDescriptor *descriptor) {
+    metal_texture_creation_result=VK_ERROR_INITIALIZATION_FAILED;
+    metal_texture_creation_reclaimed=0;
     if (!descriptor || descriptor->kind!=MD_TEXTURE) return 0;
     if (!vulkan.available) stop("Texture backend requires Vulkan",selector);
     Word pixel=metal_property(descriptor,"pixelFormat");
@@ -100,7 +104,7 @@ static Word metal_texture_new(Word device,const char *selector,struct MetalDescr
         fallback=*format; fallback.format=metal_depth_stencil_backing(format->format);
         format=&fallback;
     }
-    struct MetalTexture *texture=calloc(1,sizeof(*texture)); if (!texture) return 0;
+    struct MetalTexture *texture=calloc(1,sizeof(*texture));if(!texture){metal_texture_creation_result=VK_ERROR_OUT_OF_HOST_MEMORY;return 0;}
     texture->object=(struct MetalResource){.isa=external_class("_OBJC_CLASS_$_I2AMetalTexture"),.device=device,
         .label=metal_property(descriptor,"label"),.options=metal_property(descriptor,"resourceOptions")};
     pthread_mutex_init(&texture->mutex,NULL); texture->format=*format;
@@ -137,7 +141,11 @@ static Word metal_texture_new(Word device,const char *selector,struct MetalDescr
         ((texture->type==5 || texture->type==6) && texture->width!=texture->height) ||
         (texture->samples>1 && texture->type!=4 && texture->type!=8) || (texture->samples>1 && texture->mips!=1) ||
         (texture->type==6 && !vulkan.features.imageCubeArray) || storage>2 || (texture->usage&~0x17UL);
-    if (invalid) { LOG("Unsupported Metal texture description: type=%lu %lux%lux%lu mips=%lu layers=%lu samples=%lu options=0x%lx",texture->type,texture->width,texture->height,texture->depth,texture->mips,texture->layers,texture->samples,texture->object.options); metal_texture_dispose(texture); return 0; }
+    if(invalid) {
+        char detail[256];snprintf(detail,sizeof(detail),"Metal=%lu type=%lu extent=%lux%lux%lu mips=%lu layers=%lu samples=%lu options=0x%lx usage=0x%lx",
+            pixel,texture->type,texture->width,texture->height,texture->depth,texture->mips,texture->layers,texture->samples,texture->object.options,texture->usage);
+        metal_texture_creation_result=VK_ERROR_FORMAT_NOT_SUPPORTED;record_failure("Unsupported Metal texture description",detail);metal_texture_dispose(texture);return 0;
+    }
     if (pvrtc && (texture->depth!=1 || texture->samples!=1 || (texture->width&(texture->width-1)) || (texture->height&(texture->height-1)) || (texture->usage&6))) {
         metal_texture_dispose(texture); stop("PVRTC requires power-of-two sampled 2D images",selector);
     }
@@ -155,23 +163,35 @@ static Word metal_texture_new(Word device,const char *selector,struct MetalDescr
     PFN_vkGetPhysicalDeviceImageFormatProperties get_limits=(PFN_vkGetPhysicalDeviceImageFormatProperties)vulkan.get_instance_proc(vulkan.instance,"vkGetPhysicalDeviceImageFormatProperties");
     VkResult result=get_limits(vulkan.physical,format->format,type,VK_IMAGE_TILING_OPTIMAL,usage,flags,&limits);
     if (result!=VK_SUCCESS || texture->width>limits.maxExtent.width || texture->height>limits.maxExtent.height || texture->depth>limits.maxExtent.depth || texture->mips>limits.maxMipLevels || texture->layers>limits.maxArrayLayers || !(limits.sampleCounts&texture->samples)) {
+        metal_texture_creation_result=result==VK_SUCCESS ? VK_ERROR_FORMAT_NOT_SUPPORTED : result;
+        char detail[256];snprintf(detail,sizeof(detail),"Metal=%lu VkFormat=%d result=%d extent=%lux%lux%lu mips=%lu layers=%lu samples=%lu usage=0x%x",
+            pixel,format->format,result,texture->width,texture->height,texture->depth,texture->mips,texture->layers,texture->samples,usage);
+        record_failure("Vulkan texture format/extent unavailable",detail);
         LOG("Vulkan format/extent unavailable: Metal=%lu VkFormat=%d result=%d",pixel,format->format,result); metal_texture_dispose(texture); return 0;
     }
     VkImageCreateInfo image_info={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.flags=flags,.imageType=type,.format=format->format,
         .extent={(uint32_t)texture->width,(uint32_t)texture->height,(uint32_t)texture->depth},.mipLevels=(uint32_t)texture->mips,
         .arrayLayers=(uint32_t)texture->layers,.samples=(VkSampleCountFlagBits)texture->samples,.tiling=VK_IMAGE_TILING_OPTIMAL,
         .usage=usage,.sharingMode=VK_SHARING_MODE_EXCLUSIVE,.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED};
+    const char *operation="vkCreateImage";
+    VkMemoryRequirements requirements={0};int memory_type=-1;VkResult recovery=VK_SUCCESS;
     result=VKD(vkCreateImage)(vulkan.device,&image_info,NULL,&texture->image);
     if (result==VK_SUCCESS) {
-        VkMemoryRequirements requirements; VKD(vkGetImageMemoryRequirements)(vulkan.device,texture->image,&requirements);
-        int memory_type=metal_memory_type(requirements.memoryTypeBits,0,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (memory_type<0) result=VK_ERROR_FEATURE_NOT_PRESENT;
+        VKD(vkGetImageMemoryRequirements)(vulkan.device,texture->image,&requirements);
+        memory_type=metal_memory_type(requirements.memoryTypeBits,0,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if(memory_type<0){operation="texture memory type";result=VK_ERROR_FEATURE_NOT_PRESENT;}
         else {
             VkMemoryAllocateInfo allocation={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=requirements.size,.memoryTypeIndex=(uint32_t)memory_type};
-            result=VKD(vkAllocateMemory)(vulkan.device,&allocation,NULL,&texture->memory);
-            if (result==VK_SUCCESS) result=VKD(vkBindImageMemory)(vulkan.device,texture->image,texture->memory,0);
-            texture->allocation=requirements.size;
-            metal_memory_add(1,requirements.size);
+            operation="vkAllocateMemory texture";result=VKD(vkAllocateMemory)(vulkan.device,&allocation,NULL,&texture->memory);
+            if(result==VK_ERROR_OUT_OF_HOST_MEMORY || result==VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+                metal_texture_creation_reclaimed=metal_memory_reclaim(&recovery);
+                if(metal_texture_creation_reclaimed && recovery==VK_SUCCESS)result=VKD(vkAllocateMemory)(vulkan.device,&allocation,NULL,&texture->memory);
+            }
+            if(result==VK_SUCCESS) {
+                texture->allocation=requirements.size;
+                metal_memory_add(1,requirements.size);
+                operation="vkBindImageMemory";result=VKD(vkBindImageMemory)(vulkan.device,texture->image,texture->memory,0);
+            }
         }
     }
     if (result==VK_SUCCESS) {
@@ -179,20 +199,27 @@ static Word metal_texture_new(Word device,const char *selector,struct MetalDescr
             .subresourceRange={texture->format.aspects,0,(uint32_t)texture->mips,0,(uint32_t)texture->layers}};
         if (pixel==1) view_info.components=(VkComponentMapping){VK_COMPONENT_SWIZZLE_ZERO,VK_COMPONENT_SWIZZLE_ZERO,VK_COMPONENT_SWIZZLE_ZERO,VK_COMPONENT_SWIZZLE_R};
         if (pvrtc && pixel<164) view_info.components.a=VK_COMPONENT_SWIZZLE_ONE;
-        result=VKD(vkCreateImageView)(vulkan.device,&view_info,NULL,&texture->view);
+        operation="vkCreateImageView texture";result=VKD(vkCreateImageView)(vulkan.device,&view_info,NULL,&texture->view);
         texture->sampled_view=texture->view;
         if (result==VK_SUCCESS && texture->format.aspects==(VK_IMAGE_ASPECT_DEPTH_BIT|VK_IMAGE_ASPECT_STENCIL_BIT)) {
             view_info.subresourceRange.aspectMask=VK_IMAGE_ASPECT_DEPTH_BIT;
-            result=VKD(vkCreateImageView)(vulkan.device,&view_info,NULL,&texture->sampled_view);
+            operation="vkCreateImageView depth sample";result=VKD(vkCreateImageView)(vulkan.device,&view_info,NULL,&texture->sampled_view);
         }
     }
-    if (result!=VK_SUCCESS) { LOG("Vulkan texture allocation failed: %d Metal=%lu",result,pixel); metal_texture_dispose(texture); return 0; }
+    if(result!=VK_SUCCESS) {
+        metal_texture_creation_result=result;
+        uint32_t heap=memory_type<0 ? UINT32_MAX : vulkan.memory.memoryTypes[memory_type].heapIndex;
+        char detail[512];snprintf(detail,sizeof(detail),"operation=%s result=%d Metal=%lu VkFormat=%d extent=%lux%lux%lu mips=%lu layers=%lu usage=0x%x required_bytes=%llu memory_type=%d heap=%u heap_bytes=%llu max_allocations=%u decoded_pvrtc=%u released_idle_bytes=%zu recovery_result=%d",
+            operation,result,pixel,format->format,texture->width,texture->height,texture->depth,texture->mips,texture->layers,usage,
+            (unsigned long long)requirements.size,memory_type,heap,heap==UINT32_MAX ? 0ULL : (unsigned long long)vulkan.memory.memoryHeaps[heap].size,
+            vulkan.properties.limits.maxMemoryAllocationCount,texture->decode_pvrtc,metal_texture_creation_reclaimed,recovery);
+        record_failure("Vulkan texture allocation failed",detail);metal_texture_dispose(texture);return 0;
+    }
     texture->native_usage=usage;
     metal_lifetime_init((Word)texture,__builtin_offsetof(struct MetalTexture,lifetime),metal_texture_destroy);
-    static unsigned logged;
-    if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<32)
-        LOG("Vulkan texture created: Metal=%lu %lux%lux%lu mips=%lu layers=%lu",pixel,texture->width,texture->height,texture->depth,texture->mips,texture->layers);
+    LOG_LIMITED(32,"Vulkan texture created: Metal=%lu %lux%lux%lu mips=%lu layers=%lu",pixel,texture->width,texture->height,texture->depth,texture->mips,texture->layers);
     if (texture->decode_pvrtc) LOG("PVRTC%u upload decoder selected: %lux%lu, Vulkan RGBA8%s backing",texture->decode_pvrtc,texture->width,texture->height,(pixel&1) ? " sRGB" : "");
+    metal_texture_creation_result=VK_SUCCESS;
     return (Word)texture;
 }
 struct MetalTextureUpload { struct MetalTexture *texture; struct MetalBuffer *staging; VkBufferImageCopy region; VkImageLayout final_layout; };
@@ -253,8 +280,7 @@ static void metal_texture_replace(struct MetalTexture *texture,const char *selec
         if (!i2a_decode_pvrtc(bytes,pvrtc_size,texture->decode_pvrtc,(uint32_t)width,(uint32_t)height,format.metal<164,staging->mapped)) {
             metal_staging_release(slot); stop("PVRTC decode failed",selector);
         }
-        static unsigned decoded;
-        if (__atomic_fetch_add(&decoded,1,__ATOMIC_RELAXED)<24) LOG("PVRTC decoded for GPU upload: %zu -> %zu bytes mip=%lu slice=%lu",pvrtc_size,total,mip,slice);
+        LOG_LIMITED(24,"PVRTC decoded for GPU upload: %zu -> %zu bytes mip=%lu slice=%lu",pvrtc_size,total,mip,slice);
     } else for (size_t z=0;z<region.depth;++z) for (size_t y=0;y<rows;++y)
         memcpy((char *)staging->mapped+z*packed_image+y*packed_row,(const char *)bytes+z*image_stride+y*row_stride,packed_row);
     render_diagnostic_cost(9,diagnostic_prepare);
@@ -268,8 +294,7 @@ static void metal_texture_replace(struct MetalTexture *texture,const char *selec
     if (result==VK_SUCCESS) texture->layout=upload.final_layout;
     pthread_mutex_unlock(&texture->mutex);
     if (result!=VK_SUCCESS) stop("Vulkan texture upload failed",selector);
-    static unsigned logged;
-    if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<24) LOG("Vulkan texture upload recorded: %zu bytes mip=%lu slice=%lu",total,mip,slice);
+    LOG_LIMITED(24,"Vulkan texture upload recorded: %zu bytes mip=%lu slice=%lu",total,mip,slice);
 }
 static void metal_texture_replace_2d(struct MetalTexture *texture,const char *selector,struct MetalRegion region,Word mip,const void *bytes,Word stride) {
     metal_texture_replace(texture,selector,region,mip,0,bytes,stride,0);

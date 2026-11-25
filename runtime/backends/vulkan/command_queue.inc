@@ -31,14 +31,26 @@ struct MetalCommand {
     VkFence fence;
     Word error,active_encoder;
     unsigned gpu_done,handlers_done,callback_failed,recorded_operations;
-    struct MetalCommandTexture *textures;
+    struct MetalCommandTexture *textures,*texture_buckets[64];
     struct MetalCommandHandler *scheduled,*completed;
     struct MetalRenderEncoder *render_encoders;
+    struct MetalRenderSnapshot *snapshots;
     struct MetalDrawable *drawable;
     struct MetalDiagnosticCapture *captures;
     struct MetalBuffer *math_diagnostics;
     unsigned diagnostic_timestamps;
+    struct MetalLifetime lifetime;
 };
+static void metal_command_destroy(Word);
+static void metal_buffer_dispose(struct MetalBuffer *);
+static pthread_once_t metal_completion_once=PTHREAD_ONCE_INIT;
+static void *metal_completion_queue;
+static void (*metal_completion_enqueue)(void *,void *,void (*)(void *));
+static void metal_completion_initialize(void) {
+    void *(*global_queue)(long,unsigned long)=dispatch_export("dispatch_get_global_queue");
+    metal_completion_enqueue=dispatch_export("dispatch_async_f");
+    if(global_queue && metal_completion_enqueue)metal_completion_queue=global_queue(0,0);
+}
 static size_t metal_command_resource_hash(Word object,size_t capacity) {
     return ((object>>4)^(object>>17))*2654435761U&(capacity-1);
 }
@@ -100,6 +112,8 @@ static Word metal_queue_create(Word device,size_t maximum) {
     pthread_mutex_init(&queue->mutex,NULL);
     queue->sample_handlers=(void *)sequence_empty(external_class("_OBJC_CLASS_$_NSArray"));
     if (vulkan.available) {
+        pthread_once(&metal_completion_once,metal_completion_initialize);
+        if(!metal_completion_queue || !metal_completion_enqueue)stop("Metal completion queue unavailable","libdispatch");
         VkCommandPoolCreateInfo info={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
             .flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,.queueFamilyIndex=vulkan.queue_family};
         PFN_vkCreateCommandPool create=(PFN_vkCreateCommandPool)vulkan.get_device_proc(vulkan.device,"vkCreateCommandPool");
@@ -136,17 +150,30 @@ static struct MetalCommandPool *metal_pool_acquire(struct MetalQueue *queue) {
 static void metal_pool_return(struct MetalQueue *queue,struct MetalCommandPool *pool) {
     pthread_mutex_lock(&queue->mutex); pool->next=queue->free_pools; queue->free_pools=pool; pthread_mutex_unlock(&queue->mutex);
 }
+static void metal_pool_destroy(struct MetalQueue *queue,struct MetalCommandPool *pool) {
+    if(pool->timestamps)VKD(vkDestroyQueryPool)(vulkan.device,pool->timestamps,NULL);
+    if(pool->fence)VKD(vkDestroyFence)(vulkan.device,pool->fence,NULL);
+    VKD(vkDestroyCommandPool)(vulkan.device,pool->native,NULL);
+    if(pool->math_diagnostics){metal_buffer_dispose(pool->math_diagnostics);free(pool->math_diagnostics);}
+    metal_memory_sub(3,pool->resource_capacity*(sizeof(*pool->resource_buckets)+sizeof(*pool->resources)/2));
+    free(pool->resource_buckets);free(pool->resources);
+    pthread_mutex_lock(&queue->mutex);
+    if(queue->pool==pool->native)queue->pool=VK_NULL_HANDLE;
+    if(queue->pool_count)--queue->pool_count;
+    pthread_mutex_unlock(&queue->mutex);
+    pthread_mutex_destroy(&pool->mutex);free(pool);
+}
 static Word metal_command_buffer(struct MetalQueue *queue,const char *selector) {
     uint64_t diagnostic_begin=render_diagnostic_clock();
     struct MetalCommand *buffer=calloc(1,sizeof(*buffer));
     if (!buffer) return 0;
     buffer->object.isa=external_class("_OBJC_CLASS_$_I2AMetalCommandBuffer");
-    buffer->object.content[0]=(Word)queue;
+    buffer->object.content[0]=metal_object_retain((Word)queue);
     buffer->retained_references=strcmp(selector,"commandBufferWithUnretainedReferences")!=0;
     pthread_mutex_init(&buffer->mutex,NULL); pthread_cond_init(&buffer->condition,NULL);
     if (vulkan.available) {
         buffer->pool_owner=metal_pool_acquire(queue);
-        if (!buffer->pool_owner) { pthread_cond_destroy(&buffer->condition); pthread_mutex_destroy(&buffer->mutex); free(buffer); return 0; }
+        if (!buffer->pool_owner) { metal_object_release((Word)queue);pthread_cond_destroy(&buffer->condition);pthread_mutex_destroy(&buffer->mutex);free(buffer);return 0; }
         VkCommandBufferAllocateInfo allocate={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
             .commandPool=buffer->pool_owner->native,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
         VkCommandBufferBeginInfo info={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
@@ -158,10 +185,11 @@ static Word metal_command_buffer(struct MetalQueue *queue,const char *selector) 
         if (result==VK_SUCCESS) metal_diagnostic_command_begin(buffer);
         if (result!=VK_SUCCESS && buffer->command) { VKD(vkFreeCommandBuffers)(vulkan.device,buffer->pool_owner->native,1,&buffer->command); buffer->pool_owner->render=VK_NULL_HANDLE; }
         pthread_mutex_unlock(&buffer->pool_owner->mutex);
-        if (result!=VK_SUCCESS) { metal_pool_return(queue,buffer->pool_owner); LOG("Vulkan command buffer allocation/begin failed: %d",result); pthread_cond_destroy(&buffer->condition); pthread_mutex_destroy(&buffer->mutex); free(buffer); return 0; }
+        if (result!=VK_SUCCESS) { metal_pool_return(queue,buffer->pool_owner); LOG("Vulkan command buffer allocation/begin failed: %d",result);metal_object_release((Word)queue);pthread_cond_destroy(&buffer->condition);pthread_mutex_destroy(&buffer->mutex);free(buffer);return 0; }
     }
+    metal_lifetime_init((Word)buffer,__builtin_offsetof(struct MetalCommand,lifetime),metal_command_destroy);
     metal_memory_add(4,sizeof(*buffer));
-    render_diagnostic_cost(12,diagnostic_begin); return (Word)buffer;
+    render_diagnostic_cost(12,diagnostic_begin);return metal_object_autorelease((Word)buffer);
 }
 static Word metal_command_queue(struct HostObject *buffer) { return buffer->content[0]; }
 static Word metal_command_device(struct HostObject *buffer) { return metal_queue_device((void *)buffer->content[0]); }

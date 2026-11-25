@@ -49,7 +49,7 @@ IOS2Android/
 
 ### 构建
 
-当前构建环境使用 Python 3.11+、Windows Android NDK r27d、SDK Build Tools 35 / API 35 和 JDK。Python 依赖在 `pyproject.toml` 中声明；原生依赖、着色器工具和签名信息通过外部 JSON 配置指定。工具链与依赖需自行准备。
+当前构建环境使用 Python 3.11+、Windows Android NDK r27d、SDK Build Tools 35 / API 35 和 JDK。Python 依赖在 `pyproject.toml` 中声明；原生依赖、着色器工具和签名信息通过外部 JSON 配置指定。`toolchain.shaders` 目录需提供 `glslangValidator.exe` 和 `spirv-val.exe`，用于内置 Vulkan 1.0 呈现着色器的编译与校验。工具链与依赖需自行准备。
 
 在仓库根目录运行以下命令查看用法：
 
@@ -68,7 +68,13 @@ python -B -m porter build --help
 
 资源通常直接从已安装 APK 读取；需要真实文件路径或系统不支持共享内存时，按需处理单个文件，临时映射文件随使用结束释放。启动时清理旧版运行库留下的资源副本。着色器和驱动编译结果缓存在应用私有目录，更新后清理旧缓存，即使应用版本号没有变化。缓存不可用时会重新生成。
 
+纹理转换是可选的构建功能，资源路径由 `textures` 配置指定。目前支持二维 PVR3 中的 PVRTC1 转 ETC2，源程序需要能够读取 ETC2；其他格式保留原文件。转换在构建时完成，无需外部适配器，也不增加运行时编解码。Python 依赖见 `pyproject.toml` 的 `textures` extra。
+
+已加载的外部适配器可通过可选的 `texture_options(context)` 返回有效纹理配置；返回空配置会停用转换，用于与原程序的格式支持保持一致。
+
 APK 输出到外部工作区的 `out/<application-id>/<CFBundleVersion>/dev|release/`。不同版本共用构建缓存时需顺序构建；并行构建应使用独立工作区。
+
+应用每次进程启动会重写 `Android/data/<包名>/files/crash.log`，随后只追加异常和崩溃。release 正常日志关闭。原生栈无法继续读取时会注明原因；定位时需使用 APK 旁的同版符号文件。
 
 ### 兼容范围
 
@@ -85,7 +91,7 @@ APK 输出到外部工作区的 `out/<application-id>/<CFBundleVersion>/dev|rele
 - 网页支持基本加载和交互，多窗口、下载及部分导航和脚本接口仍未实现。
 - 照片接口尚缺相机、裁剪、视频、iCloud 版本、图库变更观察及完整查询条件；iOS 旧图库标识不能直接对应 Android 文件。
 - Metal → Vulkan 与 MSL/AIR 转换仅支持已实现的接口和转换路径。
-- 音频格式支持仍有限，实时 AudioQueue 播放尚未实现。
+- 音频格式支持仍有限，实时 AudioQueue 播放尚未实现。Android 公开信息无法完整识别其他应用的音频归属与混音状态，次要音频静音提示仍为近似实现。
 - 通知的完整日历/位置触发、分类动作与附件，Bonjour 浏览/解析，以及手势失败依赖与完整仲裁尚未实现。
 - 后台定位、区域监控、航向和部分定位授权接口尚未实现；地理编码依赖设备上的 Android 服务。
 

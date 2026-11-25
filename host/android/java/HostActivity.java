@@ -739,6 +739,7 @@ public final class HostActivity extends Activity {
         return mask;
     }
     private native String startGuest(String filesDirectory);
+    static native int configureCrashLog(String path);
     private native void updateSystemSnapshot(int width, int height, float scale, int rotation, boolean tablet, float battery, int batteryState, boolean lowPower);
     private native String updateApplicationState(int state);
     private native String expireBackgroundTask(long identifier);
@@ -1067,6 +1068,7 @@ public final class HostActivity extends Activity {
     }
 
     private void guestFailure(String message) {
+        CrashLog.record(message, null);
         Log.e("I2AGuest", message);
         runOnUiThread(() -> { startupFailed = true; if(guestLaunch!=null) { guestContent.removeView(guestLaunch); guestLaunch.release(); guestLaunch=null; } guestStatus.setVisibility(android.view.View.VISIBLE); guestStatus.setText(message); });
     }
@@ -1282,6 +1284,7 @@ public final class HostActivity extends Activity {
 
     @Override public void onConfigurationChanged(Configuration configuration) {
         super.onConfigurationChanged(configuration);
+        if (frameScheduler != null) frameScheduler.refreshDisplay();
         if (guestLoaded) updateSystemSnapshot();
     }
 
@@ -1798,6 +1801,7 @@ public final class HostActivity extends Activity {
     }
 
     @Override public void onCreate(Bundle state) {
+        CrashLog.initialize(this);
         super.onCreate(state);
         cleanRuntimeCaches();
         NotificationScheduler.attach(notificationDelivery);
@@ -1879,12 +1883,14 @@ public final class HostActivity extends Activity {
         }
         try {
             System.loadLibrary("i2a");
+            CrashLog.attach(HostActivity::configureCrashLog);
             libraryLoaded = true;
             openGuestAccessibility();
             // DEVELOPMENT_BEGIN
             configureBusinessDiagnostics(getIntent());
             // DEVELOPMENT_END
         } catch (LinkageError error) {
+            CrashLog.record("Android linker", error);
             Log.e("I2AGuest", "Android linker", error);
             guestFailure(error.toString());
         }

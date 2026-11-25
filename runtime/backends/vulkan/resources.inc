@@ -19,6 +19,8 @@ struct MetalBuffer {
     void *mapped;
     struct MetalLifetime lifetime;
 };
+static size_t metal_snapshot_trim(void);
+static size_t metal_memory_reclaim(VkResult *);
 static int metal_memory_type(uint32_t available,VkMemoryPropertyFlags required,VkMemoryPropertyFlags preferred) {
     int best=-1,score=-1;
     for (uint32_t i=0;i<vulkan.memory.memoryTypeCount;++i) {
@@ -54,6 +56,18 @@ static VkResult metal_buffer_allocate(struct MetalBuffer *buffer,size_t length,V
     if (type<0) { metal_buffer_dispose(buffer); return VK_ERROR_FEATURE_NOT_PRESENT; }
     VkMemoryAllocateInfo allocation={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=requirements.size,.memoryTypeIndex=(uint32_t)type};
     result=VKD(vkAllocateMemory)(vulkan.device,&allocation,NULL,&buffer->memory);
+    size_t reclaimed=0;VkResult recovery=VK_SUCCESS;
+    if(result==VK_ERROR_OUT_OF_HOST_MEMORY || result==VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        reclaimed=metal_memory_reclaim(&recovery);
+        if(reclaimed && recovery==VK_SUCCESS)result=VKD(vkAllocateMemory)(vulkan.device,&allocation,NULL,&buffer->memory);
+    }
+    if(result!=VK_SUCCESS) {
+        uint32_t heap=vulkan.memory.memoryTypes[type].heapIndex;
+        char detail[320];snprintf(detail,sizeof(detail),"operation=vkAllocateMemory buffer result=%d required_bytes=%llu memory_type=%d heap=%u heap_bytes=%llu max_allocations=%u released_idle_bytes=%zu recovery_result=%d",
+            result,(unsigned long long)requirements.size,type,heap,(unsigned long long)vulkan.memory.memoryHeaps[heap].size,
+            vulkan.properties.limits.maxMemoryAllocationCount,reclaimed,recovery);
+        record_failure("Vulkan buffer allocation failed",detail);
+    }
     if (result==VK_SUCCESS) result=VKD(vkBindBufferMemory)(vulkan.device,buffer->buffer,buffer->memory,0);
     if (result==VK_SUCCESS && (required&VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
         result=VKD(vkMapMemory)(vulkan.device,buffer->memory,0,VK_WHOLE_SIZE,0,&buffer->mapped);
@@ -109,6 +123,17 @@ static void metal_staging_release(struct MetalStaging *slot) {
     metal_object_release(destination);
     if (!slot->cached) { metal_buffer_dispose(&slot->buffer); free(slot); return; }
     pthread_mutex_lock(&metal_staging_mutex); slot->next=metal_staging_free; metal_staging_free=slot; pthread_mutex_unlock(&metal_staging_mutex);
+}
+static size_t metal_staging_trim(void) {
+    pthread_mutex_lock(&metal_staging_mutex);
+    struct MetalStaging *entries=metal_staging_free;metal_staging_free=NULL;
+    size_t bytes=0;
+    for(struct MetalStaging *entry=entries;entry;entry=entry->next) {
+        bytes+=entry->buffer.allocation;--metal_staging_count;metal_staging_bytes-=entry->buffer.allocation;
+    }
+    pthread_mutex_unlock(&metal_staging_mutex);
+    while(entries) {struct MetalStaging *next=entries->next;metal_buffer_dispose(&entries->buffer);free(entries);entries=next;}
+    return bytes;
 }
 /* Uploads only feed later GPU work. Record them together, submit before any
  * guest command, and retain staging bytes until the real upload fence signals.
@@ -194,6 +219,22 @@ static VkResult metal_upload_flush(void) {
     pthread_mutex_lock(&metal_uploads.mutex); VkResult result=metal_upload_flush_locked(); pthread_mutex_unlock(&metal_uploads.mutex);
     render_diagnostic_cost(7,diagnostic); return result;
 }
+static size_t metal_memory_reclaim(VkResult *result) {
+    size_t bytes=0;
+    pthread_mutex_lock(&metal_uploads.mutex);
+    *result=metal_upload_flush_locked();
+    VkFence fences[COUNT(metal_uploads.batches)];unsigned count=0;
+    for(unsigned i=0;i<COUNT(metal_uploads.batches);++i)
+        if(metal_uploads.batches[i].submitted)fences[count++]=metal_uploads.batches[i].fence;
+    if(*result==VK_SUCCESS && count)*result=VKD(vkWaitForFences)(vulkan.device,count,fences,VK_TRUE,1000000000ULL);
+    if(*result==VK_SUCCESS)for(unsigned i=0;i<COUNT(metal_uploads.batches);++i) {
+        struct MetalUploadBatch *batch=&metal_uploads.batches[i];if(!batch->submitted)continue;
+        for(struct MetalStaging *slot=batch->staging;slot;slot=slot->next)if(!slot->cached)bytes+=slot->buffer.allocation;
+        metal_upload_retire(batch);
+    }
+    pthread_mutex_unlock(&metal_uploads.mutex);
+    return bytes+metal_staging_trim()+metal_snapshot_trim();
+}
 struct MetalBufferCopy { struct MetalBuffer *from,*to; };
 static void metal_record_buffer_copy(VkCommandBuffer command,void *context) {
     struct MetalBufferCopy *copy=context;
@@ -223,9 +264,7 @@ static Word metal_buffer_new(Word device,const char *selector,size_t length,Word
     if (result!=VK_SUCCESS) { LOG("Vulkan buffer allocation failed: %d length=%zu options=0x%lx",result,length,options); free(buffer); return 0; }
     metal_memory_add(5,1);
     metal_lifetime_init((Word)buffer,__builtin_offsetof(struct MetalBuffer,lifetime),metal_buffer_destroy);
-    static unsigned logged;
-    if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<24)
-        LOG("Vulkan Metal buffer: %zu bytes storage=%u mapped=%d memoryFlags=0x%x",length,storage,buffer->mapped!=NULL,buffer->memory_flags);
+    LOG_LIMITED(24,"Vulkan Metal buffer: %zu bytes storage=%u mapped=%d memoryFlags=0x%x",length,storage,buffer->mapped!=NULL,buffer->memory_flags);
     return (Word)buffer;
 }
 static Word metal_buffer_bytes(Word device,const char *selector,const void *bytes,size_t length,Word options) {
@@ -296,8 +335,7 @@ static Word metal_sampler_new(Word device,const char *selector,struct MetalDescr
     VkResult result=VKD(vkCreateSampler)(vulkan.device,&info,NULL,&sampler->sampler);
     if (result!=VK_SUCCESS) { LOG("Vulkan sampler creation failed: %d",result); free(sampler); return 0; }
     metal_lifetime_init((Word)sampler,__builtin_offsetof(struct MetalSampler,lifetime),metal_sampler_destroy);
-    static unsigned logged;
-    if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<12) LOG("Vulkan sampler created: min=%lu mag=%lu mip=%lu anisotropy=%lu",min,mag,mip,anisotropy);
+    LOG_LIMITED(12,"Vulkan sampler created: min=%lu mag=%lu mip=%lu anisotropy=%lu",min,mag,mip,anisotropy);
     return (Word)sampler;
 }
 static VkStencilOpState metal_stencil_state(struct MetalDescriptor *descriptor) {

@@ -3,7 +3,6 @@
 struct MetalDiagnosticCapture { struct MetalBuffer buffer; uint32_t width,height,format; const char *name; struct MetalDiagnosticCapture *next; };
 static struct MetalBuffer *metal_math_buffer(struct MetalCommand *command) {
 #if I2A_DEVELOPMENT && I2A_SHADER_DIAGNOSTIC_COUNT
-    if (!vulkan.features.fragmentStoresAndAtomics) stop("Shader diagnostics require fragment storage atomics","diagnostic build");
     if (!command->math_diagnostics) {
         struct MetalBuffer *buffer=command->pool_owner->math_diagnostics;
         if (!buffer) {
@@ -23,24 +22,121 @@ static struct MetalBuffer *metal_math_buffer(struct MetalCommand *command) {
     stop("Diagnostic shader in normal package","shader binding");
 #endif
 }
+#if I2A_DEVELOPMENT && I2A_SHADER_DIAGNOSTIC_COUNT
+struct ShaderMathObservation {
+    uint64_t samples,domain,nonfinite,last_report_ns;
+    float x,y,value;
+    uint32_t flags;
+    unsigned observed;
+};
+static struct ShaderMathObservation shader_math_observations[I2A_SHADER_DIAGNOSTIC_COUNT];
+static pthread_mutex_t shader_math_observation_lock=PTHREAD_MUTEX_INITIALIZER;
+static void metal_math_emit_observation(unsigned index,uint64_t now) {
+    struct ShaderMathObservation *row=&shader_math_observations[index];
+    const struct ShaderDiagnosticSite *site=&shader_diagnostic_sites[index];
+    LOG("[BUSINESS-shader] site=%u shader=%s op=%s line=%u samples=%llu domain=%llu nonfinite=%llu x=%g y=%g value=%g flags=%u",index,
+        site->shader,site->operation,site->line,(unsigned long long)row->samples,(unsigned long long)row->domain,
+        (unsigned long long)row->nonfinite,row->x,row->y,row->value,row->flags);
+    row->samples=row->domain=row->nonfinite=0;
+    row->flags=0; row->observed=1; row->last_report_ns=now;
+}
+static void metal_math_flush_observations(void) {
+    struct timespec time; clock_gettime(CLOCK_MONOTONIC,&time);
+    uint64_t now=(uint64_t)time.tv_sec*1000000000ULL+(uint64_t)time.tv_nsec;
+    pthread_mutex_lock(&shader_math_observation_lock);
+    for (unsigned i=0;i<I2A_SHADER_DIAGNOSTIC_COUNT;++i)
+        if (shader_math_observations[i].domain || shader_math_observations[i].nonfinite) metal_math_emit_observation(i,now);
+    pthread_mutex_unlock(&shader_math_observation_lock);
+}
+#endif
+#if I2A_DEVELOPMENT
+static void metal_math_configure_observation(int enabled) {
+#if I2A_SHADER_DIAGNOSTIC_COUNT
+    if (enabled && !__atomic_load_n(&shader_diagnostics_requested,__ATOMIC_ACQUIRE)) {
+        pthread_mutex_lock(&shader_math_observation_lock);
+        memset(shader_math_observations,0,sizeof(shader_math_observations));
+        pthread_mutex_unlock(&shader_math_observation_lock);
+    }
+#endif
+    __atomic_store_n(&shader_diagnostics_requested,enabled,__ATOMIC_RELEASE);
+#if I2A_SHADER_DIAGNOSTIC_COUNT
+    if (!enabled) metal_math_flush_observations();
+#endif
+    LOG("[BUSINESS-shader-control] enabled=%u sites=%u",enabled!=0,I2A_SHADER_DIAGNOSTIC_COUNT);
+}
+#endif
 static void metal_math_complete(struct MetalCommand *command) {
 #if I2A_DEVELOPMENT && I2A_SHADER_DIAGNOSTIC_COUNT
-    static unsigned observed[I2A_SHADER_DIAGNOSTIC_COUNT],reported[I2A_SHADER_DIAGNOSTIC_COUNT];
     struct MetalBuffer *buffer=command->math_diagnostics;
     if (!buffer) return;
     uint32_t *words=buffer->mapped;
+    struct timespec time; clock_gettime(CLOCK_MONOTONIC,&time);
+    uint64_t now=(uint64_t)time.tv_sec*1000000000ULL+(uint64_t)time.tv_nsec;
+    pthread_mutex_lock(&shader_math_observation_lock);
     for (unsigned i=0;words[0] && i<I2A_SHADER_DIAGNOSTIC_COUNT;++i) {
-        uint32_t *row=words+1+i*8;
-        if (!row[0]) continue;
-        unsigned first=!__atomic_exchange_n(&observed[i],1,__ATOMIC_RELAXED);
-        unsigned issue=(row[1] || row[2]) && __atomic_fetch_add(&reported[i],1,__ATOMIC_RELAXED)<4;
-        if (first || issue) {
-            float x,y,value; memcpy(&x,row+4,4); memcpy(&y,row+5,4); memcpy(&value,row+6,4);
-            const struct ShaderDiagnosticSite *site=&shader_diagnostic_sites[i];
-            LOG("[BUSINESS-shader] site=%u shader=%s op=%s line=%u samples=%u domain=%u nonfinite=%u x=%g y=%g value=%g",i,site->shader,site->operation,site->line,row[0],row[1],row[2],x,y,value);
+        uint32_t *source=words+1+i*8;
+        if (!source[0]) continue;
+        struct ShaderMathObservation *row=&shader_math_observations[i];
+        unsigned first_issue=(source[1] || source[2]) && !(row->domain || row->nonfinite);
+        if (first_issue) {
+            memcpy(&row->x,source+4,4); memcpy(&row->y,source+5,4); memcpy(&row->value,source+6,4);
+            row->flags=source[7];
+        }
+        row->samples+=source[0]; row->domain+=source[1]; row->nonfinite+=source[2];
+        // Report initial coverage, then aggregate issues without a lifetime cap.
+        if (!row->observed || ((row->domain || row->nonfinite) &&
+                (now-row->last_report_ns>=1000000000ULL || !__atomic_load_n(&shader_diagnostics_requested,__ATOMIC_ACQUIRE))))
+            metal_math_emit_observation(i,now);
+    }
+    pthread_mutex_unlock(&shader_math_observation_lock);
+    command->math_diagnostics=NULL;
+#endif
+}
+static void metal_math_trace_render(struct MetalRenderEncoder *encoder,struct MetalFunction *function) {
+#if I2A_DEVELOPMENT && I2A_SHADER_DIAGNOSTIC_COUNT
+    if(!__atomic_load_n(&shader_diagnostics_requested,__ATOMIC_ACQUIRE))return;
+    static struct {uint64_t time;uint32_t width,height;unsigned remaining;} observed[COUNT(shader_specs)];
+    struct timespec clock;clock_gettime(CLOCK_MONOTONIC,&clock);
+    uint64_t now=(uint64_t)clock.tv_sec*1000000000ULL+(uint64_t)clock.tv_nsec;
+    size_t index=(size_t)(function->spec-shader_specs);
+    uint32_t width=encoder->state->width,height=encoder->state->height;
+    pthread_mutex_lock(&shader_math_observation_lock);
+    if(observed[index].width!=width || observed[index].height!=height) {
+        observed[index].width=width;observed[index].height=height;observed[index].remaining=4;
+    }
+    int report=observed[index].remaining || now-observed[index].time>=1000000000ULL;
+    if(observed[index].remaining)--observed[index].remaining;
+    if(report)observed[index].time=now;
+    pthread_mutex_unlock(&shader_math_observation_lock);
+    if(!report)return;
+    unsigned stage_index=function->spec->stage==1 ? 0 : 1;
+    LOG("[DIAG-shader-watch] shader=%s target=%ux%u viewport=%g,%g,%g,%g command=%p draw=%u",function->spec->name,width,height,
+        encoder->state->viewport.x,encoder->state->viewport.y,encoder->state->viewport.width,encoder->state->viewport.height,
+        (void *)encoder->command,encoder->state->draws);
+    for(unsigned i=0;i<encoder->state->attachment_count;++i) {
+        struct MetalTexture *texture=encoder->state->attachments[i];
+        const VkAttachmentDescription *description=&encoder->state->descriptions[i];
+        const VkClearValue *clear=&encoder->state->clear[i];
+        LOG("[DIAG-shader-watch] shader=%s attachment=%u object=%p format=%u load=%u store=%u started=%u clear=%g,%g,%g,%g",function->spec->name,
+            i,(void *)texture,texture->format.metal,description->loadOp,description->storeOp,encoder->state->started,
+            clear->color.float32[0],clear->color.float32[1],clear->color.float32[2],clear->color.float32[3]);
+    }
+    for(unsigned i=0;i<function->spec->binding_count;++i) {
+        const struct ShaderBindingSpec *binding=&shader_bindings[function->spec->first_binding+i];
+        if(binding->type==VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && binding->metal_index<128) {
+            struct MetalTexture *texture=encoder->state->textures[stage_index][binding->metal_index];
+            if(texture)LOG("[DIAG-shader-watch] shader=%s texture=%u object=%p format=%u extent=%lux%lux%lu mips=%lu",function->spec->name,
+                binding->metal_index,(void *)texture,texture->format.metal,texture->width,texture->height,texture->depth,texture->mips);
+        } else if(binding->type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && binding->metal_index<31) {
+            struct MetalBoundBuffer *use=&encoder->state->buffers[stage_index][binding->metal_index];
+            if(!use->buffer || !use->buffer->mapped || use->offset>use->buffer->length || binding->metal_size>use->buffer->length-use->offset)continue;
+            char words[64*9+1];size_t used=0,count=binding->metal_size/4;if(count>64)count=64;
+            for(size_t j=0;j<count;++j){uint32_t value;memcpy(&value,(char *)use->buffer->mapped+use->offset+j*4,4);used+=(size_t)snprintf(words+used,sizeof(words)-used,"%08x ",value);}
+            words[used]=0;
+            LOG("[DIAG-shader-watch] shader=%s buffer=%u offset=%llu bytes=%u words=%s",function->spec->name,binding->metal_index,
+                (unsigned long long)use->offset,binding->metal_size,words);
         }
     }
-    command->math_diagnostics=NULL;
 #endif
 }
 static void metal_diagnostic_command_begin(struct MetalCommand *command) {

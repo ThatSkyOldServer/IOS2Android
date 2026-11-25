@@ -81,6 +81,10 @@ JNIEXPORT void JNICALL HOST_JNI(HostActivity_updateSystemSnapshot)(JNIEnv *env,j
     struct DisplayState previous=display_state;
     display_state=(struct DisplayState){width,height,rotation,tablet,battery_state,low_power,scale,battery};
     pthread_mutex_unlock(&display_mutex);
+#if I2A_DEVELOPMENT && I2A_SHADER_DIAGNOSTIC_COUNT
+    if(previous.width!=width || previous.height!=height || previous.scale!=scale || previous.rotation!=rotation)
+        LOG("[DIAG-shader-watch] display=%dx%d scale=%g rotation=%d",width,height,scale,rotation);
+#endif
     if (java_vm && started) {
         unsigned changes=(battery_monitoring && previous.battery_level!=battery ? 1U : 0U) |
             (battery_monitoring && previous.battery_state!=battery_state ? 2U : 0U) |

@@ -77,8 +77,12 @@ static const void *guest_section_data(const void *,const char *,const char *,uns
 static Word guest_native_address(Word);
 #if I2A_DEVELOPMENT
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "I2AGuest", __VA_ARGS__)
+#define LOG_LIMITED(limit, ...) do { static unsigned i2a_log_count; unsigned i2a_log_limit=(limit); \
+    if (__atomic_load_n(&i2a_log_count,__ATOMIC_RELAXED)<i2a_log_limit && \
+        __atomic_fetch_add(&i2a_log_count,1,__ATOMIC_RELAXED)<i2a_log_limit) LOG(__VA_ARGS__); } while (0)
 #else
 #define LOG(...) do { if (0) __android_log_print(ANDROID_LOG_INFO, "I2AGuest", __VA_ARGS__); } while (0)
+#define LOG_LIMITED(limit, ...) do { if (0) { (void)(limit); LOG(__VA_ARGS__); } } while (0)
 #endif
 #define COUNT(array) (sizeof(array)/sizeof((array)[0]))
 
@@ -177,7 +181,7 @@ static uint64_t render_diagnostic_clock(void) {
 static void render_diagnostic_cost(unsigned kind,uint64_t begin) {
     if (begin) { render_cpu_work[kind]+=render_diagnostic_clock()-begin; ++render_cpu_calls[kind]; }
 }
-static _Thread_local int may_unwind;
+static _Thread_local int may_unwind,fatal_guest_thread;
 static JavaVM *java_vm;
 static jobject activity;
 static jmethodID preference_method, bundle_file_method, digest_method;
@@ -190,15 +194,20 @@ static Word certificate_tag, trust_tag,reachability_tag,security_key_tag,secure_
 static void secure_transport_release(Word);
 static void trust_release(Word);
 static char *files_directory;
+static void record_failure(const char *,const char *);
 
 static __attribute__((noreturn)) void stop(const char *kind, const char *name) {
     snprintf(status, sizeof(status), "%s\n%s %s", stage, kind, name);
+    record_failure(kind,name);
     __android_log_print(ANDROID_LOG_ERROR,"I2AGuest","STOP %s | %s %s",stage,kind,name);
+    /* Guest jobs may borrow this thread's stack until their original sync. */
+    if(fatal_guest_thread)abort();
     if (active_guest_call_boundary) longjmp(active_guest_call_boundary->environment,1);
     if (may_unwind) longjmp(boundary, 1);
     abort();
 }
 static __attribute__((noreturn)) void propagate_guest_failure(void) {
+    if(fatal_guest_thread)abort();
     if(active_guest_call_boundary)longjmp(active_guest_call_boundary->environment,1);
     if(may_unwind)longjmp(boundary,1);
     abort();
@@ -454,6 +463,24 @@ struct MetalAutoreleasePool {
 };
 static _Thread_local struct MetalAutoreleasePool *metal_pool_tokens;
 static _Thread_local unsigned metal_pool_token_count;
+static _Thread_local Word metal_return_object,metal_return_caller;
+
+static Word metal_autorelease_return(Word object,Word caller) {
+    const struct I2AImageSegment *segment=object ? image_segment_for(caller,8) : NULL;
+    if (segment && (segment->initial&PROT_READ) && metal_object_lifetime(object)) {
+        uint32_t instructions[2]; memcpy(instructions,(void *)caller,sizeof(instructions));
+        if (instructions[0]==0xaa1d03fdU && (instructions[1]&0xfc000000U)==0x94000000U) {
+            metal_return_object=object; metal_return_caller=caller+8; return object;
+        }
+    }
+    return metal_object_autorelease(object);
+}
+static __attribute__((noinline)) Word metal_autorelease_return_value(Word object) {
+    return metal_autorelease_return(object,(Word)__builtin_return_address(0));
+}
+static __attribute__((noinline)) Word metal_retain_autorelease_return_value(Word object) {
+    return metal_autorelease_return(metal_object_retain(object),(Word)__builtin_return_address(0));
+}
 
 static Word pool_push(void) {
     struct MetalAutoreleasePool *token=metal_pool_tokens;
@@ -477,13 +504,21 @@ static Word metal_object_autorelease(Word object) {
     pool->objects[pool->count++]=object;
     return object;
 }
-static Word metal_claim_autoreleased(Word object) {
-     
+static __attribute__((noinline)) Word metal_claim_autoreleased(Word object) {
+    if (object && metal_return_object==object && metal_return_caller==(Word)__builtin_return_address(0)) {
+        metal_return_object=metal_return_caller=0; return object;
+    }
     if (active_pool) {
         struct MetalAutoreleasePool *pool=(void *)active_pool;
         if (pool->count && pool->objects[pool->count-1]==object) { --pool->count; return object; }
     }
     return metal_object_retain(object);
+}
+static __attribute__((noinline)) Word metal_unsafe_claim_autoreleased(Word object) {
+    if (object && metal_return_object==object && metal_return_caller==(Word)__builtin_return_address(0)) {
+        metal_return_object=metal_return_caller=0; metal_object_release(object);
+    }
+    return object;
 }
 static Word core_autorelease(Word object) {
     if(!object)stop("Null object","CFAutorelease");if(!active_pool)return object;
@@ -1578,6 +1613,7 @@ static const char *bundle_relative(const char *path) {
 #include "darwin/malloc_zones.inc"
 #include "darwin/nonlocal.inc"
 #include "../diagnostics/backtrace.inc"
+#include "../diagnostics/crash.inc"
 #include "darwin/libsystem.inc"
 #include "darwin/kernel.inc"
 #include "darwin/mach_semaphores.inc"
@@ -2218,9 +2254,7 @@ static void *guest_mmap(void *address,size_t length,int protection,int flags,int
     if (flags&16) translated|=MAP_FIXED;
     if (flags&0x1000) translated|=MAP_ANONYMOUS;
     void *result=io_mmap(address,length,protection,translated,fd,offset);
-    static unsigned logged;
-    if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<8)
-        LOG("mmap size=%lu protection=%d flags=0x%x fd=%d result=%p",length,protection,flags,fd,result);
+    LOG_LIMITED(8,"mmap size=%lu protection=%d flags=0x%x fd=%d result=%p",length,protection,flags,fd,result);
     return result;
 }
 
@@ -2430,8 +2464,8 @@ static Word resolve_import(unsigned index) {
     if (!strcmp(name,"_munmap")) return (Word)munmap;
     if (!strcmp(name,"_close")) return (Word)io_close;
     if (!strcmp(name,"_objc_msgSendSuper2")) return (Word)message_super2;
-    if (!strcmp(name,"_objc_retainAutoreleaseReturnValue")) return (Word)metal_retain_autorelease;
-    if (!strcmp(name,"_objc_unsafeClaimAutoreleasedReturnValue")) return (Word)identity;
+    if (!strcmp(name,"_objc_retainAutoreleaseReturnValue")) return (Word)metal_retain_autorelease_return_value;
+    if (!strcmp(name,"_objc_unsafeClaimAutoreleasedReturnValue")) return (Word)metal_unsafe_claim_autoreleased;
     if (!strcmp(name,"_UIApplicationMain")) return (Word)application_main;
     if (!strcmp(name,"_objc_storeStrong")) return (Word)store_strong;
     if (!strcmp(name,"_objc_getProperty")) return (Word)get_property;
@@ -2492,7 +2526,7 @@ static Word resolve_import(unsigned index) {
     if (!strcmp(name, "___stack_chk_guard")) return (Word)&global_guard;
     if (!strcmp(name,"_objc_retainAutoreleasedReturnValue")) return (Word)metal_claim_autoreleased;
     if (!strcmp(name,"_objc_retain")) return (Word)metal_object_retain;
-    if (!strcmp(name,"_objc_autoreleaseReturnValue")) return (Word)metal_object_autorelease;
+    if (!strcmp(name,"_objc_autoreleaseReturnValue")) return (Word)metal_autorelease_return_value;
     if (!strcmp(name,"_objc_release")) return (Word)metal_object_release;
     const char *const compatible[] = {"malloc","calloc","realloc","free","memcpy","memset","memmove","memcmp","memchr",
                                       "strlen","strnlen","strcpy","strncpy","strcmp","strncmp","strdup","strchr","strrchr","strstr",

@@ -19,12 +19,14 @@ __attribute__((noinline)) static int darwin_backtrace(void **addresses,int capac
             frame=words[0];
         }
     }
+#if I2A_DEVELOPMENT
     static unsigned logged;
     if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<6) {
         LOG("Original diagnostic backtrace: %d frames",count);
         for (int i=0;i<count && i<24;++i) if (in_image((Word)addresses[i]))
-            LOG("  guest frame %d: 0x%lx",i,(Word)addresses[i]-aslr+GUEST_IMAGE_BASE);
+            LOG("  guest frame %d: 0x%lx",i,guest_native_address((Word)addresses[i]));
     }
+#endif
     errno=saved_errno;
     return count;
 }

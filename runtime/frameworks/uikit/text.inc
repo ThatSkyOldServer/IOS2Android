@@ -93,8 +93,7 @@ static Word ui_image_named_bundle(Word cls,const char *selector,Word name,Word s
         Word data=data_from_file(external_class("_OBJC_CLASS_$_NSData"),selector,path),image=image_from_data(cls,selector,(void *)data);
         if(image){named_image_state(image)->scale=scale;LOG("Original named image loaded: %s",filename);return image;}
     }
-    static unsigned logged;
-    if (logged++<24) LOG("Named image resource unavailable: %s",text);
+    LOG_LIMITED(24,"Named image resource unavailable: %s",text);
     return 0;
 }
 static Word ui_image_named(Word cls,const char *selector,Word name) { return ui_image_named_bundle(cls,selector,name,0,0); }

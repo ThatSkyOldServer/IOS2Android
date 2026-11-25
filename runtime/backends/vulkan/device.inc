@@ -128,6 +128,10 @@ static int vulkan_start(void) {
         PFN_vkGetDeviceQueue get_queue=(PFN_vkGetDeviceQueue)vulkan.get_device_proc(vulkan.device,"vkGetDeviceQueue");
         get_queue(vulkan.device,selected,0,&vulkan.queue);
         vulkan.available=1;
+        snprintf(crash_gpu_context,sizeof(crash_gpu_context),"gpu=%s vendor=0x%x device=0x%x api=%u.%u.%u driver=0x%x max_texture=%u storage_extended=%u storage_write_without_format=%u independent_blend=%u",
+            prop.deviceName,prop.vendorID,prop.deviceID,VK_VERSION_MAJOR(prop.apiVersion),VK_VERSION_MINOR(prop.apiVersion),VK_VERSION_PATCH(prop.apiVersion),
+            prop.driverVersion,prop.limits.maxImageDimension2D,enabled.shaderStorageImageExtendedFormats,enabled.shaderStorageImageWriteWithoutFormat,enabled.independentBlend);
+        __atomic_store_n(&crash_gpu_ready,1,__ATOMIC_RELEASE);
         LOG("Vulkan Android device ready: %s, graphics/present queue=%u, maxTexture=%u",prop.deviceName,selected,prop.limits.maxImageDimension2D);
         pthread_mutex_unlock(&vulkan_mutex); return 1;
     }
@@ -143,6 +147,7 @@ failed:
         vulkan.instance=VK_NULL_HANDLE; vulkan.surface=VK_NULL_HANDLE;
     }
     if (vulkan.window) { ANativeWindow_release(vulkan.window); vulkan.window=NULL; }
-    pthread_mutex_unlock(&vulkan_mutex); return 0;
+    pthread_mutex_unlock(&vulkan_mutex);
+    record_failure("Vulkan initialization failed",vulkan.error);return 0;
 #undef VK_INSTANCE
 }

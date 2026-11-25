@@ -39,6 +39,7 @@ static struct MetalFunction *metal_function_cache[COUNT(shader_specs)];
 static pthread_mutex_t metal_shader_mutex=PTHREAD_MUTEX_INITIALIZER;
 
 static Word metal_error(Word *error,const char *domain,long code,const char *detail) {
+    record_failure(domain,detail);
     LOG("%s (%ld): %s",domain,code,detail);
     if (error) {
         struct GuestMap *info=(void *)empty_map(external_class("_OBJC_CLASS_$_NSDictionary"));
@@ -74,8 +75,7 @@ static Word metal_library_data(Word device,const char *selector,void *data,Word 
     if (!library) return metal_error(error,"MTLLibraryErrorDomain",1,"Cannot allocate library object");
     library->object=(struct MetalResource){.isa=external_class("_OBJC_CLASS_$_I2AMetalLibrary"),.device=device};
     library->spec=spec;
-    static unsigned logged;
-    if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<32) LOG("Original Metal library matched: %s (%u bytes)",spec->name,spec->size);
+    LOG_LIMITED(32,"Original Metal library matched: %s (%u bytes)",spec->name,spec->size);
     return (Word)library;
 }
 static Word metal_library_source(Word device,const char *selector,Word source,Word options,Word *error) {
@@ -144,6 +144,13 @@ static Word metal_library_function(struct MetalLibrary *library,const char *sele
     if (!spec) { LOG("No original Metal function %s in %s",entry,library->spec->name); return 0; }
 #if I2A_DEVELOPMENT && I2A_SHADER_DIAGNOSTIC_COUNT
     LOG("[BUSINESS-shader] loaded=%s stage=%u",spec->name,spec->stage);
+    if (spec->stage==2 && !vulkan.features.fragmentStoresAndAtomics)
+        for (unsigned i=0;i<spec->binding_count;++i) {
+            const struct ShaderBindingSpec *binding=&shader_bindings[spec->first_binding+i];
+            if (binding->type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && binding->metal_index==UINT32_MAX-1) {
+                LOG("Fragment diagnostics require unsupported Vulkan storage atomics: %s",spec->name); return 0;
+            }
+        }
 #endif
     unsigned compute_fallback=!vulkan.features.vertexPipelineStoresAndAtomics && spec->fallback_size!=0;
     if (spec->stage==1 && !vulkan.features.vertexPipelineStoresAndAtomics && !compute_fallback)

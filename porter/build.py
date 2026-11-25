@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import re
+import shutil
 import sys
 import uuid
 import zipfile
@@ -9,6 +10,7 @@ from pathlib import Path
 
 from .files import write_json, build_lock, file_metadata, resolve_file
 from .bundle.identity import inspect_bundle
+from .textures import texture_options
 from . import ADAPTER_INTERFACE_VERSION, BundleIdentity, DirectoryOverlay, versions
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +41,7 @@ class BuildContext:
     policies: dict
     core_only: bool = False
     shader_diagnostics: bool = False
+    textures: dict | None = None
 
     @property
     def work(self):
@@ -86,6 +89,7 @@ class BuildContext:
             application_id=self.application_id,
             version_code=self.version_code,
             adapter=str(self.adapter_root) if self.adapter_root else None,
+            textures=self.textures,
         )
 
 
@@ -159,6 +163,7 @@ def create_context(
         uti_namespace="dyn.i2a.",
     )
     storage.update(android.get("storage", {}))
+    textures = texture_options(config.get("textures", {}), identity.build)
     signing = dict(config["signing"])
     signing["keystore"] = str(outside(signing["keystore"], "Signing key"))
     if not Path(signing["keystore"]).is_file():
@@ -178,6 +183,7 @@ def create_context(
         adapter_root,
         adapter,
         policies,
+        textures=textures,
     )
 
 
@@ -246,11 +252,14 @@ def build(context, core_only=False):
     from .bundle.storyboard import prepare_controller_catalogue, prepare_launch_screen
     from .image.macho import prepare_image
     from .shaders.build import build_shader_pack, pending_shader_plan
+    from .textures import prepare_pvr_textures
 
     native.validate(context)
     context = replace(context, core_only=core_only)
     context.work.mkdir(parents=True, exist_ok=True)
     adapter = None if core_only else context.load_adapter()
+    if adapter and hasattr(adapter, "texture_options"):
+        context = replace(context, textures=texture_options(adapter.texture_options(context), context.identity.build))
 
     def event(stage):
         print("Stage: " + stage, flush=True)
@@ -284,6 +293,10 @@ def build(context, core_only=False):
             )
             launch_screen = prepare_launch_screen(source, context.identity.prefix, context.info, resources, catalog) if not core_only else None
             overlays = adapter.resources(context, source) if adapter else {}
+            if not core_only and context.textures:
+                event("textures")
+                overlays.update(prepare_pvr_textures(source, context.identity.prefix,
+                                                     context.work / "texture-cache", context.textures["patterns"], overlays))
             members = set(source.namelist())
             for name, overlay in overlays.items():
                 directory = isinstance(overlay, DirectoryOverlay)
@@ -292,6 +305,13 @@ def build(context, core_only=False):
                     if directory
                     else context.identity.prefix + name in members
                 )
+                if not directory and not exists:
+                    for root, candidate in overlays.items():
+                        if isinstance(candidate, DirectoryOverlay) and name.startswith(root.rstrip("/") + "/"):
+                            path = (candidate.directory / name[len(root.rstrip("/")) + 1:]).resolve()
+                            exists = path.is_relative_to(candidate.directory.resolve()) and path.is_file()
+                            if exists:
+                                break
                 if name.startswith("/") or ".." in Path(name).parts or not exists:
                     raise ValueError("Overlay must target an existing bundle resource: " + name)
                 if directory and not overlay.directory.is_dir():
@@ -326,6 +346,12 @@ def build(context, core_only=False):
                 )
                 print(library, flush=True)
                 return library
+            symbols = json.loads((context.work / "native-symbols.json").read_text(encoding="utf-8"))
+            symbols.update(package_revision=revision, guest_binary_sha256=context.identity.binary_sha256,
+                           guest_image_base=main_image.image.imagebase)
+            write_json(context.work / "native-symbols.json", symbols)
+            write_json(context.work / "diagnostics.json", {key: value for key, value in symbols.items()
+                                                        if key not in ("symbols", "guest_images")})
             event("host")
             fonts = font_plan(context, source)
             manifest, dex = package.build_host(context, revision, fonts, resources, launch_screen, adapter)
@@ -342,5 +368,12 @@ def build(context, core_only=False):
         )
         write_json(context.work / "build.json", summary)
         write_json(context.output / "build.json", summary)
+        for name in ("native-symbols.json", "libi2a.so.debug", "r8-mapping.txt"):
+            artifact = context.work / name
+            destination = context.output / name
+            if artifact.is_file():
+                shutil.copyfile(artifact, destination)
+            else:
+                destination.unlink(missing_ok=True)
         print(candidate, flush=True)
         return candidate

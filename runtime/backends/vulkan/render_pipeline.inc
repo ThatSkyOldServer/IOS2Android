@@ -8,7 +8,8 @@ struct MetalPipelineKey {
     unsigned clamp;
     struct MetalDepthState *depth;
 };
-struct MetalPipelineVariant { struct MetalPipelineKey key; VkPipeline pipeline; struct MetalPipelineVariant *next; };
+struct MetalGraphicsPipeline;
+struct MetalPipelineVariant { struct MetalPipelineKey key; VkPipeline pipeline; struct MetalGraphicsPipeline *shared; struct MetalPipelineVariant *next; };
 struct MetalPipeline {
     struct MetalResource object;
     struct MetalFunction *vertex,*fragment;
@@ -57,6 +58,66 @@ static VkResult metal_cached_compile(unsigned compute,uint32_t count,const void 
     pthread_mutex_lock(&metal_pipeline_cache_mutex);metal_pipeline_cache_initialize();VkResult result=vulkan_compile_pipeline(compute,metal_pipeline_cache,count,info,output);
     if(result==VK_SUCCESS && metal_pipeline_cache)++metal_pipeline_generation;pthread_mutex_unlock(&metal_pipeline_cache_mutex);
     if(result==VK_SUCCESS)metal_pipeline_request_save();return result;
+}
+struct MetalGraphicsKey {
+    const struct ShaderSpec *vertex,*fragment;
+    VkVertexInputBindingDescription bindings[31];
+    VkVertexInputAttributeDescription attributes[31];
+    VkPipelineColorBlendAttachmentState blend[8];
+    VkFormat colors[8],depth_format;
+    uint32_t binding_count,attribute_count,color_count;
+    VkSampleCountFlagBits samples;
+    unsigned rasterization,alpha_coverage,alpha_one,dynamic_uniform,dynamic_storage;
+    VkPrimitiveTopology topology; VkCullModeFlags cull; VkFrontFace front; VkPolygonMode polygon; unsigned clamp;
+    VkBool32 depth_test,depth_write,depth_bounds,stencil;
+    VkCompareOp depth_compare; VkStencilOpState stencil_front,stencil_back;
+    float min_depth,max_depth;
+};
+struct MetalGraphicsPipeline { struct MetalGraphicsKey key; VkPipeline pipeline; size_t references; struct MetalGraphicsPipeline *next; };
+static struct MetalGraphicsPipeline *metal_graphics_pipelines;
+static VkResult metal_graphics_acquire(const struct MetalPipeline *pipeline,const struct MetalPipelineKey *state,
+        const VkGraphicsPipelineCreateInfo *info,struct MetalGraphicsPipeline **output) {
+    /* Only variant creation uses this registry. Draws keep their existing local
+     * lookup; equivalent Metal objects retain independent labels and lifetime. */
+    struct MetalGraphicsKey key={0};
+    key.vertex=pipeline->vertex->spec;key.fragment=pipeline->fragment ? pipeline->fragment->spec : NULL;
+    memcpy(key.bindings,pipeline->bindings,sizeof(key.bindings));memcpy(key.attributes,pipeline->attributes,sizeof(key.attributes));
+    memcpy(key.blend,pipeline->blend,sizeof(key.blend));memcpy(key.colors,pipeline->colors,sizeof(key.colors));
+    key.depth_format=pipeline->depth_format;key.binding_count=pipeline->binding_count;key.attribute_count=pipeline->attribute_count;key.color_count=pipeline->color_count;
+    key.samples=pipeline->samples;key.rasterization=pipeline->rasterization;key.alpha_coverage=pipeline->alpha_coverage;key.alpha_one=pipeline->alpha_one;
+    key.dynamic_uniform=pipeline->dynamic_uniform;key.dynamic_storage=pipeline->dynamic_storage;
+    key.topology=state->topology;key.cull=state->cull;key.front=state->front;key.polygon=state->polygon;key.clamp=state->clamp;
+    const VkPipelineDepthStencilStateCreateInfo *depth=info->pDepthStencilState;
+    key.depth_test=depth->depthTestEnable;key.depth_write=depth->depthWriteEnable;key.depth_bounds=depth->depthBoundsTestEnable;
+    key.stencil=depth->stencilTestEnable;key.depth_compare=depth->depthCompareOp;key.stencil_front=depth->front;key.stencil_back=depth->back;
+    key.min_depth=depth->minDepthBounds;key.max_depth=depth->maxDepthBounds;
+    pthread_mutex_lock(&metal_pipeline_cache_mutex);
+    for(struct MetalGraphicsPipeline *entry=metal_graphics_pipelines;entry;entry=entry->next) if(!memcmp(&entry->key,&key,sizeof(key))) {
+        ++entry->references;*output=entry;pthread_mutex_unlock(&metal_pipeline_cache_mutex);
+        if(render_diagnostics_requested)LOG("[DIAG-pipeline] reused vertex=%s fragment=%s",key.vertex->name,key.fragment ? key.fragment->name : "none");
+        return VK_SUCCESS;
+    }
+    struct MetalGraphicsPipeline *entry=calloc(1,sizeof(*entry));
+    if(!entry){pthread_mutex_unlock(&metal_pipeline_cache_mutex);return VK_ERROR_OUT_OF_HOST_MEMORY;}
+    metal_pipeline_cache_initialize();VkResult result=vulkan_compile_pipeline(0,metal_pipeline_cache,1,info,&entry->pipeline);
+    if(result==VK_SUCCESS) {
+        entry->key=key;entry->references=1;entry->next=metal_graphics_pipelines;metal_graphics_pipelines=entry;*output=entry;
+        if(metal_pipeline_cache)++metal_pipeline_generation;
+    } else {if(entry->pipeline)VKD(vkDestroyPipeline)(vulkan.device,entry->pipeline,NULL);free(entry);}
+    pthread_mutex_unlock(&metal_pipeline_cache_mutex);
+    if(result==VK_SUCCESS) {
+        if(render_diagnostics_requested)LOG("[DIAG-pipeline] compiled vertex=%s fragment=%s",key.vertex->name,key.fragment ? key.fragment->name : "none");
+        metal_pipeline_request_save();
+    }
+    return result;
+}
+static void metal_graphics_release(struct MetalGraphicsPipeline *entry) {
+    pthread_mutex_lock(&metal_pipeline_cache_mutex);
+    if(--entry->references){pthread_mutex_unlock(&metal_pipeline_cache_mutex);return;}
+    struct MetalGraphicsPipeline **slot=&metal_graphics_pipelines;
+    while(*slot!=entry)slot=&(*slot)->next;
+    *slot=entry->next;pthread_mutex_unlock(&metal_pipeline_cache_mutex);
+    VKD(vkDestroyPipeline)(vulkan.device,entry->pipeline,NULL);free(entry);
 }
 JNIEXPORT void JNICALL HOST_JNI(HostActivity_persistPipelineCache)(JNIEnv *env,jobject instance){
     pthread_mutex_lock(&metal_pipeline_save_mutex);pthread_mutex_lock(&metal_pipeline_cache_mutex);
@@ -243,6 +304,14 @@ static VkResult metal_pipeline_layout(struct MetalPipeline *pipeline) {
     VkPipelineLayoutCreateInfo info={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.setLayoutCount=2,.pSetLayouts=pipeline->sets};
     return VKD(vkCreatePipelineLayout)(vulkan.device,&info,NULL,&pipeline->layout);
 }
+/* Pipeline and framebuffer passes must also agree on their dependencies. */
+static const VkSubpassDependency metal_attachment_dependency={
+    .srcSubpass=VK_SUBPASS_EXTERNAL,.dstSubpass=0,
+    .srcStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT|VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT|VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+    .dstStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT|VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT|VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+    .srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+    .dstAccessMask=VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+    .dependencyFlags=VK_DEPENDENCY_BY_REGION_BIT};
 static VkResult metal_pipeline_pass(struct MetalPipeline *pipeline) {
     VkAttachmentDescription attachments[9]={0}; VkAttachmentReference colors[8],depth={VK_ATTACHMENT_UNUSED,VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     unsigned count=0;
@@ -262,7 +331,8 @@ static VkResult metal_pipeline_pass(struct MetalPipeline *pipeline) {
     }
     VkSubpassDescription subpass={.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS,.colorAttachmentCount=pipeline->color_count,.pColorAttachments=colors,
         .pDepthStencilAttachment=pipeline->depth_format ? &depth : NULL};
-    VkRenderPassCreateInfo info={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,.attachmentCount=count,.pAttachments=attachments,.subpassCount=1,.pSubpasses=&subpass};
+    VkRenderPassCreateInfo info={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,.attachmentCount=count,.pAttachments=attachments,.subpassCount=1,.pSubpasses=&subpass,
+        .dependencyCount=1,.pDependencies=&metal_attachment_dependency};
     return VKD(vkCreateRenderPass)(vulkan.device,&info,NULL,&pipeline->pass);
 }
 static int metal_pipeline_key_equal(const struct MetalPipelineKey *a,const struct MetalPipelineKey *b) {
@@ -295,18 +365,18 @@ static VkResult metal_pipeline_variant(struct MetalPipeline *pipeline,const stru
     VkPipelineColorBlendStateCreateInfo blend={.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
         .attachmentCount=pipeline->color_count,.pAttachments=pipeline->blend};
     const VkDynamicState dynamic_states[]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR,VK_DYNAMIC_STATE_BLEND_CONSTANTS,VK_DYNAMIC_STATE_DEPTH_BIAS,
-        VK_DYNAMIC_STATE_STENCIL_REFERENCE,VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,VK_DYNAMIC_STATE_STENCIL_WRITE_MASK};
+        VK_DYNAMIC_STATE_STENCIL_REFERENCE};
     VkPipelineDynamicStateCreateInfo dynamic={.sType=VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,.dynamicStateCount=COUNT(dynamic_states),.pDynamicStates=dynamic_states};
     VkGraphicsPipelineCreateInfo info={.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,.stageCount=pipeline->fragment ? 2 : 1,.pStages=stages,
         .pVertexInputState=&vertex,.pInputAssemblyState=&assembly,.pViewportState=&viewport,.pRasterizationState=&raster,.pMultisampleState=&multisample,
         .pDepthStencilState=&depth,.pColorBlendState=&blend,.pDynamicState=&dynamic,.layout=pipeline->layout,.renderPass=pipeline->pass,.subpass=0};
-    VkResult result=metal_cached_compile(0,1,&info,&variant->pipeline);
+    VkResult result=metal_graphics_acquire(pipeline,key,&info,&variant->shared);
     if (result==VK_SUCCESS) {
-         
+        variant->pipeline=variant->shared->pipeline;
         metal_object_retain((Word)variant->key.depth);
         variant->next=pipeline->variants; pipeline->variants=variant; *output=variant->pipeline;
     }
-    else { if (variant->pipeline) VKD(vkDestroyPipeline)(vulkan.device,variant->pipeline,NULL); free(variant); }
+    else free(variant);
     pthread_mutex_unlock(&pipeline->mutex); return result;
 }
 static void metal_pipeline_dispose(struct MetalPipeline *pipeline) {
@@ -314,7 +384,7 @@ static void metal_pipeline_dispose(struct MetalPipeline *pipeline) {
     struct MetalPipelineVariant *variant=pipeline->variants;
     while (variant) {
         struct MetalPipelineVariant *next=variant->next;
-        VKD(vkDestroyPipeline)(vulkan.device,variant->pipeline,NULL);
+        metal_graphics_release(variant->shared);
         metal_object_release((Word)variant->key.depth); free(variant); variant=next;
     }
     if (pipeline->pass) VKD(vkDestroyRenderPass)(vulkan.device,pipeline->pass,NULL);

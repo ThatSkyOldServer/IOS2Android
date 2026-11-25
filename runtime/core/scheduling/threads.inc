@@ -306,10 +306,12 @@ static void *guest_thread_start(void *context) {
         LOG("Android scheduling translation: requested nice=%d actual=%d setError=%d (real-time FIFO unavailable)",start.nice_priority,actual,error);
     }
     void *result=NULL;
-    may_unwind=1;
+    may_unwind=1;fatal_guest_thread=1;
     snprintf(stage,sizeof(stage),"pthread entry 0x%lx",(Word)start.entry-aslr+GUEST_IMAGE_BASE);
-    if (setjmp(boundary)==0) result=start.entry(start.argument);
-    may_unwind=0;
+    int outcome=setjmp(boundary);
+    if(outcome==0)result=start.entry(start.argument);
+    may_unwind=0;fatal_guest_thread=0;
+    if(outcome==1)abort();
     return result;
 }
 static int guest_timeshare_attr(pthread_attr_t *translated,const pthread_attr_t *original) {

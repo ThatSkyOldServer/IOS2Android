@@ -105,8 +105,7 @@ static FILE *guest_fopen(const char *path,const char *mode) {
     FILE *stream;
     if(bundle_relative(path)){int fd=io_open(path,O_RDONLY|O_CLOEXEC,0);if(fd<0)return NULL;stream=guest_fdopen(fd,mode);if(!stream){int code=errno;io_close(fd);errno=code;}}
     else stream=fopen(path,mode);
-    static unsigned logged;
-    if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<16) LOG("fopen %s mode=%s result=%p",path,mode,stream);
+    LOG_LIMITED(16,"fopen %s mode=%s result=%p",path,mode,stream);
     return stream;
 }
 static FILE *guest_freopen(const char *path,const char *mode,FILE *stream) {

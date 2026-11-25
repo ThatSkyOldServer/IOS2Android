@@ -288,7 +288,7 @@ static void *native_thread_entry(void *context) {
     pthread_cond_broadcast(&scheduling_condition); pthread_mutex_unlock(&scheduling_mutex);
     struct NativeLoop *loop=native_loop(thread->loop);
     if (thread->name) guest_thread_name(string_bytes(thread->name,"NSThread name"));
-    may_unwind=1; snprintf(stage,sizeof(stage),"NSThread %s",thread->selector ? thread->selector : "main");
+    may_unwind=1;fatal_guest_thread=1;snprintf(stage,sizeof(stage),"NSThread %s",thread->selector ? thread->selector : "main");
     int failed=setjmp(boundary);
     if (!failed) {
         if (thread->block) ((void (*)(Word))read_word(thread->block+16))(thread->block);
@@ -300,17 +300,12 @@ static void *native_thread_entry(void *context) {
             method(target,selector,thread->argument,0,0,0);
         }
     }
-    may_unwind=0;
+    if(failed==1)abort();
+    may_unwind=0;fatal_guest_thread=0;
     pthread_mutex_lock(&scheduling_mutex);
-    thread->failed=failed; thread->executing=0; thread->finished=1; loop->failed=1;
+    thread->failed=0; thread->executing=0; thread->finished=1; loop->failed=1;
     for (struct ScheduledWork *work=scheduled_work;work;work=work->next) if (work->loop==loop) { work->valid=0; work->done=1; work->running=0; }
     pthread_cond_broadcast(&scheduling_condition); pthread_mutex_unlock(&scheduling_mutex);
-    if (failed) {
-        JNIEnv *env=attached_environment("NSThread failure"); jclass type=(*env)->GetObjectClass(env,activity);
-        jmethodID report=(*env)->GetMethodID(env,type,"guestFailure","(Ljava/lang/String;)V");
-        jstring message=(*env)->NewStringUTF(env,status); (*env)->CallVoidMethod(env,activity,report,message);
-        (*env)->DeleteLocalRef(env,message); (*env)->DeleteLocalRef(env,type);
-    }
     return NULL;
 }
 static void native_thread_start(Word object,const char *selector) {

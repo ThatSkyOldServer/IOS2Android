@@ -48,6 +48,8 @@ static __attribute__((noreturn)) void exception_uncaught_terminate(void) {
         Word object=thrown->object,handler=guest_get_uncaught_exception_handler();
         if (object && read_word(object)==external_class("_OBJC_CLASS_$_NSException")) {
             struct HostObject *value=(void *)object;
+            record_failure(value->content[0] ? string_bytes(value->content[0],"exception name") : "NSException",
+                value->content[1] ? string_bytes(value->content[1],"exception reason") : "Uncaught Objective-C exception");
             __android_log_print(ANDROID_LOG_ERROR,"I2AGuest","Uncaught Objective-C exception %s: %s",
                 value->content[0] ? string_bytes(value->content[0],"exception name") : "NSException",
                 value->content[1] ? string_bytes(value->content[1],"exception reason") : "");

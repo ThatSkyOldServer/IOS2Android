@@ -118,6 +118,7 @@ def compile_library_resources(context, manifest, resources, libraries, packages,
 
 def build_host(context, revision, fonts, resources, launch_screen, adapter=None):
     work = context.work
+    (work / "r8-mapping.txt").unlink(missing_ok=True)
     shutil.copytree(ROOT / "host/android/res", resources, dirs_exist_ok=True)
     sources, classes, dex = [work / name for name in ("java", "classes", "dex")]
     for folder in (sources, classes, dex):
@@ -135,6 +136,7 @@ def build_host(context, revision, fonts, resources, launch_screen, adapter=None)
         PACKAGE_REVISION=revision,
         BUNDLE_NAME=context.identity.directory,
         APP_NAME=context.identity.display_name,
+        GUEST_BINARY_SHA256=context.identity.binary_sha256,
         RUNTIME_PREFERENCES=context.storage["preferences"],
         UUID_NAMESPACE=context.storage["uuid_namespace"],
         DEFAULTS_DOMAIN=context.storage["defaults_domain"],
@@ -261,7 +263,7 @@ def build_host(context, revision, fonts, resources, launch_screen, adapter=None)
     return manifest, binary
 
 
-def _write_directory_overlay(package, prefix, overlay):
+def _write_directory_overlay(package, prefix, overlay, files):
     for path in sorted(overlay.directory.rglob("*")):
         if not path.is_file():
             continue
@@ -271,6 +273,9 @@ def _write_directory_overlay(package, prefix, overlay):
             if overlay.date_time is not None
             else zipfile.ZipInfo.from_file(path, target)
         )
+        if target in files:
+            package.writestr(member, files[target])
+            continue
         member.file_size = path.stat().st_size
         with path.open("rb") as incoming, package.open(member, "w") as outgoing:
             shutil.copyfileobj(incoming, outgoing, 1024 * 1024)
@@ -285,10 +290,13 @@ def build_apk(context, source, manifest, resources, catalog, overlays, native, d
         for name, overlay in overlays.items()
         if isinstance(overlay, DirectoryOverlay)
     }
+    files = {"assets/" + identity.directory + "/" + name: value for name, value in overlays.items()
+             if not isinstance(value, DirectoryOverlay)}
     if not context.host.get("libraries"):
         run(context, tools["sdk"] / "aapt.exe", "package", "-f", "-M", manifest, "-I", tools["platform"], "-S", resources, "-F", assets)
     with zipfile.ZipFile(assets, "a") as package:
         package.write(work / "shaders.bin", "assets/i2a/shaders.bin", compress_type=zipfile.ZIP_STORED)
+        package.write(work / "diagnostics.json", "assets/i2a/diagnostics.json", compress_type=zipfile.ZIP_DEFLATED)
         for directory in sorted((work / "android-libraries").glob("*")):
             for path in sorted((directory / "assets").rglob("*")):
                 if path.is_file():
@@ -310,7 +318,7 @@ def build_apk(context, source, manifest, resources, catalog, overlays, native, d
                 with source.open(member) as incoming, package.open(target, "w") as outgoing:
                     shutil.copyfileobj(incoming, outgoing, 1024 * 1024)
         for root, overlay in directories.items():
-            _write_directory_overlay(package, "assets/" + identity.directory + "/" + root, overlay)
+            _write_directory_overlay(package, "assets/" + identity.directory + "/" + root, overlay, files)
         members = set(source.namelist())
         for name, path in catalog:
             if identity.prefix + name not in members and not any(name.startswith(root) for root in directories):

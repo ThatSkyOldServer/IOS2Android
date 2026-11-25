@@ -57,8 +57,7 @@ static void *guest_malloc_zone_malloc(struct GuestMallocZone *zone,size_t size) 
     allocation->hash_next=zone_allocations[bucket]; zone_allocations[bucket]=allocation;
     __atomic_fetch_add(&zone_live_allocations,1,__ATOMIC_RELEASE);
     pthread_mutex_unlock(&malloc_zones_mutex);
-    static unsigned logged;
-    if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<48) LOG("Darwin malloc zone backing allocated: %zu bytes",size);
+    LOG_LIMITED(48,"Darwin malloc zone backing allocated: %zu bytes",size);
     return pointer;
 }
 static struct GuestMallocZone *guest_malloc_zone_from_ptr(const void *pointer) {

@@ -2,6 +2,7 @@
 #if I2A_DEVELOPMENT
 static int metal_diagnostic_enabled,metal_diagnostic_readback;
 static int shader_diagnostics_requested;
+static void metal_math_configure_observation(int enabled);
 static uint64_t metal_descriptor_cache_counts[2];
 static uint64_t metal_layout_counts[2];
 #else
@@ -19,6 +20,8 @@ struct MetalBuffer;
 static struct MetalBuffer *metal_math_buffer(struct MetalCommand *);
 static void metal_math_complete(struct MetalCommand *);
 struct MetalRenderEncoder;
+struct MetalFunction;
+static void metal_math_trace_render(struct MetalRenderEncoder *,struct MetalFunction *);
 static void metal_diagnostic_command_begin(struct MetalCommand *);
 static void metal_diagnostic_command_end(struct MetalCommand *);
 static void metal_diagnostic_command_complete(struct MetalCommand *);
@@ -36,7 +39,7 @@ static void metal_diagnostic_add(unsigned category,uint64_t duration) {
 }
 #if I2A_DEVELOPMENT
 JNIEXPORT void JNICALL HOST_JNI(HostActivity_configureShaderDiagnostics)(JNIEnv *env,jobject object,jboolean enabled) {
-    __atomic_store_n(&shader_diagnostics_requested,enabled,__ATOMIC_RELEASE);
+    metal_math_configure_observation(enabled);
 }
 JNIEXPORT void JNICALL HOST_JNI(HostActivity_configureRenderDiagnostics)(JNIEnv *env,jobject object,jboolean enabled,jstring directory) {
     const char *path=(*env)->GetStringUTFChars(env,directory,NULL);

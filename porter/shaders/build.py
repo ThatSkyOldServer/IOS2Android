@@ -1,4 +1,5 @@
 import copy
+from fnmatch import fnmatchcase
 import hashlib
 import json
 import re
@@ -48,11 +49,9 @@ def compile_glsl(code, stage, folder, tools):
 
 def compile_embedded_shaders(raw, recipes, folder, tools):
     libraries, candidates = [], {}
-    for recipe in recipes:
+    for recipe_index, recipe in enumerate(recipes):
         original = read_embedded_source(raw, recipe['address'])
-        slot=folder/recipe['name']
-        if not slot.resolve().is_relative_to(folder.resolve()):
-            raise ValueError('Shader name escapes output directory')
+        slot=folder/str(recipe_index)
         base, binary, reflection = compile_glsl(recipe['glsl'], recipe['stage'], slot, tools)
         shader = dict(name=recipe['name'], source_kind='embedded_msl', address=recipe['address'],
                       original_sha256=recipe['sha256'], original_bytes=len(original), stage=recipe['stage'],
@@ -68,18 +67,41 @@ def compile_embedded_shaders(raw, recipes, folder, tools):
             shader['fallback'] = dict(path=str(alternate),
                                       reflection=str(alternate_reflection), contract=fallback['contract'])
         name = 'embedded/' + recipe['name'] + '.metal'
+        if name in candidates:
+            raise ValueError('Duplicate embedded shader identifier: ' + recipe['name'])
         libraries.append(dict(name=name, sha256=recipe['sha256'], bytes=len(original), address=recipe['address'],
                               entries=[dict(entry=recipe['entry'], stage={'vert':'vertex', 'frag':'fragment', 'comp':'kernel'}[recipe['stage']], inputs=recipe['inputs'])]))
         candidates[name] = [(shader, base)]
     return libraries, candidates
 
 
+def compile_shader_replacement(original, base, code, folder, tools):
+    output, binary, reflection = compile_glsl(code, original['stage'], folder, tools)
+    before = json.loads(resolve_file(base, original['reflection']).read_text(encoding='utf-8'))
+    after = json.loads(reflection.read_text(encoding='utf-8'))
+    for key in ('entryPoints', 'inputs', 'outputs', 'separate_images', 'separate_samplers', 'ubos', 'ssbos', 'images'):
+        def shape(value):
+            def normalize(item):
+                if isinstance(item, list):
+                    return [normalize(v) for v in item]
+                if isinstance(item, dict):
+                    return {k: normalize(value.get('types', {}).get(v, v) if k == 'type' and isinstance(v, str) else v)
+                            for k, v in item.items() if k != 'id'}
+                return item
+            return normalize(value.get(key, []))
+        if shape(before) != shape(after):
+            raise ValueError('Replacement changed the shader interface: ' + original['name'] + ' ' + key)
+    derived = copy.deepcopy(original)
+    derived.update(source='source.' + original['stage'], spirv=binary.name, reflection=reflection.name)
+    return derived, output
+
+
 def apply_shader_repairs(shaders, recipes, root, folder, tools):
     reports = []
-    for recipe in recipes:
+    for recipe_index, recipe in enumerate(recipes):
         original, base = shaders[recipe['library']][0]
         if original['original_sha256'] != recipe['original_source_sha256']:
-            raise ValueError('Replacement does not match the original shader')
+            raise ValueError('Replacement does not match the original shader: ' + recipe['library'])
         if 'source' in recipe:
             source = resolve_file(root,recipe['source'])
             code = source.read_text(encoding='utf-8')
@@ -93,30 +115,95 @@ def apply_shader_repairs(shaders, recipes, root, folder, tools):
             if recipe.get('helpers'):
                 at = code.index('void main')
                 code = code[:at]+recipe['helpers']+'\n'+code[at:]
-        output, binary, reflection = compile_glsl(code, original['stage'], folder/original['name'], tools)
-        before = json.loads((base / original['reflection']).read_text(encoding='utf-8'))
-        after = json.loads(reflection.read_text(encoding='utf-8'))
-        for key in ('entryPoints', 'inputs', 'outputs', 'separate_images', 'separate_samplers', 'ubos', 'ssbos', 'images'):
-            def shape(value):
-                def normalize(item):
-                    if isinstance(item,list):
-                        return [normalize(v) for v in item]
-                    if isinstance(item,dict):
-                        return {k:normalize(value.get('types',{}).get(v,v) if k=='type' and isinstance(v,str) else v)
-                                for k,v in item.items() if k!='id'}
-                    return item
-                return normalize(value.get(key, []))
-            if shape(before) != shape(after):
-                raise ValueError('Replacement changed the shader interface: ' + original['name'] + ' ' + key)
-        derived = copy.deepcopy(original)
-        derived.update(source='source.'+original['stage'], spirv=binary.name, reflection=reflection.name)
+        derived, output = compile_shader_replacement(original, base, code, folder/str(recipe_index), tools)
         shaders[recipe['library']] = [(derived, output)]
         reports.append(dict(source=recipe.get('source',original['source']),library=recipe['library'],reason=recipe.get('reason','')))
     return reports
 
 
-def instrument_math(code, stage, name, first_site):
-    operations = ('pow', 'sqrt', 'inversesqrt', 'log', 'log2', 'exp2')
+def rewrite_intrinsic_calls(code, recipe, helpers):
+    # The adapter supplies semantics. This pass only rewrites complete GLSL calls;
+    # comments, argument evaluation and nested expressions retain their positions.
+    functions = recipe['functions']
+    powers = recipe.get('constant_powers', {})
+    identifiers = [*functions, *functions.values(), *powers.values()]
+    if not functions or any(not re.fullmatch(r'[A-Za-z_]\w*', name) for name in identifiers):
+        raise ValueError('Invalid shader intrinsic rewrite')
+    masked = re.sub(r'/\*.*?\*/|//[^\n]*', lambda m: re.sub(r'[^\n]', ' ', m[0]), code, flags=re.S)
+    pattern = r'\b(' + '|'.join(re.escape(name) for name in functions) + r')\s*\('
+    edits, counts = [], {}
+    for call in re.finditer(pattern, masked):
+        depth, end, commas = 1, call.end(), []
+        while end < len(masked) and depth:
+            char = masked[end]
+            if char == ',' and depth == 1:
+                commas.append(end)
+            depth += (char == '(') - (char == ')')
+            end += 1
+        if depth:
+            raise ValueError('Unclosed shader intrinsic: ' + call[1])
+        replacement = functions[call[1]]
+        if call[1] == 'pow' and len(commas) == 1:
+            exponent = masked[commas[0] + 1:end - 1].strip()
+            vector = re.fullmatch(r'vec[234]\s*\(([^()]*)\)', exponent)
+            literals = vector[1].split(',') if vector else [exponent]
+            if all(re.fullmatch(r'\s*\d+(?:\.\d*)?(?:[eE][+-]?\d+)?\s*', value) for value in literals):
+                values = [float(value) for value in literals]
+                if values and all(value == values[0] for value in values) and values[0].is_integer():
+                    fixed = powers.get(str(int(values[0])))
+                    if fixed:
+                        replacement = fixed
+                        edits.append((commas[0], end - 1, ''))
+        edits.append((call.start(), call.start() + len(call[1]), replacement))
+        counts[replacement] = counts.get(replacement, 0) + 1
+    if not edits:
+        return code, counts
+    for start, end, replacement in sorted(edits, reverse=True):
+        code = code[:start] + replacement + code[end:]
+    lines = code.splitlines(keepends=True)
+    header = re.sub(r'/\*.*?\*/|//[^\n]*', lambda m: re.sub(r'[^\n]', ' ', m[0]), code, flags=re.S).splitlines()
+    insertion = 1
+    while insertion < len(lines) and (header[insertion].lstrip().startswith(('#', 'precision ')) or not header[insertion].strip()):
+        insertion += 1
+    return ''.join(lines[:insertion]) + helpers + '\n' + ''.join(lines[insertion:]), counts
+
+
+def apply_intrinsic_rewrites(shaders, recipe, root, folder, tools):
+    if not recipe:
+        return []
+    helpers = resolve_file(root, recipe['source']).read_text(encoding='utf-8')
+    reports = []
+    for library_index, (library, candidates) in enumerate(shaders.items()):
+        for index, (original, base) in enumerate(candidates):
+            slot = folder/str(library_index)/str(index)
+            code = resolve_file(base, original['source']).read_text(encoding='utf-8')
+            code, counts = rewrite_intrinsic_calls(code, recipe, helpers)
+            derived, output = (original, base)
+            if counts:
+                derived, output = compile_shader_replacement(original, base, code, slot, tools)
+            fallback = original.get('fallback')
+            fallback_counts = {}
+            if fallback:
+                alternate_base = Path(fallback['path']).parent
+                alternate = dict(name=original['name'] + '/fallback', stage='comp',
+                                 source='source.comp', reflection=Path(fallback['reflection']).name)
+                alternate_code = resolve_file(alternate_base, alternate['source']).read_text(encoding='utf-8')
+                alternate_code, fallback_counts = rewrite_intrinsic_calls(alternate_code, recipe, helpers)
+                if fallback_counts:
+                    rewritten, alternate_output = compile_shader_replacement(alternate, alternate_base, alternate_code, slot/'fallback', tools)
+                    derived = copy.deepcopy(derived)
+                    derived['fallback'].update(path=str(alternate_output/rewritten['spirv']),
+                                               reflection=str(alternate_output/rewritten['reflection']))
+            candidates[index] = (derived, output)
+            reports.append(dict(library=library, name=original['name'], stage=original['stage'],
+                                source=recipe['source'], calls=counts, fallback_calls=fallback_counts,
+                                reason='adapter_intrinsic_rewrites'))
+    write_json(folder/'rewrite-report.json', dict(shaders=reports))
+    return reports
+
+
+def instrument_math(code, stage, name, first_site, descriptor_set=None, probes=()):
+    operations = ('pow', 'sqrt', 'inversesqrt', 'log', 'log2', 'exp2', 'normalize', 'length', 'dot')
     sites = []
     masked = re.sub(r'/\*.*?\*/|//[^\n]*', lambda m: ' ' * len(m[0]), code, flags=re.S)
     calls = list(re.finditer(r'\b(' + '|'.join(operations) + r')\s*\(', masked))
@@ -134,15 +221,63 @@ def instrument_math(code, stage, name, first_site):
                           expression=code[call.start():end]))
         edits += [(call.start(), call.start()+len(call[1]), '_i2a_'+call[1]),
                   (end-1, end-1, ', '+str(index)+'u')]
-    if not sites:
-        return code, sites
+    main = re.search(r'\bvoid\s+main\s*\([^)]*\)\s*\{', masked)
+    if not main:
+        raise ValueError('Diagnostic shader entry not found: ' + name)
+    entry_site = first_site + len(sites)
+    sites.append(dict(shader=name, stage=stage, operation='stage-entry',
+                      line=code.count('\n', 0, main.start()) + 1, expression='main entry'))
+    edits.append((main.end(), main.end(), f'\n_i2a_record(0.0, 0.0, 0.0, {entry_site}u, 0u);\n'))
+    depth, main_end = 1, main.end()
+    while main_end < len(masked) and depth:
+        depth += (masked[main_end] == '{') - (masked[main_end] == '}')
+        main_end += 1
+    if depth:
+        raise ValueError('Unclosed diagnostic entry: ' + name)
+    outputs = re.findall(r'layout\s*\([^)]*\)\s*out\s+(?:(?:lowp|mediump|highp)\s+)?(?:float|vec[234])\s+(\w+)\s*;', masked)
+    if stage == 'vert' and re.search(r'\bgl_Position\s*=', masked[main.end():main_end]):
+        outputs.append('gl_Position')
+    observations = [dict(name='output:' + value, expression=value) for value in outputs] + list(probes)
+    end_records = []
+    for probe in observations:
+        index = first_site + len(sites)
+        expression = probe['expression']
+        if not isinstance(expression, str) or not expression.strip() or any(c in expression for c in ';{}'):
+            raise ValueError('Invalid shader observation expression: ' + name)
+        sites.append(dict(shader=name, stage=stage, operation=probe['name'],
+                          line=code.count('\n', 0, main_end) + 1, expression=expression))
+        end_records.append(f'_i2a_observe({expression}, {index}u);')
+    if end_records:
+        edits.append((main_end - 1, main_end - 1, '\n' + '\n'.join(end_records) + '\n'))
+    # Storage-image writes are outputs as well; wrap their value without
+    # evaluating coordinates or data twice, and leave all ordinary builds alone.
+    for call in re.finditer(r'\bimageStore\s*\(', masked[main.end():main_end]):
+        start = main.end() + call.end()
+        depth, end, commas = 1, start, []
+        while end < main_end and depth:
+            char = masked[end]
+            if char == ',' and depth == 1:
+                commas.append(end)
+            depth += (char == '(') - (char == ')')
+            end += 1
+        if depth or len(commas) != 2:
+            raise ValueError('Unsupported diagnostic imageStore signature: ' + name)
+        index = first_site + len(sites)
+        sites.append(dict(shader=name, stage=stage, operation='imageStore',
+                          line=code.count('\n', 0, start) + 1, expression=code[commas[-1] + 1:end - 1]))
+        edits.extend([(commas[-1] + 1, commas[-1] + 1, '_i2a_observe('),
+                      (end - 1, end - 1, ', ' + str(index) + 'u)')])
     for start, end, value in sorted(edits, reverse=True):
         code = code[:start] + value + code[end:]
-    guard = '((uint(gl_FragCoord.x) & 31u) == 0u && (uint(gl_FragCoord.y) & 31u) == 0u)' if stage == 'frag' else '((gl_GlobalInvocationID.x & 31u) == 0u)'
-    helpers = [f'layout(set={1 if stage == "frag" else 2}, binding=255, std430) buffer I2AMathDiagnostics {{ uint words[]; }} _i2a_diag;',
+    guard = {'frag': '((uint(gl_FragCoord.x) & 31u) == 0u && (uint(gl_FragCoord.y) & 31u) == 0u)',
+             'vert': '((uint(gl_VertexIndex) & 31u) == 0u)',
+             'comp': '((gl_GlobalInvocationID.x & 31u) == 0u)'}[stage]
+    descriptor_set = {'vert': 0, 'frag': 1, 'comp': 2}[stage] if descriptor_set is None else descriptor_set
+    helpers = [f'layout(set={descriptor_set}, binding=255, std430) buffer I2AMathDiagnostics {{ uint words[]; }} _i2a_diag;',
         'void _i2a_record(float x, float y, float value, uint site, uint domain) {',
         f'if (_i2a_diag.words[0] == 0u || !{guard}) return;',
         'uint at = 1u + site * 8u;',
+        'domain |= (isnan(x) || isinf(x) || isnan(y) || isinf(y)) ? 2u : 0u;',
         'atomicAdd(_i2a_diag.words[at], 1u);',
         'if (domain != 0u) atomicAdd(_i2a_diag.words[at+1u], 1u);',
         'bool bad = isnan(value) || isinf(value);',
@@ -150,7 +285,26 @@ def instrument_math(code, stage, name, first_site):
         'if ((bad || domain != 0u) && atomicCompSwap(_i2a_diag.words[at+3u], 0u, 1u) == 0u) {',
         '_i2a_diag.words[at+4u]=floatBitsToUint(x); _i2a_diag.words[at+5u]=floatBitsToUint(y);',
         '_i2a_diag.words[at+6u]=floatBitsToUint(value); _i2a_diag.words[at+7u]=domain;', '}', '}']
+    helpers.append('float _i2a_observe(float x, uint site) { _i2a_record(x, 0.0, x, site, abs(x)>65504.0 ? 4u : 0u); return x; }')
+    for size in (2, 3, 4):
+        records = ' '.join(f'_i2a_observe(x[{i}], site);' for i in range(size))
+        helpers.append(f'vec{size} _i2a_observe(vec{size} x, uint site) {{ {records} return x; }}')
     for op in operations:
+        if op in ('normalize', 'length', 'dot'):
+            for size in (1, 2, 3, 4):
+                value_type = 'float' if size == 1 else f'vec{size}'
+                params = f'{value_type} x' + (f', {value_type} y' if op == 'dot' else '')
+                result_type = value_type if op == 'normalize' else 'float'
+                expression = f'{op}(x, y)' if op == 'dot' else f'{op}(x)'
+                domain = ('x == 0.0' if size == 1 else 'all(equal(x, ' + value_type + '(0.0)))') if op == 'normalize' else 'false'
+                record = []
+                for component in range(size):
+                    x = 'x' if size == 1 else f'x[{component}]'
+                    y = ('y' if size == 1 else f'y[{component}]') if op == 'dot' else '0.0'
+                    value = f'v[{component}]' if op == 'normalize' and size != 1 else 'v'
+                    record.append(f'_i2a_record({x}, {y}, {value}, site, ({domain}) ? 1u : 0u);')
+                helpers.append(f'{result_type} _i2a_{op}({params}, uint site) {{ {result_type} v={expression}; ' + ' '.join(record) + ' return v; }')
+            continue
         binary = op == 'pow'
         domain = {'pow':'(x < 0.0 || (x == 0.0 && y <= 0.0))', 'sqrt':'(x < 0.0)',
                   'inversesqrt':'(x <= 0.0)', 'log':'(x <= 0.0)', 'log2':'(x <= 0.0)', 'exp2':'false'}[op]
@@ -168,24 +322,38 @@ def instrument_math(code, stage, name, first_site):
     return ''.join(lines[:insertion]) + '\n'.join(helpers) + '\n' + ''.join(lines[insertion:]), sites
 
 
-def compile_diagnostic_shaders(shaders, folder, tools):
-    sites, skipped = [], []
-    for library, candidates in shaders.items():
+def compile_diagnostic_shaders(shaders, folder, tools, patterns=None, probes=None):
+    if patterns is not None and (not isinstance(patterns, list) or any(not isinstance(value, str) for value in patterns)):
+        raise ValueError('Shader diagnostic patterns must be a list of names')
+    probes = probes or {}
+    sites = []
+    for library_index, (library, candidates) in enumerate(shaders.items()):
         for index, (shader, base) in enumerate(candidates):
-            if shader['stage'] == 'vert':
-                skipped.append(shader['name'])
+            if patterns is not None and not any(fnmatchcase(shader['name'], pattern) for pattern in patterns):
                 continue
+            slot = folder/str(library_index)/str(index)
             source = resolve_file(base, shader['source'])
-            code, current = instrument_math(source.read_text(encoding='utf-8'), shader['stage'], shader['name'], len(sites))
-            if not current:
-                continue
-            output, binary, reflection = compile_glsl(code, shader['stage'], folder/shader['name'], tools)
+            code, current = instrument_math(source.read_text(encoding='utf-8'), shader['stage'], shader['name'], len(sites),
+                                            probes=probes.get(shader['name'], ()))
+            output, binary, reflection = compile_glsl(code, shader['stage'], slot, tools)
             derived = dict(shader, source='source.'+shader['stage'], spirv=binary.name,
                            reflection=reflection.name, math_diagnostics=True)
-            candidates[index] = (derived, output)
             sites.extend(current)
-    write_json(folder/'sites.json', dict(sites=sites, uninstrumented_vertex=skipped,
-        sampling='fragment 1/1024 pixels; compute 1/32 X invocations; original operations unchanged'))
+            fallback = shader.get('fallback')
+            if fallback:
+                # The compute fallback retains the vertex descriptor contract (set 0).
+                alternate_source = Path(fallback['path']).parent / 'source.comp'
+                alternate_name = shader['name'] + '/fallback'
+                alternate, current = instrument_math(alternate_source.read_text(encoding='utf-8'), 'comp',
+                                                      alternate_name, len(sites), descriptor_set=0)
+                alternate_output, alternate_binary, alternate_reflection = compile_glsl(alternate, 'comp', slot/'fallback', tools)
+                derived['fallback'] = dict(fallback, path=str(alternate_binary), reflection=str(alternate_reflection))
+                sites.extend(current)
+            candidates[index] = (derived, output)
+    write_json(folder/'sites.json', dict(sites=sites, uninstrumented_vertex=[],
+        sampling='fragment 1/1024 pixels; vertex 1/32 indices; compute 1/32 X invocations; original operations unchanged',
+        flags={'1': 'invalid operation domain', '2': 'nonfinite input', '4': 'observation exceeds finite FP16 range'},
+        limitations='Sampled intrinsic calls, entry and outputs, plus selected expressions; early returns bypass final-output probes'))
     return sites
 
 
@@ -289,7 +457,10 @@ def assemble_shader_plan(context, source, spec):
     executable=context.identity.prefix+context.identity.executable
     embedded,generated=compile_embedded_shaders(source.read(executable),recipes,context.work/'shader-cache/embedded',context.toolchain['shaders'])
     shaders.update(generated)
-    sites = compile_diagnostic_shaders(shaders, context.work/'shader-cache/diagnostics', context.toolchain['shaders']) if context.shader_diagnostics else []
+    reports.extend(apply_intrinsic_rewrites(shaders,repair.get('intrinsics'),root,
+                   context.work/'shader-cache/intrinsics',context.toolchain['shaders']))
+    sites = compile_diagnostic_shaders(shaders, context.work/'shader-cache/diagnostics', context.toolchain['shaders'],
+                                      context.host.get('shader_diagnostic_patterns'), context.host.get('shader_diagnostic_probes')) if context.shader_diagnostics else []
     return dict(executable=executable,libraries=libraries+embedded,shaders=shaders,replacements=reports,diagnostics=sites)
 
 

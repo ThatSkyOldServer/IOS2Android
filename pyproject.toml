@@ -6,5 +6,8 @@ description = "Offline ARM64 iOS image and Android host composition"
 license = {file = "LICENSE"}
 dependencies = ["lief", "capstone", "lzfse", "nibarchive"]
 
+[project.optional-dependencies]
+textures = ["texture2ddecoder==1.0.6", "etcpak==0.9.15"]
+
 [project.scripts]
 i2a = "porter.__main__:main"

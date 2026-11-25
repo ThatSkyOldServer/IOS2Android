@@ -10,7 +10,13 @@ static void metal_render_stop(const char *reason,const char *detail) {
 static void metal_render_lock(struct MetalCommand *command) { pthread_mutex_lock(&command->pool_owner->mutex); metal_render_locked_queue=command->pool_owner; }
 static void metal_render_unlock(struct MetalCommand *command) { metal_render_locked_queue=NULL; pthread_mutex_unlock(&command->pool_owner->mutex); }
 struct MetalBoundBuffer { struct MetalBuffer *buffer; VkDeviceSize offset; };
-struct MetalDescriptorPoolChunk { VkDescriptorPool pool; unsigned sets,per_draw[6]; struct MetalDescriptorPoolChunk *next; };
+struct MetalDescriptorPoolChunk {
+    VkDescriptorPool pool; VkDescriptorSet allocated_sets[64];
+    struct MetalDescriptorSnapshot *snapshots[32];
+    const struct ShaderSpec *vertex,*fragment;
+    unsigned sets,allocated,limit,dynamic_uniform,dynamic_storage;
+    struct MetalDescriptorPoolChunk *next;
+};
 struct MetalDescriptorValue { uint64_t resource,offset,range; };
 struct MetalDescriptorSnapshot {
     struct MetalPipeline *pipeline;
@@ -20,45 +26,62 @@ struct MetalDescriptorSnapshot {
     struct MetalDescriptorSnapshot *next;
     struct MetalDescriptorValue values[];
 };
-struct MetalRenderSnapshot { struct MetalTexture *source,*texture; unsigned generation; struct MetalRenderSnapshot *next; };
-struct MetalSnapshotCache { struct MetalTexture *texture; struct MetalSnapshotCache *next; };
-static struct MetalSnapshotCache *metal_snapshot_cache;
+struct MetalRenderSnapshot { struct MetalTexture *source,*texture; struct MetalRenderEncoder *encoder; unsigned generation; struct MetalRenderSnapshot *next; };
+static struct MetalRenderSnapshot *metal_snapshot_cache;
 static size_t metal_snapshot_cache_bytes;
 static unsigned metal_snapshot_cache_count;
 static pthread_mutex_t metal_snapshot_cache_mutex=PTHREAD_MUTEX_INITIALIZER;
 static struct MetalDescriptorPoolChunk *metal_descriptor_pool_cache;
 static unsigned metal_descriptor_pool_cache_count;
 static pthread_mutex_t metal_descriptor_pool_cache_mutex=PTHREAD_MUTEX_INITIALIZER;
-static struct MetalTexture *metal_snapshot_cached(struct MetalTexture *source) {
+static struct MetalRenderSnapshot *metal_snapshot_cached(struct MetalTexture *source) {
     pthread_mutex_lock(&metal_snapshot_cache_mutex);
-    struct MetalSnapshotCache **slot=&metal_snapshot_cache;
+    struct MetalRenderSnapshot **slot=&metal_snapshot_cache;
     while (*slot) {
         struct MetalTexture *texture=(*slot)->texture;
         if (texture->format.metal==source->format.metal && texture->type==source->type && texture->width==source->width && texture->height==source->height &&
             texture->depth==source->depth && texture->mips==source->mips && texture->samples==source->samples && texture->array_length==source->array_length) {
-            struct MetalSnapshotCache *entry=*slot; *slot=entry->next;
+            struct MetalRenderSnapshot *entry=*slot; *slot=entry->next;
             --metal_snapshot_cache_count; metal_snapshot_cache_bytes-=texture->allocation;
-            pthread_mutex_unlock(&metal_snapshot_cache_mutex); free(entry); return texture;
+            pthread_mutex_unlock(&metal_snapshot_cache_mutex);entry->next=NULL;return entry;
         }
         slot=&(*slot)->next;
     }
     pthread_mutex_unlock(&metal_snapshot_cache_mutex); return NULL;
 }
-static void metal_snapshot_return(struct MetalTexture *texture) {
-    struct MetalSnapshotCache *entry=malloc(sizeof(*entry));
+static void metal_snapshot_return(struct MetalRenderSnapshot *entry) {
+    struct MetalTexture *texture=entry->texture;
     pthread_mutex_lock(&metal_snapshot_cache_mutex);
-    if (!entry || metal_snapshot_cache_count>=32 || texture->allocation>64*1024*1024-metal_snapshot_cache_bytes) {
+    if (metal_snapshot_cache_count>=32 || texture->allocation>64*1024*1024-metal_snapshot_cache_bytes) {
         pthread_mutex_unlock(&metal_snapshot_cache_mutex); free(entry); metal_object_release((Word)texture); return;
     }
-    *entry=(struct MetalSnapshotCache){texture,metal_snapshot_cache}; metal_snapshot_cache=entry;
+    entry->source=NULL;entry->encoder=NULL;entry->next=metal_snapshot_cache;metal_snapshot_cache=entry;
     ++metal_snapshot_cache_count; metal_snapshot_cache_bytes+=texture->allocation;
     pthread_mutex_unlock(&metal_snapshot_cache_mutex);
 }
-static struct MetalDescriptorPoolChunk *metal_descriptor_pool_acquire(const unsigned counts[6]) {
+static size_t metal_snapshot_trim(void) {
+    pthread_mutex_lock(&metal_snapshot_cache_mutex);
+    struct MetalRenderSnapshot *entries=metal_snapshot_cache;
+    size_t bytes=metal_snapshot_cache_bytes;
+    metal_snapshot_cache=NULL;metal_snapshot_cache_bytes=0;metal_snapshot_cache_count=0;
+    pthread_mutex_unlock(&metal_snapshot_cache_mutex);
+    while(entries) {
+        struct MetalRenderSnapshot *next=entries->next;
+        metal_object_release((Word)entries->texture);free(entries);entries=next;
+    }
+    return bytes;
+}
+static int metal_descriptor_pool_matches(const struct MetalDescriptorPoolChunk *chunk,const struct MetalPipeline *pipeline) {
+    /* Shader metadata is immutable and describes every binding and immutable
+     * sampler. Equal metadata and dynamic types yield compatible set layouts. */
+    return chunk->vertex==pipeline->vertex->spec && chunk->fragment==(pipeline->fragment ? pipeline->fragment->spec : NULL) &&
+        chunk->dynamic_uniform==pipeline->dynamic_uniform && chunk->dynamic_storage==pipeline->dynamic_storage;
+}
+static struct MetalDescriptorPoolChunk *metal_descriptor_pool_acquire(const struct MetalPipeline *pipeline) {
     pthread_mutex_lock(&metal_descriptor_pool_cache_mutex);
     struct MetalDescriptorPoolChunk **slot=&metal_descriptor_pool_cache;
     while (*slot) {
-        if (!memcmp((*slot)->per_draw,counts,sizeof((*slot)->per_draw))) {
+        if (metal_descriptor_pool_matches(*slot,pipeline)) {
             struct MetalDescriptorPoolChunk *chunk=*slot; *slot=chunk->next; --metal_descriptor_pool_cache_count;
             pthread_mutex_unlock(&metal_descriptor_pool_cache_mutex); chunk->next=NULL; chunk->sets=0; return chunk;
         }
@@ -66,20 +89,29 @@ static struct MetalDescriptorPoolChunk *metal_descriptor_pool_acquire(const unsi
     }
     pthread_mutex_unlock(&metal_descriptor_pool_cache_mutex);
     struct MetalDescriptorPoolChunk *chunk=calloc(1,sizeof(*chunk)); if (!chunk) return NULL;
-    memcpy(chunk->per_draw,counts,sizeof(chunk->per_draw));
+    chunk->vertex=pipeline->vertex->spec;chunk->fragment=pipeline->fragment ? pipeline->fragment->spec : NULL;
+    chunk->dynamic_uniform=pipeline->dynamic_uniform;chunk->dynamic_storage=pipeline->dynamic_storage;chunk->limit=64;
+    const unsigned *counts=pipeline->descriptor_counts;
     const VkDescriptorType types[]={VK_DESCRIPTOR_TYPE_SAMPLER,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC};
     VkDescriptorPoolSize sizes[6]; unsigned used=0;
     for (unsigned i=0;i<COUNT(types);++i) if (counts[i]) sizes[used++]=(VkDescriptorPoolSize){types[i],32*counts[i]};
     VkDescriptorPoolCreateInfo info={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=64,.poolSizeCount=used,.pPoolSizes=sizes};
     if (VKD(vkCreateDescriptorPool)(vulkan.device,&info,NULL,&chunk->pool)!=VK_SUCCESS) { free(chunk); return NULL; }
+    metal_memory_add(3,sizeof(*chunk));
     return chunk;
 }
 static void metal_descriptor_pool_return(struct MetalDescriptorPoolChunk *chunk) {
-    VkResult result=VKD(vkResetDescriptorPool)(vulkan.device,chunk->pool,0);
+    /* The command fence has passed. Reuse allocated sets and snapshot storage;
+     * rewrite active bindings before the next recording uses them. */
     pthread_mutex_lock(&metal_descriptor_pool_cache_mutex);
-    if (result!=VK_SUCCESS || metal_descriptor_pool_cache_count>=128) {
-        pthread_mutex_unlock(&metal_descriptor_pool_cache_mutex); VKD(vkDestroyDescriptorPool)(vulkan.device,chunk->pool,NULL); free(chunk); return;
+    if (metal_descriptor_pool_cache_count>=128) {
+        pthread_mutex_unlock(&metal_descriptor_pool_cache_mutex); VKD(vkDestroyDescriptorPool)(vulkan.device,chunk->pool,NULL);
+        for(unsigned i=0;i<COUNT(chunk->snapshots);++i)if(chunk->snapshots[i]) {
+            struct MetalDescriptorSnapshot *entry=chunk->snapshots[i];
+            metal_memory_sub(3,sizeof(*entry)+entry->count*sizeof(*entry->values));free(entry);
+        }
+        metal_memory_sub(3,sizeof(*chunk));free(chunk); return;
     }
     chunk->sets=0; chunk->next=metal_descriptor_pool_cache; metal_descriptor_pool_cache=chunk; ++metal_descriptor_pool_cache_count;
     pthread_mutex_unlock(&metal_descriptor_pool_cache_mutex);
@@ -137,7 +169,6 @@ struct MetalRenderState {
     struct MetalDescriptorPoolChunk *pools;
     struct MetalDescriptorSnapshot *descriptors[32];
     unsigned descriptor_count;
-    struct MetalRenderSnapshot *snapshots;
     VkPipeline bound_pipeline;
     struct MetalBoundBuffer bound_vertices[31];
     VkBuffer bound_index;
@@ -152,7 +183,9 @@ struct MetalRenderEncoder {
     struct MetalRenderState *state;
     unsigned ended;
     struct MetalRenderEncoder *next;
+    struct MetalLifetime lifetime;
 };
+static void metal_render_destroy(Word value) {metal_memory_sub(3,sizeof(struct MetalRenderEncoder));free((void *)value);}
 /* The ObjC identity can outlive endEncoding and completion. Only the large
  * recording state belongs to the GPU submission; recycle it after its fence
  * and completion handlers. Keep identity/device/label usable for the client. */
@@ -194,7 +227,8 @@ static void metal_render_pass_bundle(struct MetalRenderEncoder *encoder) {
         entry=calloc(1,sizeof(*entry)); if (!entry) metal_render_stop("Allocation failed","Render pass bundle"); entry->key=key;
         for (unsigned i=0;i<key.attachment_count;++i) metal_render_result(VKD(vkCreateImageView)(vulkan.device,&key.views[i],NULL,&entry->views[i]),"vkCreateImageView attachment");
         VkSubpassDescription subpass={.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS,.colorAttachmentCount=key.color_count,.pColorAttachments=key.colors,.pDepthStencilAttachment=key.depth_format ? &key.depth : NULL};
-        VkRenderPassCreateInfo info={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,.attachmentCount=key.attachment_count,.pAttachments=key.descriptions,.subpassCount=1,.pSubpasses=&subpass};
+        VkRenderPassCreateInfo info={.sType=VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,.attachmentCount=key.attachment_count,.pAttachments=key.descriptions,.subpassCount=1,.pSubpasses=&subpass,
+            .dependencyCount=1,.pDependencies=&metal_attachment_dependency};
         metal_render_result(VKD(vkCreateRenderPass)(vulkan.device,&info,NULL,&entry->first_pass),"vkCreateRenderPass first");
         for (unsigned i=0;i<key.attachment_count;++i) { key.descriptions[i].loadOp=VK_ATTACHMENT_LOAD_OP_LOAD; if (encoder->state->attachments[i]->format.aspects&VK_IMAGE_ASPECT_STENCIL_BIT) key.descriptions[i].stencilLoadOp=VK_ATTACHMENT_LOAD_OP_LOAD; }
         metal_render_result(VKD(vkCreateRenderPass)(vulkan.device,&info,NULL,&entry->load_pass),"vkCreateRenderPass continuation");
@@ -285,11 +319,11 @@ static Word metal_render_encoder(struct MetalCommand *command,const char *select
     if (!encoder->state) { free(encoder); return 0; }
     metal_memory_add(3,sizeof(*encoder));
     encoder->object=(struct MetalResource){.isa=external_class("_OBJC_CLASS_$_I2AMetalRenderCommandEncoder"),.device=metal_command_device(&command->object)};
-    encoder->command=command; encoder->state->width=encoder->state->height=UINT32_MAX; encoder->state->samples=VK_SAMPLE_COUNT_1_BIT;
+    encoder->command=(void *)metal_object_retain((Word)command);encoder->state->width=encoder->state->height=UINT32_MAX;encoder->state->samples=VK_SAMPLE_COUNT_1_BIT;
     encoder->state->key=(struct MetalPipelineKey){.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,.front=VK_FRONT_FACE_CLOCKWISE,.polygon=VK_POLYGON_MODE_FILL};
     encoder->state->depth=(VkAttachmentReference){VK_ATTACHMENT_UNUSED,VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     pthread_mutex_lock(&command->mutex);
-    if (command->object.content[1]>=2 || command->active_encoder) { pthread_mutex_unlock(&command->mutex); metal_render_state_return(encoder->state); metal_memory_sub(3,sizeof(*encoder)); free(encoder); metal_render_stop("Command cannot create a render encoder",selector); }
+    if (command->object.content[1]>=2 || command->active_encoder) {pthread_mutex_unlock(&command->mutex);metal_render_state_return(encoder->state);metal_memory_sub(3,sizeof(*encoder));metal_object_release((Word)command);free(encoder);metal_render_stop("Command cannot create a render encoder",selector);}
     command->active_encoder=(Word)encoder; encoder->next=command->render_encoders; command->render_encoders=encoder;
     pthread_mutex_unlock(&command->mutex);
     struct MetalDescriptorArray *colors=(void *)descriptor->colors;
@@ -317,9 +351,9 @@ static Word metal_render_encoder(struct MetalCommand *command,const char *select
     if (!encoder->state->attachment_count) { encoder->state->width=encoder->state->height=1; }
     metal_render_pass_bundle(encoder);
     encoder->state->viewport=(VkViewport){0,0,(float)encoder->state->width,(float)encoder->state->height,0,1}; encoder->state->scissor=(VkRect2D){{0,0},{encoder->state->width,encoder->state->height}};
-    static unsigned logged;
-    if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<32) LOG("Vulkan render encoder ready: %ux%u colorSlots=%u attachments=%u",encoder->state->width,encoder->state->height,encoder->state->color_count,encoder->state->attachment_count);
-    return (Word)encoder;
+    LOG_LIMITED(32,"Vulkan render encoder ready: %ux%u colorSlots=%u attachments=%u",encoder->state->width,encoder->state->height,encoder->state->color_count,encoder->state->attachment_count);
+    metal_lifetime_init((Word)encoder,__builtin_offsetof(struct MetalRenderEncoder,lifetime),metal_render_destroy);
+    return metal_retain_autorelease((Word)encoder);
 }
 static void metal_render_end(struct MetalRenderEncoder *encoder,const char *selector) {
     metal_render_check(encoder,selector); metal_render_lock(encoder->command);
@@ -329,6 +363,7 @@ static void metal_render_end(struct MetalRenderEncoder *encoder,const char *sele
         .dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT};
     VKD(vkCmdPipelineBarrier)(encoder->command->command,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&barrier,0,NULL,0,NULL);
     metal_render_unlock(encoder->command); encoder->ended=1; encoder->command->active_encoder=0; ++encoder->command->recorded_operations;
+    metal_object_release((Word)encoder->command);
 }
 static void metal_render_pipeline(struct MetalRenderEncoder *encoder,const char *selector,struct MetalPipeline *pipeline) {
     metal_render_check(encoder,selector);
@@ -360,8 +395,9 @@ static void metal_render_buffer(struct MetalRenderEncoder *encoder,const char *s
 static void metal_render_texture(struct MetalRenderEncoder *encoder,const char *selector,struct MetalTexture *texture,Word index) {
     metal_render_check(encoder,selector);
     if (index>=128 || (texture && (texture->object.isa!=external_class("_OBJC_CLASS_$_I2AMetalTexture") || !(texture->native_usage&VK_IMAGE_USAGE_SAMPLED_BIT)))) metal_render_stop("Invalid render texture binding",selector);
-    encoder->state->textures[strstr(selector,"Fragment")!=NULL][index]=texture;
-    if (texture) metal_command_texture(encoder->command,texture);
+    unsigned stage_index=strstr(selector,"Fragment")!=NULL;
+    if (texture && encoder->state->textures[stage_index][index]!=texture) metal_command_use(encoder->command,(Word)texture);
+    encoder->state->textures[stage_index][index]=texture;
 }
 static void metal_render_sampler(struct MetalRenderEncoder *encoder,const char *selector,struct MetalSampler *sampler,Word index) {
     metal_render_check(encoder,selector);
@@ -382,33 +418,42 @@ static void metal_render_prepare_snapshots(struct MetalRenderEncoder *encoder) {
             if (binding->type!=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || binding->metal_index>=128) continue;
             struct MetalTexture *source=encoder->state->textures[stage_index][binding->metal_index];
             if (!source || !metal_render_feedback(encoder,source)) continue;
-            struct MetalRenderSnapshot *snapshot=encoder->state->snapshots;
+            struct MetalRenderSnapshot *snapshot=encoder->command->snapshots;
             while (snapshot && snapshot->source!=source) snapshot=snapshot->next;
             if (snapshot) continue;
-            snapshot=calloc(1,sizeof(*snapshot)); if (!snapshot) metal_render_stop("Allocation failed","Render feedback snapshot");
-            struct MetalDescriptor *description=(void *)metal_descriptor_create(MD_TEXTURE);
-            const char *names[]={"pixelFormat","textureType","width","height","depth","mipmapLevelCount","sampleCount","arrayLength","usage","resourceOptions"};
-            Word values[]={source->format.metal,source->type,source->width,source->height,source->depth,source->mips,source->samples,source->array_length,1,0x20};
-            for (unsigned j=0;j<COUNT(names);++j) metal_property_assign(description,names[j],values[j]);
-            snapshot->source=source; snapshot->texture=metal_snapshot_cached(source);
-            int reused=snapshot->texture!=NULL;
-            if (!snapshot->texture) snapshot->texture=(void *)metal_texture_new(source->object.device,"Render feedback snapshot",description);
-            metal_object_release((Word)description);
-            if (!snapshot->texture) { free(snapshot); metal_render_stop("Cannot allocate native attachment snapshot",function->spec->name); }
-            snapshot->generation=UINT_MAX; snapshot->next=encoder->state->snapshots; encoder->state->snapshots=snapshot;
+            snapshot=metal_snapshot_cached(source);
+            int reused=snapshot!=NULL;
+            size_t reclaimed=0;
+            if(!snapshot) {
+                snapshot=calloc(1,sizeof(*snapshot));if(!snapshot)metal_render_stop("Allocation failed","Render feedback snapshot");
+                struct MetalDescriptor *description=(void *)metal_descriptor_create(MD_TEXTURE);
+                const char *names[]={"pixelFormat","textureType","width","height","depth","mipmapLevelCount","sampleCount","arrayLength","usage","resourceOptions"};
+                Word values[]={source->format.metal,source->type,source->width,source->height,source->depth,source->mips,source->samples,source->array_length,1,0x20};
+                for(unsigned j=0;j<COUNT(names);++j)metal_property_assign(description,names[j],values[j]);
+                snapshot->texture=(void *)metal_texture_new(source->object.device,"Render feedback snapshot",description);
+                reclaimed=metal_texture_creation_reclaimed;
+                metal_object_release((Word)description);
+            }
+            if(!snapshot->texture) {
+                char detail[384];snprintf(detail,sizeof(detail),"shader=%s result=%d Metal=%u VkFormat=%d type=%lu extent=%lux%lux%lu mips=%lu samples=%lu layers=%lu usage=0x%x source_allocation=%llu reclaimed_idle_bytes=%zu",
+                    function->spec->name,metal_texture_creation_result,source->format.metal,source->format.format,source->type,source->width,source->height,source->depth,source->mips,source->samples,source->layers,
+                    source->native_usage,(unsigned long long)source->allocation,reclaimed);
+                free(snapshot);metal_render_stop("Cannot allocate native attachment snapshot",detail);
+            }
+            snapshot->source=source;snapshot->encoder=NULL;snapshot->generation=UINT_MAX;snapshot->next=encoder->command->snapshots;encoder->command->snapshots=snapshot;
             metal_command_texture(encoder->command,snapshot->texture);
-            static unsigned logged;
-            if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<24) LOG("Vulkan attachment snapshot %s: %s texture=%u %lux%lu aspects=0x%x",reused ? "reused" : "allocated",function->spec->name,binding->metal_index,source->width,source->height,source->format.aspects);
+            LOG_LIMITED(24,"Vulkan attachment snapshot %s: %s texture=%u %lux%lu aspects=0x%x",reused ? "reused" : "allocated",function->spec->name,binding->metal_index,source->width,source->height,source->format.aspects);
         }
     }
 }
 static struct MetalTexture *metal_render_snapshot(struct MetalRenderEncoder *encoder,struct MetalTexture *source) {
-    struct MetalRenderSnapshot *snapshot=encoder->state->snapshots;
+    struct MetalRenderSnapshot *snapshot=encoder->command->snapshots;
     while (snapshot && snapshot->source!=source) snapshot=snapshot->next;
     if (!snapshot) metal_render_stop("Missing prepared attachment snapshot","draw");
-    if (snapshot->generation==encoder->state->draws) return snapshot->texture;
-     
-    metal_render_begin(encoder); metal_render_close_pass(encoder);
+    if(snapshot->encoder==encoder && snapshot->generation==encoder->state->draws)return snapshot->texture;
+    /* Capture history before the first attachment load can discard it.
+     * Explicit clears still define the sampled attachment's initial contents. */
+    metal_render_close_pass(encoder);
     metal_render_transition(encoder,source,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_ACCESS_TRANSFER_READ_BIT);
     metal_render_transition(encoder,snapshot->texture,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_ACCESS_TRANSFER_WRITE_BIT);
     for (uint32_t level=0;level<source->mips;++level) {
@@ -419,8 +464,26 @@ static struct MetalTexture *metal_render_snapshot(struct MetalRenderEncoder *enc
             VKD(vkCmdCopyImage)(encoder->command->command,source->image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,snapshot->texture->image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&copy);
         }
     }
+    if (!encoder->state->started) {
+        for (unsigned i=0;i<encoder->state->attachment_count;++i) {
+            if (encoder->state->attachments[i]!=source) continue;
+            const VkAttachmentDescription *description=&encoder->state->descriptions[i];
+            VkImageSubresourceRange range=encoder->state->view_descriptions[i].subresourceRange;
+            VkImageAspectFlags clear=0;
+            if (description->loadOp==VK_ATTACHMENT_LOAD_OP_CLEAR) clear=range.aspectMask&~VK_IMAGE_ASPECT_STENCIL_BIT;
+            if (description->stencilLoadOp==VK_ATTACHMENT_LOAD_OP_CLEAR) clear|=range.aspectMask&VK_IMAGE_ASPECT_STENCIL_BIT;
+            if (!clear) continue;
+            VkMemoryBarrier barrier={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT,.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT};
+            VKD(vkCmdPipelineBarrier)(encoder->command->command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&barrier,0,NULL,0,NULL);
+            range.aspectMask=clear;
+            if (clear==VK_IMAGE_ASPECT_COLOR_BIT)
+                VKD(vkCmdClearColorImage)(encoder->command->command,snapshot->texture->image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&encoder->state->clear[i].color,1,&range);
+            else
+                VKD(vkCmdClearDepthStencilImage)(encoder->command->command,snapshot->texture->image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&encoder->state->clear[i].depthStencil,1,&range);
+        }
+    }
     metal_render_transition(encoder,snapshot->texture,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_ACCESS_SHADER_READ_BIT);
-    snapshot->generation=encoder->state->draws; ++encoder->command->recorded_operations;
+    snapshot->encoder=encoder;snapshot->generation=encoder->state->draws;++encoder->command->recorded_operations;
     return snapshot->texture;
 }
 static void metal_render_descriptors(struct MetalRenderEncoder *encoder) {
@@ -441,6 +504,7 @@ static void metal_render_descriptors(struct MetalRenderEncoder *encoder) {
                 .descriptorCount=1,.descriptorType=metal_pipeline_binding_type(pipeline,binding->type)};
             if (binding->type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && binding->metal_index==UINT32_MAX-1) {
                 struct MetalBuffer *diagnostic=metal_math_buffer(encoder->command);
+                metal_math_trace_render(encoder,function);
                 *buffer_info=(VkDescriptorBufferInfo){diagnostic->buffer,0,diagnostic->length}; write.pBufferInfo=buffer_info;
             } else if (binding->type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || binding->type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
                 if (binding->metal_index>=31) metal_render_stop("Invalid shader buffer index",function->spec->name);
@@ -490,6 +554,10 @@ static void metal_render_descriptors(struct MetalRenderEncoder *encoder) {
         hash=(hash^values[i].offset)*UINT64_C(1099511628211);
         hash=(hash^values[i].range)*UINT64_C(1099511628211);
     }
+    /* Aligned handles and offsets have little entropy in the low bucket bits. */
+    hash=(hash^(hash>>30))*UINT64_C(0xbf58476d1ce4e5b9);
+    hash=(hash^(hash>>27))*UINT64_C(0x94d049bb133111eb);
+    hash^=hash>>31;
     unsigned bucket=(unsigned)hash&(COUNT(encoder->state->descriptors)-1);
     struct MetalDescriptorSnapshot *snapshot=encoder->state->descriptors[bucket];
     while (snapshot && (snapshot->hash!=hash || snapshot->pipeline!=pipeline || snapshot->count!=write_count ||
@@ -500,32 +568,42 @@ static void metal_render_descriptors(struct MetalRenderEncoder *encoder) {
     VkDescriptorSet sets[2];
     if (snapshot) memcpy(sets,snapshot->sets,sizeof(sets));
     else {
-        const unsigned *counts=pipeline->descriptor_counts;
         struct MetalDescriptorPoolChunk *chunk=encoder->state->pools;
-        int fits=chunk && chunk->sets<=62 && !memcmp(counts,chunk->per_draw,sizeof(chunk->per_draw));
+        int fits=chunk && chunk->sets+2<=chunk->limit && metal_descriptor_pool_matches(chunk,pipeline);
         if (!fits) {
-            chunk=metal_descriptor_pool_acquire(counts); if (!chunk) metal_render_stop("Allocation failed","Render descriptor pool");
+            chunk=metal_descriptor_pool_acquire(pipeline); if (!chunk) metal_render_stop("Allocation failed","Render descriptor pool");
             chunk->next=encoder->state->pools; encoder->state->pools=chunk;
         }
-        VkDescriptorSetAllocateInfo allocate={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=chunk->pool,
-            .descriptorSetCount=2,.pSetLayouts=pipeline->sets};
-        VkResult result=VKD(vkAllocateDescriptorSets)(vulkan.device,&allocate,sets);
-        if ((result==VK_ERROR_OUT_OF_POOL_MEMORY || result==VK_ERROR_FRAGMENTED_POOL) && chunk->sets) {
-            chunk->sets=64;
-            chunk=metal_descriptor_pool_acquire(counts);if(!chunk)metal_render_stop("Allocation failed","Render descriptor pool");
-            chunk->next=encoder->state->pools;encoder->state->pools=chunk;allocate.descriptorPool=chunk->pool;
-            result=VKD(vkAllocateDescriptorSets)(vulkan.device,&allocate,sets);
+        if(chunk->sets<chunk->allocated)memcpy(sets,chunk->allocated_sets+chunk->sets,sizeof(sets));
+        else {
+            VkDescriptorSetAllocateInfo allocate={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=chunk->pool,
+                .descriptorSetCount=2,.pSetLayouts=pipeline->sets};
+            VkResult result=VKD(vkAllocateDescriptorSets)(vulkan.device,&allocate,sets);
+            if ((result==VK_ERROR_OUT_OF_POOL_MEMORY || result==VK_ERROR_FRAGMENTED_POOL) && chunk->sets) {
+                chunk->limit=chunk->allocated;
+                chunk=metal_descriptor_pool_acquire(pipeline);if(!chunk)metal_render_stop("Allocation failed","Render descriptor pool");
+                chunk->next=encoder->state->pools;encoder->state->pools=chunk;allocate.descriptorPool=chunk->pool;
+                if(chunk->allocated){memcpy(sets,chunk->allocated_sets,sizeof(sets));result=VK_SUCCESS;}
+                else result=VKD(vkAllocateDescriptorSets)(vulkan.device,&allocate,sets);
+            }
+            metal_render_result(result,"vkAllocateDescriptorSets");
+            if(chunk->sets==chunk->allocated){memcpy(chunk->allocated_sets+chunk->allocated,sets,sizeof(sets));chunk->allocated+=2;}
         }
-        metal_render_result(result,"vkAllocateDescriptorSets"); chunk->sets+=2;
-        for (unsigned i=0;i<write_count;++i) writes[i].dstSet=sets[stages[i]];
-        if (write_count) VKD(vkUpdateDescriptorSets)(vulkan.device,write_count,writes,0,NULL);
-        if (encoder->state->descriptor_count<128) {
-            size_t bytes=sizeof(struct MetalDescriptorSnapshot)+write_count*sizeof(*values);
-            struct MetalDescriptorSnapshot *entry=malloc(bytes);
-            if (entry) {
-                *entry=(struct MetalDescriptorSnapshot){.pipeline=pipeline,.sets={sets[0],sets[1]},.hash=hash,.count=write_count,.next=encoder->state->descriptors[bucket]};
-                memcpy(entry->values,values,write_count*sizeof(*values));
-                encoder->state->descriptors[bucket]=entry; ++encoder->state->descriptor_count; metal_memory_add(3,bytes);
+        chunk->sets+=2;
+        unsigned pair=chunk->sets/2-1;
+        struct MetalDescriptorSnapshot *entry=chunk->snapshots[pair];
+        for(unsigned i=0;i<write_count;++i)writes[i].dstSet=sets[stages[i]];
+        if(write_count)VKD(vkUpdateDescriptorSets)(vulkan.device,write_count,writes,0,NULL);
+        if(!entry && encoder->state->descriptor_count<128) {
+            size_t bytes=sizeof(*entry)+write_count*sizeof(*values);entry=malloc(bytes);
+            if(entry){chunk->snapshots[pair]=entry;metal_memory_add(3,bytes);}
+        }
+        if(entry) {
+            *entry=(struct MetalDescriptorSnapshot){.pipeline=pipeline,.sets={sets[0],sets[1]},.hash=hash,.count=write_count};
+            memcpy(entry->values,values,write_count*sizeof(*values));
+            if(encoder->state->descriptor_count<128) {
+                entry->next=encoder->state->descriptors[bucket];encoder->state->descriptors[bucket]=entry;
+                ++encoder->state->descriptor_count;
             }
         }
     }
@@ -580,14 +658,14 @@ static void metal_render_draw(struct MetalRenderEncoder *encoder,const char *sel
         barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; barrier.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT|VK_ACCESS_HOST_READ_BIT;
         VKD(vkCmdPipelineBarrier)(encoder->command->command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT|VK_PIPELINE_STAGE_HOST_BIT,0,1,&barrier,0,NULL,0,NULL);
         metal_render_unlock(encoder->command); ++encoder->state->draws; ++encoder->command->recorded_operations;
-        static unsigned logged; if (!logged++) LOG("Verified non-rasterizing vertex executed as one compute invocation");
+        LOG_LIMITED(1,"Verified non-rasterizing vertex executed as one compute invocation");
         return;
     }
     metal_render_prepare_snapshots(encoder);
     metal_render_lock(encoder->command);
     metal_render_prepare_draw(encoder,primitive); VKD(vkCmdDraw)(encoder->command->command,(uint32_t)count,1,(uint32_t)start,0);
     metal_render_unlock(encoder->command); ++encoder->state->draws; ++encoder->command->recorded_operations;
-    static unsigned logged; if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<32) LOG("Vulkan draw recorded: %s vertices=%zu",encoder->state->pipeline->vertex->spec->name,count);
+    LOG_LIMITED(32,"Vulkan draw recorded: %s vertices=%zu",encoder->state->pipeline->vertex->spec->name,count);
 }
 static void metal_render_draw_indexed_instances(struct MetalRenderEncoder *encoder,const char *selector,Word primitive,size_t count,Word type,struct MetalBuffer *buffer,size_t offset,size_t instances) {
     metal_render_check(encoder,selector); size_t element=type ? 4 : 2;
@@ -604,7 +682,7 @@ static void metal_render_draw_indexed_instances(struct MetalRenderEncoder *encod
     }
     VKD(vkCmdDrawIndexed)(encoder->command->command,(uint32_t)count,(uint32_t)instances,0,0,0);
     metal_render_unlock(encoder->command); ++encoder->state->draws; ++encoder->command->recorded_operations;
-    static unsigned logged; if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<32) LOG("Vulkan indexed draw recorded: %s indices=%zu instances=%zu",encoder->state->pipeline->vertex->spec->name,count,instances);
+    LOG_LIMITED(32,"Vulkan indexed draw recorded: %s indices=%zu instances=%zu",encoder->state->pipeline->vertex->spec->name,count,instances);
 }
 static void metal_render_draw_indexed(struct MetalRenderEncoder *encoder,const char *selector,Word primitive,size_t count,Word type,struct MetalBuffer *buffer,size_t offset) {
     metal_render_draw_indexed_instances(encoder,selector,primitive,count,type,buffer,offset,1);
@@ -622,16 +700,21 @@ static void metal_render_cleanup(struct MetalCommand *command) {
         if (encoder->state->pass_bundle) { metal_pass_bundle_return(encoder->state->pass_bundle); encoder->state->pass_bundle=NULL; }
         encoder->state->framebuffer=VK_NULL_HANDLE; encoder->state->first_pass=encoder->state->load_pass=VK_NULL_HANDLE;
         memset(encoder->state->views,0,sizeof(encoder->state->views));
-        for (unsigned i=0;i<COUNT(encoder->state->descriptors);++i) {
-            struct MetalDescriptorSnapshot *entry=encoder->state->descriptors[i];
-            while (entry) {
-                struct MetalDescriptorSnapshot *next=entry->next;
-                metal_memory_sub(3,sizeof(*entry)+entry->count*sizeof(*entry->values)); free(entry); entry=next;
-            }
-        }
+        memset(encoder->state->descriptors,0,sizeof(encoder->state->descriptors));
         while (encoder->state->pools) { struct MetalDescriptorPoolChunk *chunk=encoder->state->pools; encoder->state->pools=chunk->next; metal_descriptor_pool_return(chunk); }
-        while (encoder->state->snapshots) { struct MetalRenderSnapshot *snapshot=encoder->state->snapshots; encoder->state->snapshots=snapshot->next; metal_snapshot_return(snapshot->texture); free(snapshot); }
         metal_render_state_return(encoder->state); encoder->state=NULL;
+    }
+}
+static void metal_snapshot_cleanup(struct MetalCommand *command) {
+    while(command->snapshots) {
+        struct MetalRenderSnapshot *snapshot=command->snapshots;command->snapshots=snapshot->next;
+        metal_snapshot_return(snapshot);
+    }
+}
+static void metal_render_release_encoders(struct MetalCommand *command) {
+    while(command->render_encoders) {
+        struct MetalRenderEncoder *encoder=command->render_encoders;
+        command->render_encoders=encoder->next;metal_object_release((Word)encoder);
     }
 }
 static Method metal_render_method(Word object,const char *selector,const char *receiver,int class_receiver) {

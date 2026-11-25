@@ -89,7 +89,7 @@ static int socket_getaddrinfo(const char *host,const char *service,const struct 
     }
     freeaddrinfo(result);
     if (error || !*output) { socket_free_addrinfo(*output); *output=NULL; return error ? error : 8; }
-    static unsigned logged; if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<24) LOG("Darwin DNS resolved: %s addresses=%u",host ? host : "(null)",count);
+    LOG_LIMITED(24,"Darwin DNS resolved: %s addresses=%u",host ? host : "(null)",count);
     return 0;
 }
 static const char *socket_gai_error(int code) {

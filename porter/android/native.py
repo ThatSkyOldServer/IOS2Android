@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import shutil
+import struct
 import subprocess
 from pathlib import Path
 
@@ -111,10 +112,37 @@ def dependencies(context):
     return outputs
 
 
+def presentation_shaders(context):
+    compiler = Path(context.toolchain["shaders"]) / "glslangValidator.exe"
+    validator = compiler.with_name("spirv-val.exe")
+    sources = [ROOT / "runtime/backends/vulkan" / ("present." + stage) for stage in ("vert", "frag")]
+    outputs = [context.work / ("present." + stage + ".spv") for stage in ("vert", "frag")]
+    include = context.work / "presentation-shaders.inc"
+    inputs = file_metadata([compiler, validator, Path(__file__), *sources])
+    stamp = context.work / "presentation-shaders.cache.json"
+    if cache_matches(stamp, inputs, [*outputs, include]):
+        return
+    stamp.unlink(missing_ok=True)
+    lines = []
+    for stage, source, output in zip(("vert", "frag"), sources, outputs):
+        run(context, compiler, "-V", "--target-env", "vulkan1.0", "-S", stage, "-e", "main", "-o", output, source, capture=True)
+        run(context, validator, "--target-env", "vulkan1.0", output)
+        data = output.read_bytes()
+        if len(data) < 20 or len(data) % 4 or data[:4] != b"\x03\x02\x23\x07":
+            raise ValueError("Invalid built-in presentation shader")
+        words = struct.unpack("<" + "I" * (len(data) // 4), data)
+        lines.append("static const uint32_t metal_present_" + stage + "[]={")
+        lines.extend(",".join(hex(word) for word in words[index:index + 8]) + "," for index in range(0, len(words), 8))
+        lines.append("};")
+    include.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_json(stamp, inputs)
+
+
 def build(context, extension_sources, standalone=False, adapter=None):
     tools = {name: Path(value) for name, value in context.toolchain.items()}
     work = context.work
     dependencies(context)
+    presentation_shaders(context)
     compression=ROOT/'third_party/lzfse/src'
     compression_sources=[compression/name for name in ('lzfse_decode.c','lzfse_decode_base.c','lzfse_fse.c','lzvn_decode_base.c')]
     compression_objects=[work/(path.stem+'.o') for path in compression_sources]
@@ -141,6 +169,8 @@ def build(context, extension_sources, standalone=False, adapter=None):
         "-Wall",
         "-Werror",
         "-O2" if context.development else "-O3",
+        "-fno-omit-frame-pointer",
+        "-gline-tables-only",
         "-DI2A_DEVELOPMENT=" + str(int(context.development)),
         "-DI2A_SHADER_DIAGNOSTICS=" + str(int(context.shader_diagnostics)),
         "-DI2A_HAS_EXTENSION=" + str(int(bool(sources))),
@@ -176,6 +206,27 @@ def build(context, extension_sources, standalone=False, adapter=None):
         "-o",
         output,
     )
+    if not standalone:
+        # Keep symbol/line information beside the deliverable, while the APK
+        # may still strip and protect its native code and constants.
+        import lief
+        binary = lief.ELF.parse(str(output))
+        guest = binary.get_symbol("guest_text")
+        collection = json.loads((work / "image-collection.json").read_text(encoding="utf-8"))
+        metadata = {
+            "version": 2,
+            "module": "libi2a.so",
+            "guest_elf_base": guest.value,
+            "guest_images": [dict(path=image["path"], native_base=image["native_base"],
+                                  elf_base=guest.value + image["arena_offset"], size=image["size"])
+                             for image in collection["images"]],
+            "build_id": next((bytes(note.description).hex() for note in binary.notes
+                              if note.name == "GNU" and "BUILD_ID" in str(note.type)), ""),
+            "symbols": [[symbol.value, symbol.size, symbol.name] for symbol in binary.symbols
+                        if symbol.value and symbol.size and str(symbol.type).endswith("FUNC")],
+        }
+        write_json(work / "native-symbols.json", metadata)
+        run(context, tools["ndk"] / "bin/llvm-objcopy.exe", "--only-keep-debug", output, work / "libi2a.so.debug")
     if adapter and hasattr(adapter, "finish_native"):
         adapter.finish_native(context, output)
     return output

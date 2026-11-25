@@ -49,7 +49,7 @@ IOS2Android/
 
 ### Building
 
-The current build environment uses Python 3.11+, Android NDK r27d for Windows, SDK Build Tools 35 / API 35, and a JDK. Python dependencies are declared in `pyproject.toml`. External JSON configuration specifies native dependencies, shader tools, and signing details. The toolchain and dependencies must be installed separately.
+The current build environment uses Python 3.11+, Android NDK r27d for Windows, SDK Build Tools 35 / API 35, and a JDK. Python dependencies are declared in `pyproject.toml`. External JSON configuration specifies native dependencies, shader tools, and signing details. `toolchain.shaders` must provide `glslangValidator.exe` and `spirv-val.exe` to compile and validate the built-in Vulkan 1.0 presentation shaders. The toolchain and dependencies must be installed separately.
 
 Run these commands from the repository root to view usage:
 
@@ -68,7 +68,13 @@ Online services reuse portable endpoints and configuration from the original app
 
 Resources are normally read from the installed APK. A real-path requirement or unavailable shared-memory support is handled per file; temporary mapping files are released when no longer in use. Startup removes resource copies left by older runtime versions. Shaders and driver compilation results are cached in private storage. Updates remove old caches even when the application version stays the same. Unavailable caches are regenerated.
 
+Texture conversion is optional. Resource paths are selected in the `textures` build configuration. Currently, it converts PVRTC1 to ETC2 in 2D PVR3 files; the application must be able to load ETC2. Other formats keep their original files. Conversion runs during the build, requires no external adapter, and adds no runtime encoding or decoding. Python dependencies are declared in the `textures` extra in `pyproject.toml`.
+
+A loaded adapter may return the effective texture configuration through the optional `texture_options(context)` hook. Returning an empty configuration disables conversion to match the source application's format support.
+
 APKs are written to `out/<application-id>/<CFBundleVersion>/dev|release/` in the external workspace. Build different input versions sequentially when sharing a cache. Use separate workspaces for parallel builds.
+
+Each process launch replaces `Android/data/<package>/files/crash.log`, then appends exceptions and crashes only. Normal release logging stays disabled. Native records explain when a stack cannot be read further. Use the matching symbols beside the APK to locate failures.
 
 ### Compatibility
 
@@ -85,7 +91,7 @@ The runtime targets ARM64 Android 9 and later. Window, picker, and permission AP
 - Web pages support basic loading and interaction. Multiple windows, downloads, and some navigation and scripting APIs remain unsupported.
 - Photo support still lacks camera capture, cropping, video, iCloud versions, library change observation, and complete query options. Legacy iOS photo identifiers cannot directly identify Android files.
 - Metal-to-Vulkan and MSL/AIR translation cover only the interfaces and translation paths currently implemented.
-- Audio format support is limited, and real-time AudioQueue playback is not implemented.
+- Audio format support is limited, and real-time AudioQueue playback is not implemented. Android's public playback information does not fully expose other apps' audio ownership or mixing state, so secondary-audio hints are approximate.
 - Full calendar/location notification triggers, notification actions and attachments, Bonjour browsing/resolution, and gesture failure dependencies and arbitration are not implemented.
 - Background location, region monitoring, heading, and some authorization APIs are not implemented. Geocoding depends on the device's Android service.
 
