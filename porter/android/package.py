@@ -358,8 +358,19 @@ def build_apk(context, source, manifest, resources, catalog, overlays, native, d
             compress_type=zipfile.ZIP_DEFLATED,
         )
         package.write(ROOT/'third_party/lzfse/LICENSE','assets/licenses/Apple-LZFSE.txt',compress_type=zipfile.ZIP_DEFLATED)
+        for name in ("LICENSE", "NOTICE"):
+            package.write(
+                ROOT / name,
+                f"assets/licenses/IOS2Android-{name}.txt",
+                compress_type=zipfile.ZIP_DEFLATED,
+            )
     package_options = adapter.prepare_package(context, unsigned) if adapter and hasattr(adapter, "prepare_package") else None
     package_options = package_options or {}
+    filename = package_options.get("filename", "application.apk")
+    if not isinstance(filename, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._() -]*\.apk", filename):
+        raise ValueError("Package filename must be a plain .apk filename")
+    if filename.split(".", 1)[0].upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}:
+        raise ValueError("Package filename is reserved by the host filesystem")
     alignment = package_options.get("alignment", 16384)
     native_alignment = package_options.get("native_page_alignment")
     align_options = ["-P", native_alignment] if native_alignment is not None else []
@@ -410,7 +421,7 @@ def build_apk(context, source, manifest, resources, catalog, overlays, native, d
         for target, rule in adapter.variant_tokens(context).items():
             require_tokens({"native": native_bytes, "dex": dex_bytes}[target], **rule)
     context.output.mkdir(parents=True, exist_ok=True)
-    published = context.output / "application.apk"
+    published = context.output / filename
     with build_lock(context.output):
         candidate.replace(published)
     return published

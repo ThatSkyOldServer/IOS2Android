@@ -9,6 +9,8 @@ import subprocess
 
 from .. import SHADER_PACK_VERSION
 from ..files import write_json, cache_matches, file_metadata, resolve_file
+from .components import sampled_component_masks
+from .samplers import sampler_description
 
 
 def read_embedded_source(raw, address):
@@ -27,15 +29,26 @@ def read_embedded_source(raw, address):
 
 def compile_glsl(code, stage, folder, tools):
     tools = Path(tools)
-    executables = [tools / name for name in ('glslangValidator.exe', 'spirv-val.exe', 'spirv-cross.exe')]
-    inputs = dict(source=code,stage=stage,target='vulkan1.0',tools=file_metadata([Path(__file__),*executables]))
+    executables = [tools / name for name in ('glslangValidator.exe', 'spirv-val.exe', 'spirv-cross.exe', 'spirv-opt.exe')]
+    # Keep the interface, resource ABI and precision policy. These passes remove
+    # call/local-variable scaffolding and repeated values from recovered GLSL;
+    # do not use relaxed-float, FP16 conversion or algebraic fast-math passes.
+    optimizations = ['--preserve-interface', '--preserve-bindings', '--preserve-spec-constants',
+                     '--merge-return', '--inline-entry-points-exhaustive', '--eliminate-dead-functions',
+                     '--eliminate-local-single-block', '--eliminate-local-single-store', '--ssa-rewrite',
+                     '--ccp', '--eliminate-dead-branches', '--eliminate-dead-code-aggressive',
+                     '--redundancy-elimination', '--eliminate-dead-code-aggressive', '--compact-ids']
+    inputs = dict(source=code,stage=stage,target='vulkan1.0',optimizations=optimizations,
+                  tools=file_metadata([Path(__file__),*executables]))
     folder.mkdir(parents=True, exist_ok=True)
     source, binary, reflection = folder / ('source.' + stage), folder / 'module.spv', folder / 'reflection.json'
     stamp=folder/'compile.cache.json'
     if not cache_matches(stamp,inputs,[source,binary,reflection]):
         stamp.unlink(missing_ok=True)
         source.write_text(code, encoding='utf-8')
-        for command in ([executables[0], '-V', '--target-env', 'vulkan1.0', '-S', stage, '-e', 'main', '-o', binary, source],
+        unoptimized = folder / 'unoptimized.spv'
+        for command in ([executables[0], '-V', '--target-env', 'vulkan1.0', '-S', stage, '-e', 'main', '-o', unoptimized, source],
+                        [executables[3], '--target-env=vulkan1.0', *optimizations, unoptimized, '-o', binary],
                         [executables[1], '--target-env', 'vulkan1.0', binary],
                         [executables[2], binary, '--reflect']):
             result = subprocess.run([str(x) for x in command], capture_output=True, text=True,
@@ -43,8 +56,32 @@ def compile_glsl(code, stage, folder, tools):
             if result.returncode:
                 raise RuntimeError(result.stdout + result.stderr)
         reflection.write_text(result.stdout, encoding='utf-8')
+        original = subprocess.run([str(executables[2]), str(unoptimized), '--reflect'], capture_output=True,
+                                  text=True, encoding='utf-8', errors='replace')
+        if original.returncode:
+            raise RuntimeError(original.stdout + original.stderr)
+        if shader_interface(json.loads(original.stdout)) != shader_interface(json.loads(result.stdout)):
+            raise ValueError('Shader optimization changed the resource or stage interface: ' + str(source))
         write_json(stamp,inputs)
     return folder, binary, reflection
+
+
+def shader_interface(reflection):
+    """Compare ABI shapes independently of SPIR-V result/type identifiers."""
+    types = reflection.get('types', {})
+
+    def shape(value):
+        if isinstance(value, list):
+            return [shape(item) for item in value]
+        if isinstance(value, dict):
+            return {key: shape(types[item]) if key == 'type' and isinstance(item, str) and item in types else shape(item)
+                    for key, item in value.items() if key not in ('variable_id',)}
+        return value
+
+    categories = ('entryPoints', 'inputs', 'outputs', 'ubos', 'ssbos', 'images', 'separate_images',
+                  'separate_samplers', 'textures', 'subpass_inputs', 'push_constants', 'specialization_constants')
+    return {key: sorted((shape(value) for value in reflection.get(key, [])), key=lambda value: json.dumps(value, sort_keys=True))
+            for key in categories}
 
 
 def compile_embedded_shaders(raw, recipes, folder, tools):
@@ -464,11 +501,60 @@ def assemble_shader_plan(context, source, spec):
     return dict(executable=executable,libraries=libraries+embedded,shaders=shaders,replacements=reports,diagnostics=sites)
 
 
+def shader_requirements(blob, reflection, stage):
+    # Shared bit layout with MetalShaderRequirement in the runtime. Inspect
+    # offline SPIR-V once; the device compares these flags without scanning code.
+    capabilities = {10: 1 << 5, 11: 1 << 6, 22: 1 << 7, 35: 1 << 8,
+                    49: 1 << 4, 55: 1 << 2, 56: 1 << 3}
+    words = struct.unpack('<' + 'I' * (len(blob) // 4), blob)
+    flags, cursor = 0, 5
+    while cursor < len(words):
+        count, opcode = words[cursor] >> 16, words[cursor] & 0xffff
+        if not count or cursor + count > len(words):
+            raise ValueError('Invalid SPIR-V instruction while reading requirements')
+        if opcode == 17 and count >= 2:
+            flags |= capabilities.get(words[cursor + 1], 0)
+        cursor += count
+    writes = any(not resource.get('readonly', False)
+                 for category in ('ssbos', 'images')
+                 for resource in reflection.get(category, []))
+    if writes:
+        flags |= 1 << 16
+        if stage in (1, 2):
+            flags |= 1 << (stage - 1)
+    return flags
+
+
+def shader_workgroup(reflection):
+    point = reflection['entryPoints'][0]
+    values = point.get('workgroup_size', [1, 1, 1])
+    specialized = point.get('workgroup_size_is_spec_constant_id', [False, False, False])
+    if len(values) != 3 or len(specialized) != 3:
+        raise ValueError('Invalid compute workgroup reflection')
+    constants = {value['id']: value for value in reflection.get('specialization_constants', [])}
+    size, ids = [], []
+    for value, dynamic in zip(values, specialized):
+        if dynamic:
+            constant = constants.get(value)
+            if constant is None or constant.get('type') not in ('uint', 'int'):
+                raise ValueError('Missing compute workgroup specialization default')
+            dimension = int(constant['default_value'])
+            identity = int(value)
+        else:
+            dimension, identity = int(value), 0xffffffff
+        if dimension < 1 or dimension > 0xffffffff or identity < 0 or identity > 0xffffffff:
+            raise ValueError('Compute workgroup exceeds uint32 metadata')
+        size.append(dimension)
+        ids.append(identity)
+    return size, ids
+
+
 def build_shader_pack(source, work, plan):
     all_libraries = plan.get('libraries', [])
     shaders = plan.get('shaders', {})
     executable = source.read(plan['executable'])
     members, arguments, attributes, bindings, inputs, outputs, entries, libraries = ([] for _ in range(8))
+    literal_descriptions, literal_indices = [], {}
     binary = bytearray()
     modules = {}
     report = []
@@ -499,7 +585,8 @@ def build_shader_pack(source, work, plan):
             reflection = json.loads((shader_directory / shader['reflection']).read_text(encoding='utf8'))
             if len(reflection['entryPoints']) != 1 or any(reflection['entryPoints'][0][k] != value for k,value in [('name',shader['entry']),('mode',shader['stage'])]):
                 raise ValueError('SPIR-V entry reflection mismatch')
-            fallback_offset, fallback_size = 0, 0
+            requirements = shader_requirements(blob, reflection, stage)
+            fallback_offset, fallback_size, fallback_requirements = 0, 0, 0
             fallback = shader.get('fallback')
             if fallback:
                 if stage != 1 or fallback['contract'] != 'single-point-no-rasterization':
@@ -523,6 +610,10 @@ def build_shader_pack(source, work, plan):
                     modules[alternate] = len(binary)
                     binary.extend(alternate)
                 fallback_offset, fallback_size = modules[alternate], len(alternate)
+                fallback_requirements = shader_requirements(alternate, alternate_reflection, 3)
+            # The alternate compute program may use different channels. Do not
+            # narrow a binding based solely on the main program in that case.
+            component_masks = sampled_component_masks(blob) if not fallback and reflection.get('separate_images') else {}
             first_binding = len(bindings)
             active = set()
             for key, descriptor, kind, binding_base in [('ubos', 6, 'buffer', 0),
@@ -532,7 +623,7 @@ def build_shader_pack(source, work, plan):
                                                ('images', 3, 'texture', 32)]:
                 for resource in reflection.get(key, []):
                     if shader.get('math_diagnostics') and key=='ssbos' and resource['binding']==255 and resource['set']==stage-1:
-                        bindings.append([str(stage-1), '255', '7', '4294967294', '0', '0', '0'])
+                        bindings.append([str(stage-1), '255', '7', '4294967294', '0', '0', '0', '0'])
                         continue
                     index = resource['binding'] - binding_base
                     if resource['set'] != stage - 1 or index < 0 or resource.get('array'):
@@ -540,13 +631,18 @@ def build_shader_pack(source, work, plan):
                     literal = next((s for s in shader.get('literal_samplers',[]) if s['binding']==resource['binding']), None) if kind=='sampler' else None
                     if literal:
                         index = 0xffffffff
+                        description = sampler_description(literal)
+                        if description not in literal_indices:
+                            literal_indices[description] = len(literal_descriptions) + 1
+                            literal_descriptions.append([str(value) for value in description])
                     else:
                         active.add((kind, index))
                     native_buffer = next((a for a in native['inputs'] if a['kind']=='buffer' and a['index']==index), None) if kind=='buffer' else None
                     if kind=='buffer' and not native_buffer:
                         raise ValueError('Missing original buffer ABI: ' + shader['name'])
                     bindings.append([str(n) for n in (resource['set'], resource['binding'], descriptor,
-                                    index, resource.get('block_size', 0), native_buffer['size'] if native_buffer else 0)] + [literal['raw']+'ULL' if literal else '0'])
+                                    index, resource.get('block_size', 0), native_buffer['size'] if native_buffer else 0)] + [str(literal_indices[description]) if literal else '0'])
+                    bindings[-1].append(str(component_masks.get((resource['set'], resource['binding']), 0) if key=='separate_images' else 0))
             first_argument = len(arguments)
             first_attribute = len(attributes)
             active_locations = {i['location'] for i in reflection.get('inputs', [])}
@@ -580,10 +676,13 @@ def build_shader_pack(source, work, plan):
                     if value.get('array'):
                         raise ValueError('Interface array needs explicit translation: ' + shader['name'])
                     target.append([c_string(value['name']), c_string(value['type']), str(value['location'])])
-            entries.append([c_string(shader['name']), c_string(native['entry'])] + [str(n) for n in (
+            workgroup, workgroup_ids = shader_workgroup(reflection) if stage == 3 else ([1, 1, 1], [0xffffffff] * 3)
+            entries.append([c_string(shader['name']), c_string(native['entry']), c_string(shader['entry'])] + [str(n) for n in (
                 stage, modules[blob], len(blob), first_argument, len(arguments) - first_argument,
                 first_attribute, len(attributes) - first_attribute, first_binding, len(bindings) - first_binding,
-                first_input, len(inputs) - first_input, first_output, len(outputs) - first_output, fallback_offset, fallback_size)])
+                first_input, len(inputs) - first_input, first_output, len(outputs) - first_output, fallback_offset, fallback_size,
+                requirements, fallback_requirements)] +
+                ['{' + ','.join(map(str, workgroup)) + '}', '{' + ','.join(map(str, workgroup_ids)) + '}'])
         libraries.append([c_string(library['name']), '{' + ','.join(str(x) for x in bytes.fromhex(library['sha256'])) + '}',
                           str(len(original)), str(first_entry), str(len(entries) - first_entry), str(int(is_source))])
         report.append({'name': library['name'], 'sha256': library['sha256'],
@@ -597,6 +696,7 @@ def build_shader_pack(source, work, plan):
     emit_struct_array(header, 'ShaderMemberSpec', 'shader_members', members)
     emit_struct_array(header, 'ShaderArgumentSpec', 'shader_arguments', arguments)
     emit_struct_array(header, 'ShaderAttributeSpec', 'shader_attributes', attributes)
+    emit_struct_array(header, 'ShaderSamplerSpec', 'shader_literal_samplers', literal_descriptions)
     emit_struct_array(header, 'ShaderBindingSpec', 'shader_bindings', bindings)
     emit_struct_array(header, 'ShaderInterfaceSpec', 'shader_inputs', inputs)
     emit_struct_array(header, 'ShaderInterfaceSpec', 'shader_outputs', outputs)

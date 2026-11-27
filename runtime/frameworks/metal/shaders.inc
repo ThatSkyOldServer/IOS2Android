@@ -3,16 +3,20 @@
 struct ShaderMemberSpec { const char *name; uint32_t type,offset,size; };
 struct ShaderArgumentSpec { const char *name; uint32_t kind,index,type,size,alignment,texture_type,access,active,first_member,member_count; };
 struct ShaderAttributeSpec { const char *name; uint32_t index,type,active; };
-struct ShaderBindingSpec { uint32_t set,binding,type,metal_index,size,metal_size; uint64_t sampler_bits; };
+/* sampled_components is an optional build-time proof. Zero means unknown (all). */
+struct ShaderBindingSpec { uint32_t set,binding,type,metal_index,size,metal_size,literal_sampler,sampled_components; };
+struct ShaderSamplerSpec { uint32_t min_filter,mag_filter,mip_filter,address_u,address_v,address_w,border; float lod_min,lod_max; };
 struct ShaderInterfaceSpec { const char *name,*type; uint32_t location; };
 struct ShaderSpec {
-    const char *name,*entry;
+    const char *name,*entry,*spirv_entry;
     uint32_t stage,spirv_offset,spirv_size,first_argument,argument_count,first_attribute,attribute_count,
-        first_binding,binding_count,first_input,input_count,first_output,output_count,fallback_offset,fallback_size;
+        first_binding,binding_count,first_input,input_count,first_output,output_count,fallback_offset,fallback_size,
+        requirements,fallback_requirements;
+    uint32_t workgroup[3],workgroup_ids[3];
 };
 struct ShaderLibrarySpec { const char *name; unsigned char sha256[32]; uint32_t size,first_entry,entry_count,source; };
 #include "shaders.h"
-_Static_assert(I2A_SHADER_PACK_VERSION == 1, "Shader pack ABI mismatch");
+_Static_assert(I2A_SHADER_PACK_VERSION == 2, "Shader pack ABI mismatch");
 static const unsigned char *guest_spirv_data;
 static _Atomic(char *) shader_cache_directory;
 static AAsset *shader_pack_asset;
@@ -33,7 +37,7 @@ static void shader_pack_initialize(void){
 static const char *shader_cache_root(void){pthread_once(&shader_pack_once,shader_pack_initialize);return shader_cache_directory;}
 static unsigned char *guest_sha256(const void *,uint32_t,unsigned char *);
 struct MetalLibrary { struct MetalResource object; const struct ShaderLibrarySpec *spec; };
-struct MetalFunction { struct MetalResource object; const struct ShaderSpec *spec; VkShaderModule module; Word attributes,arguments; unsigned compute_fallback; };
+struct MetalFunction { struct MetalResource object; const struct ShaderSpec *spec; VkShaderModule module; Word attributes,arguments; unsigned compute_fallback,requirements; };
 struct MetalReflectionNode { Word isa; const void *spec; Word name,children; };
 static struct MetalFunction *metal_function_cache[COUNT(shader_specs)];
 static pthread_mutex_t metal_shader_mutex=PTHREAD_MUTEX_INITIALIZER;
@@ -152,11 +156,16 @@ static Word metal_library_function(struct MetalLibrary *library,const char *sele
             }
         }
 #endif
-    unsigned compute_fallback=!vulkan.features.vertexPipelineStoresAndAtomics && spec->fallback_size!=0;
-    if (spec->stage==1 && !vulkan.features.vertexPipelineStoresAndAtomics && !compute_fallback)
-        for (unsigned i=0;i<spec->binding_count;++i) if (shader_bindings[spec->first_binding+i].type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
-            LOG("Original vertex storage writes require unsupported Vulkan feature: %s",spec->name); return 0;
-        }
+    unsigned requirements=spec->requirements;
+    unsigned compute_fallback=spec->stage==1 && (requirements&METAL_SHADER_VERTEX_STORES) &&
+        !vulkan.features.vertexPipelineStoresAndAtomics && spec->fallback_size;
+    if (compute_fallback) requirements=spec->fallback_requirements;
+    unsigned missing=requirements&METAL_SHADER_FEATURE_MASK&~vulkan.shader_requirements;
+    if (missing) {
+        char detail[256];snprintf(detail,sizeof(detail),"shader=%s requested=0x%x enabled=0x%x missing=0x%x",
+            spec->name,requirements&METAL_SHADER_FEATURE_MASK,vulkan.shader_requirements,missing);
+        return metal_error(NULL,"MTLLibraryErrorDomain",1,detail);
+    }
     unsigned index=(unsigned)(spec-shader_specs);
     pthread_once(&shader_pack_once,shader_pack_initialize);
     pthread_mutex_lock(&metal_shader_mutex);
@@ -166,7 +175,7 @@ static Word metal_library_function(struct MetalLibrary *library,const char *sele
         if (function) {
             function->object=(struct MetalResource){.isa=external_class("_OBJC_CLASS_$_I2AMetalFunction"),.device=library->object.device};
             function->spec=spec;
-            function->compute_fallback=compute_fallback;
+            function->compute_fallback=compute_fallback; function->requirements=requirements;
             VkShaderModuleCreateInfo info={.sType=VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,.codeSize=spec->spirv_size,
                 .pCode=(const uint32_t *)(guest_spirv_data+spec->spirv_offset)};
             if (compute_fallback) { info.codeSize=spec->fallback_size; info.pCode=(const uint32_t *)(guest_spirv_data+spec->fallback_offset); }

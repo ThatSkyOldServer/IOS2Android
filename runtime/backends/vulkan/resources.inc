@@ -305,35 +305,55 @@ static int metal_sampler_address(Word mode,VkSamplerAddressMode *output) {
     default: return 0;
     }
 }
+static Word metal_sampler_failure(struct MetalDescriptor *descriptor,const char *reason,VkResult result) {
+    char detail[512];
+    snprintf(detail,sizeof(detail),"reason=%s result=%d min=%lu mag=%lu mip=%lu lod=%g..%g address=%lu/%lu/%lu border=%lu normalized=%lu compare=%lu anisotropy=%lu supported_anisotropy=%u max_anisotropy=%g",
+        reason,result,metal_property(descriptor,"minFilter"),metal_property(descriptor,"magFilter"),metal_property(descriptor,"mipFilter"),
+        descriptor->lod_min,descriptor->lod_max,metal_property(descriptor,"sAddressMode"),metal_property(descriptor,"tAddressMode"),metal_property(descriptor,"rAddressMode"),
+        metal_property(descriptor,"borderColor"),metal_property(descriptor,"normalizedCoordinates"),metal_property(descriptor,"compareFunction"),
+        metal_property(descriptor,"maxAnisotropy"),vulkan.features.samplerAnisotropy,vulkan.properties.limits.maxSamplerAnisotropy);
+    record_failure("Metal sampler creation failed",detail);return 0;
+}
 static Word metal_sampler_new(Word device,const char *selector,struct MetalDescriptor *descriptor) {
     if (!descriptor || descriptor->kind!=MD_SAMPLER) return 0;
     if (!vulkan.available) stop("Sampler backend requires Vulkan",selector);
     Word min=metal_property(descriptor,"minFilter"),mag=metal_property(descriptor,"magFilter"),mip=metal_property(descriptor,"mipFilter");
     Word anisotropy=metal_property(descriptor,"maxAnisotropy"),compare=metal_property(descriptor,"compareFunction");
     Word normalized=metal_property(descriptor,"normalizedCoordinates");
+    Word border=metal_property(descriptor,"borderColor");
+    const VkBorderColor borders[]={VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK,VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE};
+    if (border>=COUNT(borders)) return metal_sampler_failure(descriptor,"unsupported border color",VK_ERROR_FEATURE_NOT_PRESENT);
     VkSamplerCreateInfo info={.sType=VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,.minFilter=(VkFilter)min,.magFilter=(VkFilter)mag,
         .mipmapMode=mip==2 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST,
         .minLod=mip ? descriptor->lod_min : 0,.maxLod=mip ? descriptor->lod_max : 0,
-        .compareEnable=compare!=7,.compareOp=(VkCompareOp)compare,.borderColor=VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
+        .compareEnable=compare!=7,.compareOp=(VkCompareOp)compare,.borderColor=borders[border],
         .unnormalizedCoordinates=!normalized,.maxAnisotropy=(float)anisotropy,.anisotropyEnable=anisotropy>1};
+    /* Negative LOD clamps are valid for normalized Vulkan samplers. Keep the
+     * requested range, including magnification, instead of rejecting it. */
     if (min>1 || mag>1 || mip>2 || compare>7 || anisotropy<1 || anisotropy>16 || !isfinite(info.minLod) || !isfinite(info.maxLod) || info.maxLod<info.minLod ||
         !metal_sampler_address(metal_property(descriptor,"sAddressMode"),&info.addressModeU) ||
         !metal_sampler_address(metal_property(descriptor,"tAddressMode"),&info.addressModeV) ||
         !metal_sampler_address(metal_property(descriptor,"rAddressMode"),&info.addressModeW)) {
-        LOG("Invalid/unsupported Metal sampler descriptor: min=%lu mag=%lu mip=%lu aniso=%lu compare=%lu normalized=%lu lod=%g..%g address=%lu/%lu/%lu",
-            min,mag,mip,anisotropy,compare,normalized,info.minLod,info.maxLod,metal_property(descriptor,"sAddressMode"),metal_property(descriptor,"tAddressMode"),metal_property(descriptor,"rAddressMode")); return 0;
+        return metal_sampler_failure(descriptor,"invalid descriptor",VK_ERROR_FEATURE_NOT_PRESENT);
     }
+    /* Metal clampToZero ignores borderColor; Vulkan has one border for all axes. */
+    int zero=metal_property(descriptor,"sAddressMode")==4 || metal_property(descriptor,"tAddressMode")==4 || metal_property(descriptor,"rAddressMode")==4;
+    int colored=metal_property(descriptor,"sAddressMode")==5 || metal_property(descriptor,"tAddressMode")==5 || metal_property(descriptor,"rAddressMode")==5;
+    if (zero && colored && border) return metal_sampler_failure(descriptor,"mixed zero and colored borders",VK_ERROR_FEATURE_NOT_PRESENT);
+    if (zero) info.borderColor=VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     if (anisotropy>1 && (!vulkan.features.samplerAnisotropy || anisotropy>vulkan.properties.limits.maxSamplerAnisotropy)) {
-        LOG("Requested sampler anisotropy %lu exceeds Vulkan support",anisotropy); return 0;
+        return metal_sampler_failure(descriptor,"unsupported anisotropy",VK_ERROR_FEATURE_NOT_PRESENT);
     }
     if (!normalized && (min!=mag || mip!=0 || anisotropy>1 || info.compareEnable ||
         (info.addressModeU!=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && info.addressModeU!=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER) ||
-        (info.addressModeV!=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && info.addressModeV!=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER))) return 0;
-    struct MetalSampler *sampler=calloc(1,sizeof(*sampler)); if (!sampler) return 0;
+        (info.addressModeV!=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && info.addressModeV!=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER)))
+        return metal_sampler_failure(descriptor,"unsupported unnormalized coordinates",VK_ERROR_FEATURE_NOT_PRESENT);
+    struct MetalSampler *sampler=calloc(1,sizeof(*sampler));
+    if (!sampler) return metal_sampler_failure(descriptor,"sampler allocation",VK_ERROR_OUT_OF_HOST_MEMORY);
     sampler->object=(struct MetalResource){.isa=external_class("_OBJC_CLASS_$_I2AMetalSamplerState"),.device=device,.label=metal_property(descriptor,"label")};
     sampler->description=info;
     VkResult result=VKD(vkCreateSampler)(vulkan.device,&info,NULL,&sampler->sampler);
-    if (result!=VK_SUCCESS) { LOG("Vulkan sampler creation failed: %d",result); free(sampler); return 0; }
+    if (result!=VK_SUCCESS) { free(sampler);return metal_sampler_failure(descriptor,"vkCreateSampler",result); }
     metal_lifetime_init((Word)sampler,__builtin_offsetof(struct MetalSampler,lifetime),metal_sampler_destroy);
     LOG_LIMITED(12,"Vulkan sampler created: min=%lu mag=%lu mip=%lu anisotropy=%lu",min,mag,mip,anisotropy);
     return (Word)sampler;

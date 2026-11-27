@@ -1,35 +1,66 @@
 /* Vulkan submissions, actual fence completion and original Metal blocks.
  * Texture layout changes are published only when their command is submitted. */
 #define VKD(name) ({ static PFN_##name cached; PFN_##name fn=__atomic_load_n(&cached,__ATOMIC_ACQUIRE); if (!fn) { fn=(PFN_##name)vulkan.get_device_proc(vulkan.device,#name); __atomic_store_n(&cached,fn,__ATOMIC_RELEASE); } fn; })
-struct MetalCommandTexture { struct MetalTexture *texture; VkImageLayout initial,layout; VkAccessFlags initial_access; unsigned layout_used; struct MetalCommandTexture *next,*hash_next; };
+struct MetalCommandTexture { struct MetalTexture *texture; VkImageLayout initial,layout; VkAccessFlags initial_access; VkPipelineStageFlags initial_stages,read_stages; unsigned layout_used,layout_changed; struct MetalCommandTexture *next,*hash_next; };
+static VkPipelineStageFlags metal_image_stages(VkImageLayout layout) {
+    switch(layout) {
+        case VK_IMAGE_LAYOUT_UNDEFINED:return VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:return VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        /* Depth/stencil resolve accesses also execute in color output. */
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:return VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT|VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT|VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:return VK_PIPELINE_STAGE_VERTEX_SHADER_BIT|VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT|VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:return VK_PIPELINE_STAGE_TRANSFER_BIT;
+        default:return VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    }
+}
+static VkAccessFlags metal_image_access(VkImageLayout layout) {
+    switch(layout) {
+        case VK_IMAGE_LAYOUT_UNDEFINED:return 0;
+        case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:return VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT|VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:return VK_ACCESS_SHADER_READ_BIT;
+        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:return VK_ACCESS_TRANSFER_READ_BIT;
+        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:return VK_ACCESS_TRANSFER_WRITE_BIT;
+        default:return VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
+    }
+}
 struct MetalCommandHandler { Word block; struct MetalCommandHandler *next; };
 struct MetalBlitEncoder { struct MetalResource object; struct MetalCommand *command; unsigned ended,debug_depth; struct MetalLifetime lifetime; };
 static _Thread_local struct MetalCommand *metal_completing_command;
 static void metal_render_cleanup(struct MetalCommand *);
 static void metal_render_release_encoders(struct MetalCommand *);
+static void metal_compute_cleanup(struct MetalCommand *);
+static void metal_compute_release_encoders(struct MetalCommand *);
 static void metal_snapshot_cleanup(struct MetalCommand *);
 static VkSemaphore metal_drawable_signal(struct MetalCommand *);
 static VkResult metal_drawable_present(struct MetalCommand *);
+static void metal_command_record_presentation(struct MetalCommand *);
 static void metal_first_frame_complete(struct MetalCommand *);
 static void metal_drawable_complete(struct MetalCommand *);
 static void metal_command_destroy(Word value) {
     struct MetalCommand *command=(void *)value;
     struct MetalQueue *queue=(void *)command->object.content[0];
+    pthread_mutex_lock(&queue->mutex);
+    unsigned reserved=command->queued;
+    metal_queue_unlink_locked(queue,command);
+    pthread_mutex_unlock(&queue->mutex);
     if(command->pool_owner) {
         struct MetalCommandPool *pool=command->pool_owner;
         pthread_mutex_lock(&pool->mutex);VkResult result=VKD(vkResetCommandPool)(vulkan.device,pool->native,0);pthread_mutex_unlock(&pool->mutex);
-        metal_render_cleanup(command);
+        metal_render_cleanup(command);metal_compute_cleanup(command);
         while(command->textures){struct MetalCommandTexture *next=command->textures->next;free(command->textures);command->textures=next;}
         metal_command_release_resources(command);metal_snapshot_cleanup(command);command->pool_owner=NULL;
         if(result==VK_SUCCESS)metal_pool_return(queue,pool);
         else metal_pool_destroy(queue,pool);
     }
-    metal_render_release_encoders(command);
+    metal_render_release_encoders(command);metal_compute_release_encoders(command);
     struct MetalCommandHandler *handlers[]={command->scheduled,command->completed};
     for(unsigned i=0;i<COUNT(handlers);++i)while(handlers[i]) {
         struct MetalCommandHandler *next=handlers[i]->next;_Block_release((void *)handlers[i]->block);free(handlers[i]);handlers[i]=next;
     }
-    metal_drawable_complete(command);metal_object_release((Word)queue);
+    metal_drawable_complete(command);
+    if (reserved) metal_queue_drain(queue);
+    metal_object_release((Word)queue);
     pthread_cond_destroy(&command->condition);pthread_mutex_destroy(&command->mutex);
     metal_memory_sub(4,sizeof(*command));free(command);
 }
@@ -87,8 +118,9 @@ static void metal_command_complete(void *context) {
     if (metal_command_status(&command->object)==3) {
         failed|=metal_command_handlers(command,command->scheduled); command->scheduled=NULL;
         VkResult result=VKD(vkWaitForFences)(vulkan.device,1,&command->fence,VK_TRUE,UINT64_MAX);
-        if (result==VK_SUCCESS) metal_diagnostic_command_complete(command);
+        if (result==VK_SUCCESS) {metal_gpu_time_complete(command);metal_diagnostic_command_complete(command);}
         if (result!=VK_SUCCESS) {
+            metal_diagnostic_present_complete(command,0,0);
             retire_safe=result==VK_ERROR_DEVICE_LOST;
             char detail[128]; snprintf(detail,sizeof(detail),"Vulkan command fence failed: %d",result);
             metal_error(&command->error,"MTLCommandBufferErrorDomain",1,detail);
@@ -111,7 +143,7 @@ static void metal_command_complete(void *context) {
         command->prologue=VK_NULL_HANDLE;
         VkResult reset=VKD(vkResetCommandPool)(vulkan.device,pool->native,0);
         pthread_mutex_unlock(&pool->mutex);
-        metal_render_cleanup(command);
+        metal_render_cleanup(command);metal_compute_cleanup(command);
         struct MetalCommandTexture *use=command->textures;
         while (use) { struct MetalCommandTexture *next=use->next; free(use); use=next; }
         command->textures=NULL;
@@ -145,28 +177,31 @@ static int metal_command_texture_barrier(const struct MetalCommandTexture *use) 
      * them visible to later shader reads on this queue. Read-after-read needs
      * neither another layout transition nor a full pipeline dependency. */
     return use->layout_used && !(use->texture->layout==VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
-        use->initial==VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && use->initial_access==VK_ACCESS_SHADER_READ_BIT);
+        use->initial==VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && use->initial_access==VK_ACCESS_SHADER_READ_BIT &&
+        !(use->initial_stages&~use->texture->read_stages));
 }
-static void metal_command_commit(struct MetalCommand *command,const char *selector) {
+static void metal_command_submit(struct MetalCommand *command) {
     uint64_t diagnostic_commit=render_diagnostic_clock();
-    struct MetalQueue *queue=(void *)command->object.content[0];
-    if (!vulkan.available || !queue->execution_enabled) stop("Metal submission backend unavailable or queue disabled",selector);
     pthread_mutex_lock(&command->mutex);
-    if (command->object.content[1]>=2 || command->active_encoder) {
-        pthread_mutex_unlock(&command->mutex); stop("Command already committed or encoder still active",selector);
-    }
-    __atomic_store_n(&command->object.content[1],2,__ATOMIC_RELEASE);
-     
+    metal_command_record_presentation(command);
+
     unsigned needs_prologue=0;
     for (struct MetalCommandTexture *use=command->textures;use;use=use->next) if(use->layout_used) {
         pthread_mutex_lock(&use->texture->mutex);
         needs_prologue|=metal_command_texture_barrier(use);
     }
      
-    if (metal_upload_flush()!=VK_SUCCESS) stop("Vulkan upload batch submission failed",selector);
+    VkResult result=metal_upload_flush();
+    if (result!=VK_SUCCESS) {
+        char detail[80];snprintf(detail,sizeof(detail),"Vulkan upload flush result=%d",result);
+        record_failure("Vulkan upload batch submission failed",detail);
+    }
     pthread_mutex_lock(&command->pool_owner->mutex);
-    metal_diagnostic_command_end(command);
-    VkResult result=VKD(vkEndCommandBuffer)(command->command);
+    if (result==VK_SUCCESS) {
+        metal_diagnostic_command_end(command);
+        metal_gpu_time_end(command);
+        result=VKD(vkEndCommandBuffer)(command->command);
+    }
     if (result==VK_SUCCESS && needs_prologue) {
         VkCommandBufferAllocateInfo allocate={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=command->pool_owner->native,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
         command->prologue=command->pool_owner->prologue;
@@ -178,22 +213,23 @@ static void metal_command_commit(struct MetalCommand *command,const char *select
              
             VkImageMemoryBarrier barriers[64];
             uint32_t count=0;
-            VkPipelineStageFlags sources=0;
+            VkPipelineStageFlags sources=0,destinations=0;
             for (struct MetalCommandTexture *use=command->textures;use;use=use->next) {
                 if(!metal_command_texture_barrier(use))continue;
                 struct MetalTexture *texture=use->texture;
+                unsigned additional_reader=texture->layout==VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && use->initial==texture->layout;
                 barriers[count++]=(VkImageMemoryBarrier){.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                    .srcAccessMask=texture->layout==VK_IMAGE_LAYOUT_UNDEFINED ? 0 : VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT,
+                    .srcAccessMask=additional_reader ? VK_ACCESS_MEMORY_WRITE_BIT : metal_image_access(texture->layout),
                     .dstAccessMask=use->initial_access,.oldLayout=texture->layout,.newLayout=use->initial,
                     .srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.image=texture->image,
                     .subresourceRange={texture->format.aspects,0,(uint32_t)texture->mips,0,(uint32_t)texture->layers}};
-                sources|=texture->layout==VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                sources|=additional_reader ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : metal_image_stages(texture->layout);destinations|=use->initial_stages ? use->initial_stages : metal_image_stages(use->initial);
                 if (count==COUNT(barriers)) {
-                    VKD(vkCmdPipelineBarrier)(command->prologue,sources,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,NULL,0,NULL,count,barriers);
-                    count=0; sources=0;
+                    VKD(vkCmdPipelineBarrier)(command->prologue,sources,destinations,0,0,NULL,0,NULL,count,barriers);
+                    count=0;sources=destinations=0;
                 }
             }
-            if(count)VKD(vkCmdPipelineBarrier)(command->prologue,sources,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,NULL,0,NULL,count,barriers);
+            if(count)VKD(vkCmdPipelineBarrier)(command->prologue,sources,destinations,0,0,NULL,0,NULL,count,barriers);
             result=VKD(vkEndCommandBuffer)(command->prologue);
         }
     }
@@ -215,6 +251,7 @@ static void metal_command_commit(struct MetalCommand *command,const char *select
         render_diagnostic_cost(8,diagnostic_lock);
         uint64_t diagnostic_submit=render_diagnostic_clock();
         result=VKD(vkQueueSubmit)(vulkan.queue,1,&submit,command->fence);
+        if (result==VK_SUCCESS) metal_diagnostic_submitted(command);
         render_diagnostic_cost(4,diagnostic_submit);
         if (result==VK_SUCCESS && command->drawable) {
             presented=metal_drawable_present(command);
@@ -226,7 +263,12 @@ static void metal_command_commit(struct MetalCommand *command,const char *select
         char detail[96];snprintf(detail,sizeof(detail),"vkQueuePresentKHR result=%d",presented);record_failure("Vulkan queue presentation failed",detail);
     }
     for (struct MetalCommandTexture *use=command->textures;use;use=use->next) if(use->layout_used) {
-        if (result==VK_SUCCESS) use->texture->layout=use->layout;
+        if (result==VK_SUCCESS) {
+            VkPipelineStageFlags readers=use->read_stages;
+            if (!use->layout_changed && use->texture->layout==VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && use->layout==use->texture->layout)
+                readers|=use->texture->read_stages;
+            use->texture->read_stages=readers;use->texture->layout=use->layout;
+        }
         pthread_mutex_unlock(&use->texture->mutex);
     }
     if (result!=VK_SUCCESS) {
@@ -235,9 +277,40 @@ static void metal_command_commit(struct MetalCommand *command,const char *select
     }
     __atomic_store_n(&command->object.content[1],result==VK_SUCCESS ? 3 : 5,__ATOMIC_RELEASE);
     pthread_cond_broadcast(&command->condition); pthread_mutex_unlock(&command->mutex);
-    metal_object_retain((Word)command);
     metal_completion_enqueue(metal_completion_queue,command,metal_command_complete);
     render_diagnostic_cost(13,diagnostic_commit);
+}
+static void metal_queue_drain(struct MetalQueue *queue) {
+    pthread_mutex_lock(&queue->mutex);
+    if (queue->draining || !queue->pending_head || metal_command_status(&queue->pending_head->object)<2) {
+        pthread_mutex_unlock(&queue->mutex); return;
+    }
+    queue->draining=1; metal_object_retain((Word)queue);
+    for (;;) {
+        struct MetalCommand *command=queue->pending_head;
+        if (!command || metal_command_status(&command->object)<2) break;
+        metal_queue_unlink_locked(queue,command);
+        pthread_mutex_unlock(&queue->mutex);
+        metal_command_submit(command);
+        pthread_mutex_lock(&queue->mutex);
+    }
+    queue->draining=0; pthread_mutex_unlock(&queue->mutex);
+    metal_object_release((Word)queue);
+}
+static void metal_command_commit(struct MetalCommand *command,const char *selector) {
+    struct MetalQueue *queue=(void *)command->object.content[0];
+    if (!vulkan.available || !queue->execution_enabled) stop("Metal submission backend unavailable or queue disabled",selector);
+    pthread_mutex_lock(&command->mutex);
+    if (command->object.content[1]>=2 || command->active_encoder) {
+        pthread_mutex_unlock(&command->mutex); stop("Command already committed or encoder still active",selector);
+    }
+    if (!command->object.content[1]) metal_enqueue_locked(command);
+    metal_object_retain((Word)command);
+    __atomic_store_n(&command->object.content[1],2,__ATOMIC_RELEASE);
+    pthread_mutex_unlock(&command->mutex);
+    /* Later commits remain ready without overtaking an earlier reservation.
+     * Queue ownership is released before recording/submission locks are taken. */
+    metal_queue_drain(queue);
 }
 static void metal_command_wait(struct MetalCommand *command,const char *selector) {
     if (metal_completing_command==command) return;
@@ -314,7 +387,9 @@ static void metal_blit_mipmaps(struct MetalBlitEncoder *encoder,const char *sele
     barrier.subresourceRange.baseMipLevel=0; barrier.subresourceRange.levelCount=(uint32_t)texture->mips;
     VKD(vkCmdPipelineBarrier)(command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,NULL,0,NULL,1,&barrier);
     pthread_mutex_unlock(&encoder->command->pool_owner->mutex);
-    use->layout=final_layout; ++encoder->command->recorded_operations;
+    use->layout=final_layout;use->layout_changed=1;
+    use->read_stages=final_layout==VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ? metal_image_stages(final_layout) : 0;
+    ++encoder->command->recorded_operations;
 #if I2A_DEVELOPMENT
     if (render_diagnostics_requested) {
         static unsigned traces;

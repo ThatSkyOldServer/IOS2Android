@@ -58,24 +58,31 @@ static void crash_event(struct CrashOutput *output,const char *kind) {
     if(__atomic_load_n(&crash_gpu_ready,__ATOMIC_ACQUIRE)){crash_text(&text,crash_gpu_context);crash_text(&text,"\n");}
     crash_flush(output,&text);
 }
-static void crash_frame(struct CrashOutput *output,unsigned index,Word address) {
+static Word crash_code_address(Word address) {
+    register Word stripped __asm__("x30")=address;
+    __asm__ volatile("hint #7" : "+r"(stripped)); /* XPACLRI; a hint on CPUs without PAC. */
+    return stripped;
+}
+static void crash_frame(struct CrashOutput *output,unsigned index,Word raw) {
+    Word address=crash_code_address(raw);
     struct CrashText text={0};crash_text(&text,"  #");crash_number(&text,index,0);
     crash_text(&text," pc=");crash_number(&text,address,1);
+    if(raw!=address){crash_text(&text," raw_pc=");crash_number(&text,raw,1);}
     if(address>=crash_module_base && address<crash_module_end){crash_text(&text," module=libi2a.so elf_pc=");crash_number(&text,address-crash_module_base,1);}
     if(in_image(address)){crash_text(&text," guest_pc=");crash_number(&text,guest_native_address(address),1);}
     crash_text(&text,"\n");crash_flush(output,&text);
 }
 static void crash_walk(struct CrashOutput *output,Word pc,Word lr,Word frame,Word stack) {
-    unsigned count=0;Word previous=pc;
+    unsigned count=0;Word previous=crash_code_address(pc);
     if(pc)crash_frame(output,count++,pc);
-    if(lr && lr!=pc){crash_frame(output,count++,lr);previous=lr;}
+    if(lr && crash_code_address(lr)!=previous){crash_frame(output,count++,lr);previous=crash_code_address(lr);}
     const char *end="frame_chain_end";
     while(frame && count<4096) {
         Word words[2];
         if(frame<stack || frame-stack>64*1024*1024 || (frame&7) || frame>UINTPTR_MAX-16){end="invalid_frame_pointer";break;}
         struct iovec local={words,sizeof(words)},remote={(void *)frame,sizeof(words)};
         if(syscall(SYS_process_vm_readv,getpid(),&local,1,&remote,1,0)!=sizeof(words)){end="unreadable_frame_pointer";break;}
-        if(words[1] && words[1]!=previous){crash_frame(output,count++,words[1]);previous=words[1];}
+        if(words[1] && crash_code_address(words[1])!=previous){crash_frame(output,count++,words[1]);previous=crash_code_address(words[1]);}
         if(!words[0])break;
         if(words[0]<=frame || words[0]-frame>64*1024*1024){end="invalid_frame_chain";break;}
         frame=words[0];

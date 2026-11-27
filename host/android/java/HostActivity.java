@@ -263,13 +263,13 @@ public final class HostActivity extends Activity {
         mainHandler.post(()->{CompositionUpdate update=pendingCompositions.remove(token);if(update!=null && !isDestroyed())viewComposition().sync(token,update.owner,update.raw,update.presentation,update.clips,update.clipOwners);});
     }
     private static final class LayerUpdate {
-        final long owner;final boolean raw,replace;final float[] metrics,locations;final int[] options,colors;final byte[] image;
-        LayerUpdate(long owner,boolean raw,boolean replace,float[] metrics,int[] options,int[] colors,float[] locations,byte[] image){this.owner=owner;this.raw=raw;this.replace=replace;this.metrics=metrics;this.options=options;this.colors=colors;this.locations=locations;this.image=image;}
+        final long owner;final boolean raw,replace,replacePattern;final float[] metrics,locations;final int[] options,colors;final byte[] image,pattern;
+        LayerUpdate(long owner,boolean raw,boolean replace,float[] metrics,int[] options,int[] colors,float[] locations,byte[] image,boolean replacePattern,byte[] pattern){this.owner=owner;this.raw=raw;this.replace=replace;this.metrics=metrics;this.options=options;this.colors=colors;this.locations=locations;this.image=image;this.replacePattern=replacePattern;this.pattern=pattern;}
     }
     private final ConcurrentHashMap<Long,LayerUpdate> pendingLayers=new ConcurrentHashMap<>();
-    private void syncGuestLayer(long token,long owner,boolean raw,boolean replace,float[] metrics,int[] options,int[] colors,float[] locations,byte[] image) {
-        final boolean[] schedule={false};pendingLayers.compute(token,(key,previous)->{schedule[0]=previous==null;return new LayerUpdate(owner,raw,replace || previous!=null && previous.replace,metrics,options,colors,locations,!replace && previous!=null ? previous.image : image);});
-        if(schedule[0])mainHandler.post(()->{LayerUpdate update=pendingLayers.remove(token);if(update!=null && !isDestroyed())try{viewComposition().layer(token,update.owner,update.raw,update.replace,update.metrics,update.options,update.colors,update.locations,update.image);}catch(RuntimeException error){guestFailure("Unable to display the supplied layer: "+error.getMessage());}});
+    private void syncGuestLayer(long token,long owner,boolean raw,boolean replace,float[] metrics,int[] options,int[] colors,float[] locations,byte[] image,boolean replacePattern,byte[] pattern) {
+        final boolean[] schedule={false};pendingLayers.compute(token,(key,previous)->{schedule[0]=previous==null;return new LayerUpdate(owner,raw,replace || previous!=null && previous.replace,metrics,options,colors,locations,!replace && previous!=null ? previous.image : image,replacePattern || previous!=null && previous.replacePattern,!replacePattern && previous!=null ? previous.pattern : pattern);});
+        if(schedule[0])mainHandler.post(()->{LayerUpdate update=pendingLayers.remove(token);if(update!=null && !isDestroyed())try{viewComposition().layer(token,update.owner,update.raw,update.replace,update.metrics,update.options,update.colors,update.locations,update.image,update.replacePattern,update.pattern);}catch(RuntimeException error){guestFailure("Unable to display the supplied layer: "+error.getMessage());}});
     }
     private void animateGuestViews(long[] changed,float[] before,float[] after,long[] tokens,int[] offsets,long[] ancestors,float[] model,float[] framesBefore,float[] framesAfter,long duration,long delay,int options,float damping,float velocity,float repeat,long completion) {
         long requested=android.os.SystemClock.uptimeMillis();mainHandler.post(()->{if(isDestroyed() || startupFailed){if(completion!=0)completeViewAnimation(completion,1,false);return;}viewComposition().animate(changed,before,after,tokens,offsets,ancestors,model,framesBefore,framesAfter,duration,delay,options,damping,velocity,repeat,completion,requested);});
@@ -727,7 +727,7 @@ public final class HostActivity extends Activity {
     private native void configureNetworkDiagnostics(boolean enabled);
     private native void configureInterfaceDiagnostics(boolean enabled);
     // DEVELOPMENT_END
-    private void setDisplayLinksActive(boolean active) { frameScheduler.active(active); }
+    private void setDisplayLinksActive(boolean active,float rate) { frameScheduler.active(active,rate); }
     private int motionSensorMask() {
         android.hardware.SensorManager manager = (android.hardware.SensorManager)getSystemService(SENSOR_SERVICE);
         if (manager == null) return 0;
@@ -1096,6 +1096,7 @@ public final class HostActivity extends Activity {
             else if (status == BatteryManager.BATTERY_STATUS_DISCHARGING || status == BatteryManager.BATTERY_STATUS_NOT_CHARGING) state = 1;
         }
         PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
+        updateThermalSnapshot(guestThermalStatus);
         updateSystemSnapshot(metrics.widthPixels, metrics.heightPixels, metrics.density,
             getWindowManager().getDefaultDisplay().getRotation(), getResources().getConfiguration().smallestScreenWidthDp >= 600,
             level, state, power != null && power.isPowerSaveMode());
@@ -1132,7 +1133,18 @@ public final class HostActivity extends Activity {
         }catch(RuntimeException unavailable){return 0;}
     }
     private boolean batteryMonitorRegistered;
+    private int guestThermalStatus;
+    private PowerManager.OnThermalStatusChangedListener thermalMonitor;
+    private native void updateThermalSnapshot(int status);
     private void monitorPlatformChanges() {
+        if(Build.VERSION.SDK_INT>=29) {
+            PowerManager power=getSystemService(PowerManager.class);
+            if(power!=null)try {
+                guestThermalStatus=power.getCurrentThermalStatus();
+                thermalMonitor=status->{guestThermalStatus=status;if(libraryLoaded && !isDestroyed())updateThermalSnapshot(status);};
+                power.addThermalStatusListener(getMainExecutor(),thermalMonitor);
+            } catch(RuntimeException unavailable) {thermalMonitor=null;}
+        }
         IntentFilter filter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
         try{if (Build.VERSION.SDK_INT >= 33) registerReceiver(batteryMonitor, filter, Context.RECEIVER_NOT_EXPORTED);
             else registerReceiver(batteryMonitor, filter);batteryMonitorRegistered=true;
@@ -1149,6 +1161,7 @@ public final class HostActivity extends Activity {
     }
 
     @Override public void onDestroy() {
+        if(Build.VERSION.SDK_INT>=29 && thermalMonitor!=null){PowerManager power=getSystemService(PowerManager.class);if(power!=null)try{power.removeThermalStatusListener(thermalMonitor);}catch(RuntimeException ignored){}thermalMonitor=null;}
         if(batteryMonitorRegistered){try{unregisterReceiver(batteryMonitor);}catch(IllegalArgumentException ignored){}batteryMonitorRegistered=false;}
         if(networkMonitor!=null){ConnectivityManager manager=(ConnectivityManager)getSystemService(CONNECTIVITY_SERVICE);if(manager!=null)try{manager.unregisterNetworkCallback(networkMonitor);}catch(RuntimeException ignored){}networkMonitor=null;}
         if(motion!=null)motion.close();
@@ -1438,6 +1451,9 @@ public final class HostActivity extends Activity {
         if (style == 0) formatter.setGroupingUsed(false);
         if (positivePattern != null && formatter instanceof android.icu.text.DecimalFormat) ((android.icu.text.DecimalFormat) formatter).applyPattern(positivePattern);
         return formatter;
+    }
+    private String localizedFormatNumber(long bits, char code, int flags, int width, int precision) {
+        return LocalizedFormat.number(bits, code, flags, width, precision);
     }
     private String parseFormattedNumber(android.icu.text.NumberFormat formatter, String text) {
         text = text.trim(); java.text.ParsePosition position = new java.text.ParsePosition(0);
@@ -1840,8 +1856,9 @@ public final class HostActivity extends Activity {
         catch(org.json.JSONException | RuntimeException failure) { guestFailure("Unable to restore the original launch screen: "+failure.getMessage()); }
         content.addView(status, new android.widget.FrameLayout.LayoutParams(-1, -1));
         surface.getHolder().addCallback(new android.view.SurfaceHolder.Callback() {
-            @Override public void surfaceCreated(android.view.SurfaceHolder holder) {}
+            @Override public void surfaceCreated(android.view.SurfaceHolder holder) { frameScheduler.surface(holder.getSurface()); }
             @Override public void surfaceChanged(android.view.SurfaceHolder holder, int format, int width, int height) {
+                frameScheduler.surface(holder.getSurface());
                 if (!libraryLoaded) return;
                 setRenderSurface(holder.getSurface(), width, height);
                 if (!guestStarted) {
@@ -1856,6 +1873,7 @@ public final class HostActivity extends Activity {
                 }
             }
             @Override public void surfaceDestroyed(android.view.SurfaceHolder holder) {
+                frameScheduler.surface(null);
                 cancelGuestTouches();
                 if (libraryLoaded) setRenderSurface(null, 0, 0);
             }

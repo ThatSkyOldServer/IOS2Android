@@ -67,6 +67,7 @@ static Word metal_descriptor_create(unsigned kind) {
     for (unsigned i=range.first;i<range.first+range.count;++i)
         object->properties[metal_defaults[i].property]=metal_defaults[i].value;
     if (kind==MD_SAMPLER) object->lod_max=3.402823466e38F;
+    if (kind==MD_PASS_COLOR) object->clear_color[3]=1;
     object->clear_depth=1;
     return (Word)object;
 }

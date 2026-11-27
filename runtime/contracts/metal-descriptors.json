@@ -70,12 +70,12 @@
     {
       "id": "MD_PASS_DEPTH",
       "name": "MTLRenderPassDepthAttachmentDescriptor",
-      "defaults": {}
+      "defaults": {"depthResolveFilter": 0}
     },
     {
       "id": "MD_PASS_STENCIL",
       "name": "MTLRenderPassStencilAttachmentDescriptor",
-      "defaults": {}
+      "defaults": {"stencilResolveFilter": 0}
     },
     {
       "id": "MD_VERTEX",
@@ -250,6 +250,11 @@
       "kinds": [
         "MD_SAMPLER"
       ],
+      "reference": false
+    },
+    {
+      "name": "borderColor",
+      "kinds": ["MD_SAMPLER"],
       "reference": false
     },
     {
@@ -523,6 +528,16 @@
         "MD_PASS_DEPTH",
         "MD_PASS_STENCIL"
       ],
+      "reference": false
+    },
+    {
+      "name": "depthResolveFilter",
+      "kinds": ["MD_PASS_DEPTH"],
+      "reference": false
+    },
+    {
+      "name": "stencilResolveFilter",
+      "kinds": ["MD_PASS_STENCIL"],
       "reference": false
     },
     {

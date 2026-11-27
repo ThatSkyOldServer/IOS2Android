@@ -63,12 +63,13 @@ struct MetalTexture {
     struct MetalFormat format;
     Word type,width,height,depth,mips,samples,array_length,usage,layers;
     VkImage image;
-    VkImageView view,sampled_view;
+    VkImageView view,sampled_view,storage_view;
     VkDeviceMemory memory;
     VkDeviceSize allocation;
     VkImageLayout layout;
+    VkPipelineStageFlags read_stages;
     VkImageUsageFlags native_usage;
-    unsigned decode_pvrtc;
+    unsigned decode_pvrtc,sampled_identity;
     struct MetalLifetime lifetime;
 };
 struct MetalRegion { size_t x,y,z,width,height,depth; };
@@ -77,6 +78,7 @@ static void metal_texture_dispose(struct MetalTexture *texture) {
     if (texture->allocation) metal_memory_sub(1,texture->allocation);
     if (texture->image) metal_render_cache_invalidate(texture);
     if (texture->sampled_view && texture->sampled_view!=texture->view) VKD(vkDestroyImageView)(vulkan.device,texture->sampled_view,NULL);
+    if (texture->storage_view) VKD(vkDestroyImageView)(vulkan.device,texture->storage_view,NULL);
     if (texture->view) VKD(vkDestroyImageView)(vulkan.device,texture->view,NULL);
     if (texture->image) VKD(vkDestroyImage)(vulkan.device,texture->image,NULL);
     if (texture->memory) VKD(vkFreeMemory)(vulkan.device,texture->memory,NULL);
@@ -140,7 +142,7 @@ static Word metal_texture_new(Word device,const char *selector,struct MetalDescr
         ((texture->type==0 || texture->type==2 || texture->type==4 || texture->type==5) && texture->array_length!=1) ||
         ((texture->type==5 || texture->type==6) && texture->width!=texture->height) ||
         (texture->samples>1 && texture->type!=4 && texture->type!=8) || (texture->samples>1 && texture->mips!=1) ||
-        (texture->type==6 && !vulkan.features.imageCubeArray) || storage>2 || (texture->usage&~0x17UL);
+        (texture->type==6 && !vulkan.features.imageCubeArray) || storage>3 || (texture->usage&~0x17UL);
     if(invalid) {
         char detail[256];snprintf(detail,sizeof(detail),"Metal=%lu type=%lu extent=%lux%lux%lu mips=%lu layers=%lu samples=%lu options=0x%lx usage=0x%lx",
             pixel,texture->type,texture->width,texture->height,texture->depth,texture->mips,texture->layers,texture->samples,texture->object.options,texture->usage);
@@ -199,11 +201,18 @@ static Word metal_texture_new(Word device,const char *selector,struct MetalDescr
             .subresourceRange={texture->format.aspects,0,(uint32_t)texture->mips,0,(uint32_t)texture->layers}};
         if (pixel==1) view_info.components=(VkComponentMapping){VK_COMPONENT_SWIZZLE_ZERO,VK_COMPONENT_SWIZZLE_ZERO,VK_COMPONENT_SWIZZLE_ZERO,VK_COMPONENT_SWIZZLE_R};
         if (pvrtc && pixel<164) view_info.components.a=VK_COMPONENT_SWIZZLE_ONE;
+        texture->sampled_identity=view_info.components.r==VK_COMPONENT_SWIZZLE_IDENTITY && view_info.components.g==VK_COMPONENT_SWIZZLE_IDENTITY &&
+            view_info.components.b==VK_COMPONENT_SWIZZLE_IDENTITY && view_info.components.a==VK_COMPONENT_SWIZZLE_IDENTITY;
         operation="vkCreateImageView texture";result=VKD(vkCreateImageView)(vulkan.device,&view_info,NULL,&texture->view);
         texture->sampled_view=texture->view;
         if (result==VK_SUCCESS && texture->format.aspects==(VK_IMAGE_ASPECT_DEPTH_BIT|VK_IMAGE_ASPECT_STENCIL_BIT)) {
             view_info.subresourceRange.aspectMask=VK_IMAGE_ASPECT_DEPTH_BIT;
             operation="vkCreateImageView depth sample";result=VKD(vkCreateImageView)(vulkan.device,&view_info,NULL,&texture->sampled_view);
+        }
+        if (result==VK_SUCCESS && (usage&VK_IMAGE_USAGE_STORAGE_BIT)) {
+            view_info.subresourceRange.levelCount=1;
+            view_info.components=(VkComponentMapping){0};
+            operation="vkCreateImageView storage";result=VKD(vkCreateImageView)(vulkan.device,&view_info,NULL,&texture->storage_view);
         }
     }
     if(result!=VK_SUCCESS) {
@@ -291,7 +300,10 @@ static void metal_texture_replace(struct MetalTexture *texture,const char *selec
             (format.aspects==VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL) : VK_IMAGE_LAYOUT_GENERAL};
     pthread_mutex_lock(&texture->mutex);
     result=metal_upload_record(metal_record_texture_upload,&upload,slot,(Word)texture);
-    if (result==VK_SUCCESS) texture->layout=upload.final_layout;
+    if (result==VK_SUCCESS) {
+        texture->layout=upload.final_layout;
+        texture->read_stages=VK_PIPELINE_STAGE_VERTEX_SHADER_BIT|VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT|VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    }
     pthread_mutex_unlock(&texture->mutex);
     if (result!=VK_SUCCESS) stop("Vulkan texture upload failed",selector);
     LOG_LIMITED(24,"Vulkan texture upload recorded: %zu bytes mip=%lu slice=%lu",total,mip,slice);

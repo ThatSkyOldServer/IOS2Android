@@ -3,21 +3,24 @@ struct DisplayLink {
     Word isa,target;
     const char *selector;
     struct ScheduledWork *work;
-    unsigned modes,paused,invalid,interval,counter,preferred;
+    unsigned modes,paused,invalid,interval,counter,preferred,effective_interval;
     double timestamp,duration;
+    int64_t delivered_vsync_ns;
     struct DisplayLink *next;
 };
 static struct DisplayLink *display_links;
 static void display_links_changed(void) {
-    int active=0;
+    int active=0,unrestricted=0;unsigned preferred=0;
     pthread_mutex_lock(&scheduling_mutex);
     for (struct DisplayLink *link=display_links;link;link=link->next)
-        if (!link->invalid && !link->paused && link->modes && link->work->loop && !link->work->loop->failed) active=1;
+        if (!link->invalid && !link->paused && link->modes && link->work->loop && !link->work->loop->failed) {
+            active=1;if(!link->preferred)unrestricted=1;else if(link->preferred>preferred)preferred=link->preferred;
+        }
     pthread_mutex_unlock(&scheduling_mutex);
     JNIEnv *env=attached_environment("CADisplayLink registration");
     jclass type=(*env)->GetObjectClass(env,activity);
-    jmethodID configure=(*env)->GetMethodID(env,type,"setDisplayLinksActive","(Z)V");
-    (*env)->CallVoidMethod(env,activity,configure,active ? JNI_TRUE : JNI_FALSE);
+    jmethodID configure=(*env)->GetMethodID(env,type,"setDisplayLinksActive","(ZF)V");
+    (*env)->CallVoidMethod(env,activity,configure,active ? JNI_TRUE : JNI_FALSE,(jfloat)(unrestricted ? 0 : preferred));
     (*env)->DeleteLocalRef(env,type);
     if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); stop("Android vsync registration failed","CADisplayLink"); }
 }
@@ -45,12 +48,13 @@ static void display_link_add(struct DisplayLink *link,const char *selector,Word 
     }
     if (!link->modes) ++native->ports;
     link->work->loop=native; link->modes|=bits; link->work->valid=1;
-    pthread_cond_broadcast(&scheduling_condition); pthread_mutex_unlock(&scheduling_mutex);
+    work_update_locked(link->work);loop_notify_locked(native);pthread_mutex_unlock(&scheduling_mutex);
     display_links_changed();
 }
 static void display_link_remove(struct DisplayLink *link,const char *selector,Word loop,Word mode) {
     unsigned bits=display_mode(mode,selector);
     pthread_mutex_lock(&scheduling_mutex);
+    struct NativeLoop *previous=link->work->loop;
     if (link->work->loop && link->work->loop->object==loop && (link->modes&bits)) {
         link->modes&=~bits;
         if (!link->modes) {
@@ -58,29 +62,30 @@ static void display_link_remove(struct DisplayLink *link,const char *selector,Wo
             link->work->scheduled=0; ++link->work->generation; link->work->loop=NULL;
         }
     }
-    pthread_cond_broadcast(&scheduling_condition); pthread_mutex_unlock(&scheduling_mutex);
+    work_update_locked(link->work);loop_notify_locked(previous);pthread_mutex_unlock(&scheduling_mutex);
     display_links_changed();
 }
 static void display_link_invalidate(struct DisplayLink *link) {
     pthread_mutex_lock(&scheduling_mutex);
     if (link->modes && link->work->loop && link->work->loop->ports) --link->work->loop->ports;
     link->modes=0; link->invalid=1; link->work->valid=0; link->work->scheduled=0; ++link->work->generation;
-    pthread_cond_broadcast(&scheduling_condition); pthread_mutex_unlock(&scheduling_mutex);
+    work_update_locked(link->work);loop_notify_locked(link->work->loop);pthread_mutex_unlock(&scheduling_mutex);
     display_links_changed();
 }
 static void display_link_pause(struct DisplayLink *link,const char *selector,unsigned char paused) {
     pthread_mutex_lock(&scheduling_mutex);
-    link->paused=paused!=0; link->counter=0;
+    link->paused=paused!=0; link->counter=0; link->delivered_vsync_ns=0;
     if (paused) { link->work->scheduled=0; ++link->work->generation; }
-    pthread_mutex_unlock(&scheduling_mutex); display_links_changed();
+    work_update_locked(link->work);pthread_mutex_unlock(&scheduling_mutex);display_links_changed();
 }
 static void display_link_rate(struct DisplayLink *link,const char *selector,Word value) {
     int preferred=!strcmp(selector,"setPreferredFramesPerSecond:");
     if ((!preferred && !value) || value>1000) stop("Invalid display rate",selector);
     pthread_mutex_lock(&scheduling_mutex);
     if (preferred) link->preferred=value; else { link->interval=value; link->preferred=0; }
-    link->counter=0; pthread_mutex_unlock(&scheduling_mutex);
+    link->counter=0;link->effective_interval=0;link->delivered_vsync_ns=0;pthread_mutex_unlock(&scheduling_mutex);
     if (render_diagnostics_requested) LOG("[DIAG-render] Display link rate: interval=%u preferred=%u",link->interval,link->preferred);
+    display_links_changed();
 }
 static Word display_link_integer(struct DisplayLink *link,const char *selector) {
     pthread_mutex_lock(&scheduling_mutex);
@@ -89,7 +94,8 @@ static Word display_link_integer(struct DisplayLink *link,const char *selector) 
 }
 static double display_link_time(struct DisplayLink *link,const char *selector) {
     pthread_mutex_lock(&scheduling_mutex);
-    double value=!strcmp(selector,"duration") ? link->duration : !strcmp(selector,"targetTimestamp") ? link->timestamp+link->duration*link->interval : link->timestamp;
+    unsigned interval=link->effective_interval ? link->effective_interval : link->interval;
+    double value=!strcmp(selector,"duration") ? link->duration : !strcmp(selector,"targetTimestamp") ? link->timestamp+link->duration*interval : link->timestamp;
     pthread_mutex_unlock(&scheduling_mutex); return value;
 }
 JNIEXPORT jstring JNICALL HOST_JNI(FrameScheduler_frame)(JNIEnv *env,jclass cls,jlong nanos,jdouble refresh) {
@@ -102,17 +108,32 @@ JNIEXPORT jstring JNICALL HOST_JNI(FrameScheduler_frame)(JNIEnv *env,jclass cls,
             struct ScheduledWork *work=link->work;
             if (link->invalid || link->paused || !link->modes || !work->loop || work->loop->failed) continue;
             unsigned interval=link->preferred ? (unsigned)fmax(1,round(refresh/link->preferred)) : link->interval;
+            if(link->effective_interval!=interval){link->effective_interval=interval;link->counter=0;link->delivered_vsync_ns=0;}
             static unsigned logged;
             if (render_diagnostics_requested && __atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)<3)
                 LOG("[DIAG-render] Display source: refresh=%g interval=%u target=%s",refresh,interval,link->selector);
-            if (++link->counter<interval) continue;
-            link->counter=0;
+            if (link->preferred) {
+                /* Choreographer timestamps identify display opportunities, not the
+                 * number of Java callbacks delivered. A busy run loop must not
+                 * consume a preferred-rate slot. Try again on a real vsync; do
+                 * not enqueue a replay or run a catch-up frame between vsyncs.
+                 * Allow 5% of one refresh period for nominal rate/timestamp skew. */
+                if (interval>1 && link->delivered_vsync_ns && nanos>=link->delivered_vsync_ns &&
+                    (double)(nanos-link->delivered_vsync_ns)*refresh < (interval-0.05)*1e9) continue;
+            } else {
+                if (++link->counter<interval) continue;
+                link->counter=0;
+            }
             if (work->running || work->scheduled) continue;
+            link->delivered_vsync_ns=nanos;
             link->timestamp=nanos*1e-9; link->duration=1.0/refresh;
             work->deadline=scheduling_now(); work->valid=1; work->scheduled=1; work->done=0; ++work->generation;
+            work_update_locked(work);
+            if(work->loop->object==(Word)&main_run_loop) {
+                pthread_mutex_unlock(&scheduling_mutex);schedule_main_work(work);pthread_mutex_lock(&scheduling_mutex);
+            }
         }
-        pthread_cond_broadcast(&scheduling_condition); pthread_mutex_unlock(&scheduling_mutex);
-        for (struct DisplayLink *link=display_links;link;link=link->next) schedule_main_work(link->work);
+        pthread_mutex_unlock(&scheduling_mutex);
     }
     may_unwind=0;
     return failed ? (*env)->NewStringUTF(env,status) : NULL;

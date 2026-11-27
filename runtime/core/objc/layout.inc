@@ -30,6 +30,7 @@ static uint32_t external_instance_size(Word cls) {
     if (!strcmp(name,"_OBJC_CLASS_$_SKPayment") || !strcmp(name,"_OBJC_CLASS_$_SKMutablePayment")) return sizeof(struct StorePayment);
     if (!strcmp(name,"_OBJC_CLASS_$_SKPaymentTransaction")) return sizeof(struct StoreTransaction);
     if (!strcmp(name,"_OBJC_CLASS_$_NSLayoutConstraint")) return sizeof(struct LayoutConstraint);
+    if (!strcmp(name,"_OBJC_CLASS_$_UIColor")) return sizeof(struct UIKitColor);
     if (!strcmp(name,"_OBJC_CLASS_$_CLLocation")) return sizeof(struct LocationValue);
     return 8;  
 }

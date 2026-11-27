@@ -59,8 +59,49 @@ static void format_unicode_field(struct FormatText *out,const uint16_t *units,si
     format_units(out,units,count);
     if (left) format_padding(out,padding);
 }
+static pthread_once_t format_locale_once=PTHREAD_ONCE_INIT;
+static jmethodID format_locale_method;
+static void format_locale_initialize(void) {
+    JNIEnv *env=attached_environment("Localized string format");
+    jclass type=(*env)->GetObjectClass(env,activity);
+    format_locale_method=(*env)->GetMethodID(env,type,"localizedFormatNumber","(JCIII)Ljava/lang/String;");
+    (*env)->DeleteLocalRef(env,type);
+    if ((*env)->ExceptionCheck(env) || !format_locale_method) {
+        (*env)->ExceptionClear(env); stop("Localized formatter unavailable","NSString");
+    }
+}
+static void format_localized_number(struct FormatText *out,Word value,char code,const char *length,const char *flags,int width,int precision) {
+    if (code=='d' || code=='i') {
+        if (length[0]=='h') value=length[1] ? (Word)(int64_t)(int8_t)value : (Word)(int64_t)(int16_t)value;
+        else if (!length[0]) value=(Word)(int64_t)(int32_t)value;
+    } else if (code=='u') {
+        if (length[0]=='h') value=length[1] ? (uint8_t)value : (uint16_t)value;
+        else if (!length[0]) value=(uint32_t)value;
+    }
+    int options=0; const char *names="-+ 0#";
+    for (unsigned i=0;names[i];++i) if (strchr(flags,names[i])) options|=1<<i;
+    pthread_once(&format_locale_once,format_locale_initialize);
+    JNIEnv *env=attached_environment("Localized string format");
+    jstring text=(*env)->CallObjectMethod(env,activity,format_locale_method,(jlong)value,(jchar)code,(jint)options,(jint)width,(jint)precision);
+    if ((*env)->ExceptionCheck(env) || !text) {
+        (*env)->ExceptionClear(env); stop("Localized number formatting failed","NSString");
+    }
+    const jchar *units=(*env)->GetStringChars(env,text,NULL);
+    if (!units) { (*env)->ExceptionClear(env); stop("Allocation failed","Localized string format"); }
+    format_units(out,units,(size_t)(*env)->GetStringLength(env,text));
+    (*env)->ReleaseStringChars(env,text,units); (*env)->DeleteLocalRef(env,text);
+}
+static int format_scalar(char *output,size_t capacity,const char *spec,char code,Word value,int wide) {
+    if (code=='s') return snprintf(output,capacity,spec,value ? (const char *)value : "(null)");
+    if (code=='p') return snprintf(output,capacity,spec,(void *)value);
+    if (code=='c') return snprintf(output,capacity,spec,(int)value);
+    if (code=='d' || code=='i') return wide ? snprintf(output,capacity,spec,(long long)value) : snprintf(output,capacity,spec,(int)value);
+    if (strchr("ouxX",code)) return wide ? snprintf(output,capacity,spec,(unsigned long long)value) : snprintf(output,capacity,spec,(unsigned int)value);
+    double number;memcpy(&number,&value,sizeof(number));return snprintf(output,capacity,spec,number);
+}
 __attribute__((used,noinline)) static Word foundation_format(Word cls,const char *selector,Word format,const unsigned char *arguments) {
     const char *text=string_bytes(format,selector),*cursor=text;
+    int localized=!strcmp(selector,"localizedStringWithFormat:");
     struct FormatText out={0}; unsigned next=1;
     while (*cursor) {
         const char *literal=cursor;
@@ -98,6 +139,7 @@ __attribute__((used,noinline)) static Word foundation_format(Word cls,const char
         if (!code) stop("Unterminated NSString format",text);
         ++cursor;
         if (!strchr("@CSspdiouxXcDfFeEgGaAUOn",code)) stop("Unsupported NSString format",text);
+        if (localized && code=='@' && strchr(flags,'#')) stop("Localized plural format unavailable",text);
         Word value=format_slot(arguments,position,&next);
         if (code=='@' || code=='C' || code=='S' || ((code=='s' || code=='c') && length[0]=='l')) {
             struct TextView view={0}; uint16_t single=(uint16_t)value; char *description=NULL;
@@ -130,7 +172,7 @@ __attribute__((used,noinline)) static Word foundation_format(Word cls,const char
             free(view.owned); free(description); continue;
         }
         int wide=length[0] && length[0]!='h';
-        if (code=='D' || code=='U' || code=='O') { wide=1; code=code=='D' ? 'd' : code=='U' ? 'u' : 'o'; }
+        if (code=='D' || code=='U' || code=='O') { wide=1; length[0]='l'; code=code=='D' ? 'd' : code=='U' ? 'u' : 'o'; }
         if (code=='n') {
             if (!value) stop("Nil format count pointer",selector);
             if (length[0]=='h' && length[1]) *(signed char *)value=(signed char)out.count;
@@ -139,22 +181,25 @@ __attribute__((used,noinline)) static Word foundation_format(Word cls,const char
             else *(int *)value=(int)out.count;
             continue;
         }
+        if (localized && strchr("diufFeEgG",code)) {
+            format_localized_number(&out,value,code,length,flags,width,precision); continue;
+        }
         char spec[64],precision_text[20]={0};
         if (precision>=0) snprintf(precision_text,sizeof(precision_text),".%d",precision);
         const char *modifier=strchr("diouxX",code) ? (wide ? "ll" : length[0]=='h' ? length : "") : "";
         snprintf(spec,sizeof(spec),"%%%s%d%s%s%c",flags,width,precision_text,modifier,code);
-        char *rendered=NULL; size_t size=0; FILE *stream=open_memstream(&rendered,&size);
-        if (!stream) stop("Allocation failed",selector);
-        if (code=='s') fprintf(stream,spec,value ? (const char *)value : "(null)");
-        else if (code=='p') fprintf(stream,spec,(void *)value);
-        else if (code=='c') fprintf(stream,spec,(int)value);
-        else if (code=='d' || code=='i') {
-            if (wide) fprintf(stream,spec,(long long)value); else fprintf(stream,spec,(int)value);
-        } else if (strchr("ouxX",code)) {
-            if (wide) fprintf(stream,spec,(unsigned long long)value); else fprintf(stream,spec,(unsigned int)value);
-        } else { double number; memcpy(&number,&value,sizeof(number)); fprintf(stream,spec,number); }
-        if (fclose(stream)) stop("String formatting failed",selector);
-        format_utf8(&out,rendered,size); free(rendered);
+        /* Most numeric fields fit on the stack. Avoid a FILE and its heap
+         * buffer per field; preserve the exact printf format and Darwin slots. */
+        char local[256],*rendered=local;
+        int size=format_scalar(local,sizeof(local),spec,code,value,wide);
+        if (size<0) stop("String formatting failed",selector);
+        if ((size_t)size>=sizeof(local)) {
+            rendered=malloc((size_t)size+1);if (!rendered) stop("Allocation failed",selector);
+            if (format_scalar(rendered,(size_t)size+1,spec,code,value,wide)!=size) {
+                free(rendered);stop("String formatting changed during conversion",selector);
+            }
+        }
+        format_utf8(&out,rendered,(size_t)size);if (rendered!=local) free(rendered);
     }
     Word result=text_from_units(cls==external_class("_OBJC_CLASS_$_NSMutableString") ? cls : external_class("_OBJC_CLASS_$_NSString"),out.units,out.count);
     free(out.units); return result;

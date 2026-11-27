@@ -1,7 +1,7 @@
 /* Foundation scheduling uses Android's main Handler and condition-backed
  * native runloops. Guest callbacks remain on their requested thread. */
 struct ScheduledWork;
-struct NativeLoop { Word object; unsigned ports; int failed; struct NativeLoop *next; };
+struct NativeLoop { Word object; unsigned ports; int failed; pthread_cond_t condition; struct ScheduledWork *work; struct NativeLoop *next; };
 struct ScheduledWork {
     struct HostObject object;
     Word target,argument,block,info;
@@ -14,7 +14,10 @@ struct ScheduledWork {
     void *context;
     unsigned replay;
     intptr_t order;
-    struct ScheduledWork *next;
+    pthread_cond_t completed;
+    struct NativeLoop *queued_loop;
+    struct ScheduledWork *next,*previous;
+    unsigned main_generation,main_queued;
 };
 struct NativeThread {
     Word object,target,argument,block,name,loop;
@@ -22,12 +25,11 @@ struct NativeThread {
     pthread_t handle;
     size_t stack;
     int started,executing,finished,cancelled,failed;
+    pthread_cond_t condition;
     struct NativeThread *next;
 };
 static pthread_mutex_t scheduling_mutex=PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t scheduling_condition=PTHREAD_COND_INITIALIZER;
 static struct NativeLoop *native_loops;
-static struct ScheduledWork *scheduled_work;
 static struct NativeThread *native_threads;
 static _Thread_local struct NativeThread *active_native_thread;
 static double scheduling_now(void) { struct timespec value; clock_gettime(CLOCK_REALTIME,&value); return value.tv_sec+value.tv_nsec*1e-9; }
@@ -38,9 +40,37 @@ static struct NativeLoop *native_loop(Word object) {
     if (!loop) {
         loop=calloc(1,sizeof(*loop));
         if (!loop) { pthread_mutex_unlock(&scheduling_mutex); stop("Allocation failed","NSRunLoop"); }
+        pthread_cond_init(&loop->condition,NULL);
         loop->object=object; loop->next=native_loops; native_loops=loop;
     }
     pthread_mutex_unlock(&scheduling_mutex); return loop;
+}
+static void loop_notify_locked(struct NativeLoop *loop) { if(loop)pthread_cond_signal(&loop->condition); }
+/* Keep only runnable/timed work in its owner's queue. Tokens may still be held
+ * by Java or guest objects after invalidation, so unlinking does not free them. */
+static void work_update_locked(struct ScheduledWork *work) {
+    struct NativeLoop *desired=work->valid && work->scheduled && !work->running && work->loop && !work->loop->failed ? work->loop : NULL;
+    struct NativeLoop *previous=work->queued_loop;
+    if(previous && previous!=desired) {
+        if(work->previous)work->previous->next=work->next;else previous->work=work->next;
+        if(work->next)work->next->previous=work->previous;
+        work->next=work->previous=NULL;work->queued_loop=NULL;
+        loop_notify_locked(previous);
+    }
+    if(desired && !work->queued_loop) {
+        work->next=desired->work;if(work->next)work->next->previous=work;
+        desired->work=work;work->queued_loop=desired;
+    }
+    if(desired)loop_notify_locked(desired);
+}
+static void loop_fail_locked(struct NativeLoop *loop) {
+    if(!loop)return;
+    loop->failed=1;
+    while(loop->work) {
+        struct ScheduledWork *work=loop->work;work->valid=0;work->done=1;
+        work_update_locked(work);pthread_cond_broadcast(&work->completed);
+    }
+    loop_notify_locked(loop);
 }
 static int scheduling_mode(Word mode) {
     if (!mode) return 0;
@@ -55,8 +85,10 @@ static void scheduling_modes(Word modes,const char *selector) {
 }
 static void schedule_main_work(struct ScheduledWork *work) {
     pthread_mutex_lock(&scheduling_mutex);
-    int valid=work->valid && work->scheduled && work->loop && work->loop->object==(Word)&main_run_loop;
+    int valid=work->valid && work->scheduled && !work->running && work->loop && !work->loop->failed && work->loop->object==(Word)&main_run_loop;
     unsigned generation=work->generation;
+    if(valid && work->main_queued && work->main_generation==generation)valid=0;
+    if(valid){work->main_queued=1;work->main_generation=generation;}
     double delay=fmax(0,work->deadline-scheduling_now());
     pthread_mutex_unlock(&scheduling_mutex);
     if (!valid) return;
@@ -71,19 +103,19 @@ static struct ScheduledWork *work_create(void) {
     struct ScheduledWork *work=calloc(1,sizeof(*work));
     if (!work) stop("Allocation failed","Delayed work");
     work->valid=1;
+    pthread_cond_init(&work->completed,NULL);
     return work;
 }
 static void work_publish(struct ScheduledWork *work) {
     pthread_mutex_lock(&scheduling_mutex);
-    work->next=scheduled_work; scheduled_work=work;
-    pthread_cond_broadcast(&scheduling_condition);
+    work_update_locked(work);
     pthread_mutex_unlock(&scheduling_mutex);
     schedule_main_work(work);
 }
 static Word loop_function_create(Word loop,void (*function)(void *),void *context,void (*cleanup)(void *)) {
     struct ScheduledWork *work=work_create();work->external_source=1;work->loop=native_loop(loop);
     work->function=function;work->context=context;work->cleanup=cleanup;
-    pthread_mutex_lock(&scheduling_mutex);++work->loop->ports;pthread_mutex_unlock(&scheduling_mutex);
+    pthread_mutex_lock(&scheduling_mutex);++work->loop->ports;loop_notify_locked(work->loop);pthread_mutex_unlock(&scheduling_mutex);
     work_publish(work);return (Word)work;
 }
 static void loop_function_signal(Word object) {
@@ -91,7 +123,7 @@ static void loop_function_signal(Word object) {
     pthread_mutex_lock(&scheduling_mutex);
     int submit=work->valid && !work->scheduled;
     if(work->valid){if(work->running)work->replay=1;else if(!work->scheduled){work->scheduled=1;work->deadline=scheduling_now();++work->generation;}}
-    pthread_cond_broadcast(&scheduling_condition);pthread_mutex_unlock(&scheduling_mutex);
+    if(submit)work_update_locked(work);pthread_mutex_unlock(&scheduling_mutex);
     if(submit)schedule_main_work(work);
 }
 static void loop_function_close(Word object) {
@@ -100,7 +132,7 @@ static void loop_function_close(Word object) {
     pthread_mutex_lock(&scheduling_mutex);
     if(work->valid){work->valid=work->scheduled=work->replay=0;++work->generation;if(work->loop->ports)--work->loop->ports;}
     if(!work->running){cleanup=work->cleanup;context=work->context;work->cleanup=NULL;work->context=NULL;}
-    pthread_cond_broadcast(&scheduling_condition);pthread_mutex_unlock(&scheduling_mutex);
+    work_update_locked(work);loop_notify_locked(work->loop);pthread_mutex_unlock(&scheduling_mutex);
     if(cleanup)cleanup(context);
 }
 static int runtime_block(Word object) {
@@ -151,30 +183,31 @@ static void work_complete(struct ScheduledWork *work,int failed) {
     if (work->external_source) {
         work->scheduled=work->valid && work->replay;work->replay=0;
         if(work->scheduled){work->deadline=scheduling_now();++work->generation;}
-        if (failed) { if(work->valid && work->function && work->loop->ports)--work->loop->ports;work->valid=work->scheduled=0; if (work->loop) work->loop->failed=1; }
+        if (failed) { if(work->valid && work->function && work->loop->ports)--work->loop->ports;work->valid=work->scheduled=0;loop_fail_locked(work->loop); }
         void (*cleanup)(void *)=!work->valid ? work->cleanup : NULL;void *context=work->context;
         if(cleanup){work->cleanup=NULL;work->context=NULL;}
-        pthread_cond_broadcast(&scheduling_condition);
+        work_update_locked(work);pthread_cond_broadcast(&work->completed);
         pthread_mutex_unlock(&scheduling_mutex);
         if(cleanup)cleanup(context);
         schedule_main_work(work);
         return;
     }
     if (failed || !work->timer || !work->interval) work->valid=0;
-    if (failed && work->loop) work->loop->failed=1;
+    if (failed)loop_fail_locked(work->loop);
     if (work->valid && work->scheduled) {
         double now=scheduling_now();
         if (work->deadline<=now) work->deadline+=(floor((now-work->deadline)/work->interval)+1)*work->interval;
         ++work->generation;
     }
-    pthread_cond_broadcast(&scheduling_condition);
+    work_update_locked(work);pthread_cond_broadcast(&work->completed);
     pthread_mutex_unlock(&scheduling_mutex);
     schedule_main_work(work);
 }
 static int work_claim(struct ScheduledWork *work,unsigned generation) {
     pthread_mutex_lock(&scheduling_mutex);
     int valid=work->valid && work->scheduled && !work->running && work->generation==generation && !work->loop->failed;
-    if (valid) work->running=1;
+    if(work->main_queued && work->main_generation==generation)work->main_queued=0;
+    if (valid) { work->running=1;work_update_locked(work); }
     pthread_mutex_unlock(&scheduling_mutex); return valid;
 }
 JNIEXPORT jstring JNICALL HOST_JNI(HostActivity_runGuestWork)(JNIEnv *env,jobject instance,jlong token,jint generation) {
@@ -199,18 +232,18 @@ static Word loop_run_mode(Word object,const char *selector,Word mode,Word date) 
         struct ScheduledWork *candidate=NULL;
         int has_source=loop->ports!=0;
         double now=scheduling_now();
-        for (struct ScheduledWork *work=scheduled_work;work;work=work->next) if (work->loop==loop && work->valid && work->scheduled && !work->running) {
+        for (struct ScheduledWork *work=loop->work;work;work=work->next) {
             has_source=1; if (!candidate || (work->external_source && candidate->external_source && work->deadline<=now && candidate->deadline<=now ? work->order<candidate->order : work->deadline<candidate->deadline)) candidate=work;
         }
         if (loop->failed) { pthread_mutex_unlock(&scheduling_mutex); stop("Runloop callback failed",selector); }
         if (!has_source || now>=until) { pthread_mutex_unlock(&scheduling_mutex); return has_source; }
         if (candidate && candidate->deadline<=now) {
-            candidate->running=1; pthread_mutex_unlock(&scheduling_mutex);
+            candidate->running=1;work_update_locked(candidate);pthread_mutex_unlock(&scheduling_mutex);
             work_invoke(candidate); work_complete(candidate,0); return 1;
         }
         double deadline=candidate ? fmin(until,candidate->deadline) : until;
         struct timespec timeout={(time_t)floor(deadline),(long)((deadline-floor(deadline))*1e9)};
-        pthread_cond_timedwait(&scheduling_condition,&scheduling_mutex,&timeout);
+        pthread_cond_timedwait(&loop->condition,&scheduling_mutex,&timeout);
         pthread_mutex_unlock(&scheduling_mutex);
     }
 }
@@ -229,13 +262,13 @@ static void loop_add_port(Word object,const char *selector,struct HostObject *po
     pthread_mutex_lock(&scheduling_mutex);
     if (!port->content[1]) { port->content[1]=(Word)loop; ++loop->ports; }
     else if (port->content[1]!=(Word)loop) { pthread_mutex_unlock(&scheduling_mutex); stop("Port is already scheduled on another runloop",selector); }
-    pthread_cond_broadcast(&scheduling_condition); pthread_mutex_unlock(&scheduling_mutex);
+    loop_notify_locked(loop);pthread_mutex_unlock(&scheduling_mutex);
 }
 static void loop_remove_port(Word object,const char *selector,struct HostObject *port,Word mode) {
     pthread_mutex_lock(&scheduling_mutex);
     struct NativeLoop *loop=(void *)port->content[1];
     if (loop && loop->object==object) { if (loop->ports) --loop->ports; port->content[1]=0; }
-    pthread_cond_broadcast(&scheduling_condition); pthread_mutex_unlock(&scheduling_mutex);
+    loop_notify_locked(loop);pthread_mutex_unlock(&scheduling_mutex);
 }
 static void loop_port_invalidate(struct HostObject *port,const char *selector) {
     struct NativeLoop *loop=(void *)port->content[1];
@@ -250,7 +283,7 @@ static struct NativeThread *native_thread(Word object) {
     if (!thread) {
         thread=calloc(1,sizeof(*thread));
         if (!thread) { pthread_mutex_unlock(&scheduling_mutex); stop("Allocation failed","NSThread"); }
-        thread->object=object; thread->stack=1024*1024;
+        thread->object=object; thread->stack=1024*1024;pthread_cond_init(&thread->condition,NULL);
         if (object==(Word)&main_thread) { thread->started=thread->executing=1; thread->loop=core_main_runloop(); }
         thread->next=native_threads; native_threads=thread;
     }
@@ -285,7 +318,7 @@ static void *native_thread_entry(void *context) {
 #endif
     pthread_mutex_lock(&scheduling_mutex);
     thread->loop=core_current_runloop(); thread->handle=pthread_self(); thread->executing=1;
-    pthread_cond_broadcast(&scheduling_condition); pthread_mutex_unlock(&scheduling_mutex);
+    pthread_cond_broadcast(&thread->condition);pthread_mutex_unlock(&scheduling_mutex);
     struct NativeLoop *loop=native_loop(thread->loop);
     if (thread->name) guest_thread_name(string_bytes(thread->name,"NSThread name"));
     may_unwind=1;fatal_guest_thread=1;snprintf(stage,sizeof(stage),"NSThread %s",thread->selector ? thread->selector : "main");
@@ -303,9 +336,8 @@ static void *native_thread_entry(void *context) {
     if(failed==1)abort();
     may_unwind=0;fatal_guest_thread=0;
     pthread_mutex_lock(&scheduling_mutex);
-    thread->failed=0; thread->executing=0; thread->finished=1; loop->failed=1;
-    for (struct ScheduledWork *work=scheduled_work;work;work=work->next) if (work->loop==loop) { work->valid=0; work->done=1; work->running=0; }
-    pthread_cond_broadcast(&scheduling_condition); pthread_mutex_unlock(&scheduling_mutex);
+    thread->failed=0;thread->executing=0;thread->finished=1;loop_fail_locked(loop);
+    pthread_cond_broadcast(&thread->condition);loop_notify_locked(loop);pthread_mutex_unlock(&scheduling_mutex);
     return NULL;
 }
 static void native_thread_start(Word object,const char *selector) {
@@ -373,13 +405,16 @@ static void perform_delayed_modes(Word object,const char *selector,const char *a
 static void perform_cancel(Word object,const char *selector,Word target,const char *action,Word argument) {
     Word current=core_current_runloop();
     int filtered=strstr(selector,":selector:")!=NULL;
+    struct NativeLoop *loop=native_loop(current);
     pthread_mutex_lock(&scheduling_mutex);
-    for (struct ScheduledWork *work=scheduled_work;work;work=work->next) {
-        if (work->timer || work->target!=target || !work->loop || work->loop->object!=current || work->running) continue;
+    for (struct ScheduledWork *work=loop->work,*next;work;work=next) {
+        next=work->next;
+        if (work->timer || work->target!=target || work->running) continue;
         if (filtered && (strcmp(work->selector,action) || !same_objects(work->argument,argument))) continue;
         work->valid=0; work->cancelled=1; work->done=1; ++work->generation;
+        work_update_locked(work);pthread_cond_broadcast(&work->completed);
     }
-    pthread_cond_broadcast(&scheduling_condition); pthread_mutex_unlock(&scheduling_mutex);
+    pthread_mutex_unlock(&scheduling_mutex);
 }
 static void perform_cancel_all(Word object,const char *selector,Word target) { perform_cancel(object,selector,target,NULL,0); }
 static void perform_thread(Word object,const char *selector,const char *action,Word thread_object,Word argument,unsigned char wait) {
@@ -391,14 +426,14 @@ static void perform_thread(Word object,const char *selector,const char *action,W
     }
     pthread_mutex_lock(&scheduling_mutex);
     if (!thread->started) { pthread_mutex_unlock(&scheduling_mutex); stop("Target thread has not started",selector); }
-    while (!thread->loop && !thread->finished) pthread_cond_wait(&scheduling_condition,&scheduling_mutex);
+    while (!thread->loop && !thread->finished) pthread_cond_wait(&thread->condition,&scheduling_mutex);
     int unavailable=thread->finished || thread->failed; Word loop=thread->loop;
     pthread_mutex_unlock(&scheduling_mutex);
     if (unavailable) stop("Target thread has finished",selector);
     struct ScheduledWork *work=perform_enqueue(object,action,argument,loop,0);
     if (wait) {
         pthread_mutex_lock(&scheduling_mutex);
-        while (!work->done && !thread->finished && !work->loop->failed) pthread_cond_wait(&scheduling_condition,&scheduling_mutex);
+        while (!work->done && !thread->finished && !work->loop->failed) pthread_cond_wait(&work->completed,&scheduling_mutex);
         int failed=thread->failed || work->loop->failed;
         pthread_mutex_unlock(&scheduling_mutex);
         if (failed) stop("Target thread callback failed",action);
@@ -440,11 +475,11 @@ static void timer_add(Word object,const char *selector,struct ScheduledWork *tim
     if (!timer->valid) { pthread_mutex_unlock(&scheduling_mutex); return; }
     if (timer->loop && timer->loop!=loop) { pthread_mutex_unlock(&scheduling_mutex); stop("Timer already belongs to another runloop",selector); }
     timer->loop=loop; timer->scheduled=1; ++timer->generation;
-    pthread_cond_broadcast(&scheduling_condition); pthread_mutex_unlock(&scheduling_mutex); schedule_main_work(timer);
+    work_update_locked(timer);pthread_mutex_unlock(&scheduling_mutex);schedule_main_work(timer);
 }
 static void timer_invalidate(struct ScheduledWork *timer) {
     pthread_mutex_lock(&scheduling_mutex); timer->valid=0; timer->scheduled=0; ++timer->generation;
-    pthread_cond_broadcast(&scheduling_condition); pthread_mutex_unlock(&scheduling_mutex);
+    work_update_locked(timer);pthread_mutex_unlock(&scheduling_mutex);
 }
 static Word timer_valid(struct ScheduledWork *timer) { return __atomic_load_n(&timer->valid,__ATOMIC_ACQUIRE); }
 static Word timer_info(struct ScheduledWork *timer) { return timer->info; }
@@ -454,12 +489,16 @@ static void timer_set_tolerance(struct ScheduledWork *timer,const char *selector
 static Word timer_date(struct ScheduledWork *timer,const char *selector) { return date_epoch(external_class("_OBJC_CLASS_$_NSDate"),selector,timer->deadline); }
 static void timer_set_date(struct ScheduledWork *timer,const char *selector,Word date) {
     pthread_mutex_lock(&scheduling_mutex); timer->deadline=date_seconds(date); ++timer->generation;
-    pthread_cond_broadcast(&scheduling_condition); pthread_mutex_unlock(&scheduling_mutex); schedule_main_work(timer);
+    work_update_locked(timer);pthread_mutex_unlock(&scheduling_mutex);schedule_main_work(timer);
 }
 static void timer_fire(struct ScheduledWork *timer) {
-    if (!timer->valid || timer->running) return;
-    timer->running=1; work_invoke(timer); timer->running=0;
-    if (!timer->interval) timer_invalidate(timer);
+    pthread_mutex_lock(&scheduling_mutex);
+    if (!timer->valid || timer->running) {pthread_mutex_unlock(&scheduling_mutex);return;}
+    timer->running=1;work_update_locked(timer);pthread_mutex_unlock(&scheduling_mutex);
+    work_invoke(timer);
+    pthread_mutex_lock(&scheduling_mutex);timer->running=0;
+    if(!timer->interval){timer->valid=timer->scheduled=0;++timer->generation;}
+    work_update_locked(timer);pthread_mutex_unlock(&scheduling_mutex);
 }
 static Word distant_date(Word cls,const char *selector) { return date_epoch(cls,selector,!strcmp(selector,"distantFuture") ? 64092211200.0 : -62135769600.0); }
 static Method scheduling_method(Word object,const char *selector,const char *receiver,int class_receiver) {

@@ -17,6 +17,11 @@ static struct GuestPoint view_convert_point(Word,const char *,struct GuestPoint,
 static struct GuestRect view_transformed_frame(Word);
 static struct GuestPoint view_anchor(Word);
 static unsigned label_argb(Word,unsigned);
+static Word ui_color_pattern_image(Word);
+static double ui_color_opacity(Word),ui_image_scale(Word);
+static Word view_layer(Word);
+struct LayerState;
+static struct LayerState *layer_state(Word);
 static void ui_label_sync(Word);
 static void ui_web_sync(Word);
 static void ui_input_sync(Word);
@@ -114,6 +119,7 @@ static Word application_windows(void) {
 }
 static void view_sync_subtree(Word object) {
     struct ViewState *state=view_state(object);
+    if(ui_color_pattern_image(state->background))layer_state(view_layer(object));
     ui_label_sync(object);
     ui_web_sync(object);
     ui_input_sync(object);
@@ -609,7 +615,7 @@ struct LayerState {
     struct GuestTransform3D transform,sublayer_transform;
     struct GuestPoint anchor,start,end;
     struct GuestRect contents_rect;
-    Word background,border,colors,locations,contents,gravity,type,delegate,synced_background,synced_contents;
+    Word background,border,colors,locations,contents,gravity,type,delegate,synced_background,synced_contents,synced_pattern;
     double border_width;
     unsigned dirty,children_ready,layout_pending,layout_running,background_set,published;
 };
@@ -793,12 +799,13 @@ static void layer_set_value(Word object,const char *selector,Word value) {
     struct ViewState *view=view_state(object);struct LayerState *layer=layer_state(object);
     if(!strcmp(selector,"setDelegate:")){store_weak(&layer->delegate,value);return;}
     if(!strcmp(selector,"setBackgroundColor:") || !strcmp(selector,"setBorderColor:")){if(value && !class_inherits(read_word(value),external_class("_OBJC_CLASS_$_UIColor")))stop("Unsupported layer color",selector);
+        if(!strcmp(selector,"setBorderColor:") && ui_color_pattern_image(value))stop("Pattern border colors are unavailable",selector);
         if(!strcmp(selector,"setBorderColor:"))layer->border=value;else {layer->background_set=1;if(view->view)view_state(view->view)->background=value;else layer->background=value;}}
     else if(!strcmp(selector,"setContents:")){if(value && !class_inherits(read_word(value),external_class("_OBJC_CLASS_$_UIImage")))stop("Unsupported layer image contents",selector);layer->contents=value;}
     else if(!strcmp(selector,"setContentsGravity:")){const char *name=value ? string_bytes(value,selector) : "resize";const char *valid[]={"resize","resizeAspect","resizeAspectFill","center","top","bottom","left","right","topLeft","topRight","bottomLeft","bottomRight"};unsigned found=0;for(unsigned i=0;i<COUNT(valid);++i)found|=!strcmp(name,valid[i]);if(!found)stop("Unsupported layer contents gravity",selector);layer->gravity=copy_string(name);}
     else if(!strcmp(selector,"setType:")){if(value && strcmp(string_bytes(value,selector),"axial"))stop("Unsupported gradient type",selector);layer->type=value ? text_copy(value,"copy") : 0;}
     else {if(value && !class_inherits(read_word(value),external_class("_OBJC_CLASS_$_NSArray")))stop("Invalid gradient array",selector);struct Sequence *values=(void *)value;
-        if(values)for(size_t i=0;i<values->count;++i){if(!strcmp(selector,"setColors:")){if(!class_inherits(read_word(values->items[i]),external_class("_OBJC_CLASS_$_UIColor")))stop("Unsupported gradient color",selector);}else {if(!class_inherits(read_word(values->items[i]),external_class("_OBJC_CLASS_$_NSNumber")))stop("Invalid gradient location",selector);double p=numeric_double((void *)values->items[i]);if(!isfinite(p) || p<0 || p>1 || (i && p<numeric_double((void *)values->items[i-1])))stop("Invalid gradient stops",selector);}}
+        if(values)for(size_t i=0;i<values->count;++i){if(!strcmp(selector,"setColors:")){if(!class_inherits(read_word(values->items[i]),external_class("_OBJC_CLASS_$_UIColor")) || ui_color_pattern_image(values->items[i]))stop("Unsupported gradient color",selector);}else {if(!class_inherits(read_word(values->items[i]),external_class("_OBJC_CLASS_$_NSNumber")))stop("Invalid gradient location",selector);double p=numeric_double((void *)values->items[i]);if(!isfinite(p) || p<0 || p>1 || (i && p<numeric_double((void *)values->items[i-1])))stop("Invalid gradient stops",selector);}}
         Word copy=value ? sequence_copy((void *)value,"copy") : 0;Word *slot=!strcmp(selector,"setColors:") ? &layer->colors : &layer->locations;Word old=*slot;*slot=copy;if(old){struct Sequence *sequence=(void *)old;free(sequence->items);free(sequence);}}
     layer_changed(object);
 }
@@ -807,7 +814,7 @@ static void layer_set_gradient_point(Word object,const char *selector,struct Gue
 static struct GuestRect layer_contents_rect(Word object) { return layer_state(object)->contents_rect; }
 static void layer_set_contents_rect(Word object,const char *selector,struct GuestRect rect) { if(!isfinite(rect.x) || !isfinite(rect.y) || !isfinite(rect.width) || !isfinite(rect.height) || rect.width<0 || rect.height<0)stop("Invalid layer contents rectangle",selector);layer_state(object)->contents_rect=rect;layer_changed(object); }
 static Word layer_contains_point(Word object,const char *selector,struct GuestPoint point) { struct GuestRect bounds=layer_bounds(object);return point.x>=bounds.x && point.y>=bounds.y && point.x<bounds.x+bounds.width && point.y<bounds.y+bounds.height; }
-static int ui_layer_has_content(Word object) { struct ViewState *view=view_state(object);struct LayerState *layer=view_backing_state(object);return layer && (layer->border_width>0 || layer->contents || layer->colors || view_state(view->layer)->corner>0); }
+static int ui_layer_has_content(Word object) { struct ViewState *view=view_state(object);struct LayerState *layer=view_backing_state(object);return layer && (ui_color_pattern_image(view->background) || layer->border_width>0 || layer->contents || layer->colors || view_state(view->layer)->corner>0); }
 static void layer_layout_content(Word object,const char *selector) { struct LayerState *layer=layer_state(object);Word delegate=load_weak_retained(&layer->delegate);Method callback=delegate ? find_implementation(delegate,"layoutSublayersOfLayer:") : NULL;if(callback)callback(delegate,"layoutSublayersOfLayer:",object,0,0,0);metal_object_release(delegate); }
 static void layer_layout_if_needed(Word object,const char *selector) {
     struct LayerState *layer=layer_state(object);if(layer->layout_running)return;
@@ -1427,20 +1434,28 @@ static void ui_view_composition_sync(Word object) {
     jlongArray owners=count ? (*env)->NewLongArray(env,count) : NULL;if(owners)(*env)->SetLongArrayRegion(env,owners,0,count,(const jlong *)clip_owners);
     (*env)->CallVoidMethod(env,activity,method,(jlong)object,(jlong)host,(jboolean)raw,presentation,bounds,owners);(*env)->DeleteLocalRef(env,presentation);if(bounds)(*env)->DeleteLocalRef(env,bounds);if(owners)(*env)->DeleteLocalRef(env,owners);if((*env)->ExceptionCheck(env)){(*env)->ExceptionClear(env);stop("Android view composition failed","UIView");}
 }
+static jbyteArray ui_layer_image_bytes(JNIEnv *env,Word image) {
+    if(!image)return NULL;struct HostObject *data=(void *)image_png((void *)image);
+    if(!data || data->content[0]>INT_MAX)stop("Invalid layer image","CALayer");
+    jbyteArray bytes=(*env)->NewByteArray(env,data->content[0]);if(!bytes)stop("Allocation failed","Layer image");
+    (*env)->SetByteArrayRegion(env,bytes,0,data->content[0],(void *)data_buffer(data));return bytes;
+}
 static void ui_layer_publish(Word object) {
     struct ViewState *view=view_state(object);struct LayerState *layer=view->composition;if(!layer)return;Word owner=view->view,background=owner ? view_state(owner)->background : layer->background;
     if(!layer->dirty && layer->synced_background==background)return;Word token=owner ? owner : object;float presentation[VIEW_PRESENTATION_FIELDS];view_presentation(token,presentation);if(!presentation[20]){layer->dirty=1;layer->published=0;return;}
-    struct Sequence *colors=(void *)layer->colors,*locations=(void *)layer->locations;double scale=screen_scale();float metrics[]={(float)(layer->border_width*scale),(float)(view->corner*scale),(float)layer->start.x,(float)layer->start.y,(float)layer->end.x,(float)layer->end.y,(float)layer->contents_rect.x,(float)layer->contents_rect.y,(float)layer->contents_rect.width,(float)layer->contents_rect.height,(float)(scale/fmax(1e-6,layer_metric(object,"contentsScale")))};
+    Word pattern=ui_color_pattern_image(background);
+    struct Sequence *colors=(void *)layer->colors,*locations=(void *)layer->locations;double scale=screen_scale();float metrics[]={(float)(layer->border_width*scale),(float)(view->corner*scale),(float)layer->start.x,(float)layer->start.y,(float)layer->end.x,(float)layer->end.y,(float)layer->contents_rect.x,(float)layer->contents_rect.y,(float)layer->contents_rect.width,(float)layer->contents_rect.height,(float)(scale/fmax(1e-6,layer_metric(object,"contentsScale"))),(float)(pattern ? scale/ui_image_scale(pattern) : 1),(float)(pattern ? ui_color_opacity(background) : 1)};
     const char *gravities[]={"resize","resizeAspect","resizeAspectFill","center","top","bottom","left","right","topLeft","topRight","bottomLeft","bottomRight"};unsigned gravity=0;if(layer->gravity)for(unsigned i=0;i<COUNT(gravities);++i)if(!strcmp(gravities[i],string_bytes(layer->gravity,"contentsGravity")))gravity=i;
     jint options[]={(jint)label_argb(background,0),(jint)label_argb(layer->border,0xff000000),(jint)gravity,(jint)(background || layer->background_set)};JNIEnv *env=attached_environment("CALayer composition");static jmethodID method;
-    if(!method){jclass cls=(*env)->GetObjectClass(env,activity);method=(*env)->GetMethodID(env,cls,"syncGuestLayer","(JJZZ[F[I[I[F[B)V");(*env)->DeleteLocalRef(env,cls);}
+    if(!method){jclass cls=(*env)->GetObjectClass(env,activity);method=(*env)->GetMethodID(env,cls,"syncGuestLayer","(JJZZ[F[I[I[F[BZ[B)V");(*env)->DeleteLocalRef(env,cls);}
     jfloatArray m=(*env)->NewFloatArray(env,COUNT(metrics)),stops=locations && locations->count ? (*env)->NewFloatArray(env,locations->count) : NULL;jintArray o=(*env)->NewIntArray(env,COUNT(options)),palette=colors && colors->count ? (*env)->NewIntArray(env,colors->count) : NULL;
     (*env)->SetFloatArrayRegion(env,m,0,COUNT(metrics),metrics);(*env)->SetIntArrayRegion(env,o,0,COUNT(options),options);
     if(palette)for(size_t i=0;i<colors->count;++i){jint color=label_argb(colors->items[i],0);(*env)->SetIntArrayRegion(env,palette,i,1,&color);}if(stops)for(size_t i=0;i<locations->count;++i){jfloat value=numeric_double((void *)locations->items[i]);(*env)->SetFloatArrayRegion(env,stops,i,1,&value);}
-    unsigned replace=!layer->published || layer->contents!=layer->synced_contents;jbyteArray bytes=NULL;if(replace && layer->contents){struct HostObject *data=(void *)image_png((void *)layer->contents);if(data){bytes=(*env)->NewByteArray(env,data->content[0]);(*env)->SetByteArrayRegion(env,bytes,0,data->content[0],(void *)data_buffer(data));}}
-    Word container=view_container(owner ? owner : layer_owner(object)),host=container ? view_state(container)->host_container : 0;(*env)->CallVoidMethod(env,activity,method,(jlong)token,(jlong)host,(jboolean)!owner,(jboolean)replace,m,o,palette,stops,bytes);
-    (*env)->DeleteLocalRef(env,m);(*env)->DeleteLocalRef(env,o);if(palette)(*env)->DeleteLocalRef(env,palette);if(stops)(*env)->DeleteLocalRef(env,stops);if(bytes)(*env)->DeleteLocalRef(env,bytes);
-    if((*env)->ExceptionCheck(env)){(*env)->ExceptionClear(env);stop("Android layer drawing failed","CALayer");}layer->dirty=0;layer->synced_background=background;layer->synced_contents=layer->contents;layer->published=1;
+    unsigned replace=!layer->published || layer->contents!=layer->synced_contents,replace_pattern=!layer->published || pattern!=layer->synced_pattern;
+    jbyteArray bytes=replace ? ui_layer_image_bytes(env,layer->contents) : NULL,pattern_bytes=replace_pattern ? ui_layer_image_bytes(env,pattern) : NULL;
+    Word container=view_container(owner ? owner : layer_owner(object)),host=container ? view_state(container)->host_container : 0;(*env)->CallVoidMethod(env,activity,method,(jlong)token,(jlong)host,(jboolean)!owner,(jboolean)replace,m,o,palette,stops,bytes,(jboolean)replace_pattern,pattern_bytes);
+    (*env)->DeleteLocalRef(env,m);(*env)->DeleteLocalRef(env,o);if(palette)(*env)->DeleteLocalRef(env,palette);if(stops)(*env)->DeleteLocalRef(env,stops);if(bytes)(*env)->DeleteLocalRef(env,bytes);if(pattern_bytes)(*env)->DeleteLocalRef(env,pattern_bytes);
+    if((*env)->ExceptionCheck(env)){(*env)->ExceptionClear(env);stop("Android layer drawing failed","CALayer");}layer->dirty=0;layer->synced_background=background;layer->synced_contents=layer->contents;layer->synced_pattern=pattern;layer->published=1;
 }
 static void ui_layer_sync_tree(Word object) {
     struct ViewState *view=view_state(object);if(!view->view)ui_view_composition_sync(object);ui_layer_publish(object);

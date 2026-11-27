@@ -41,6 +41,7 @@ static void ui_view_order_sync(Word object) {
 static unsigned label_argb(Word value,unsigned fallback) {
     if (!value || read_word(value)!=external_class("_OBJC_CLASS_$_UIColor")) return fallback;
     struct UIKitColor *c=(void *)value;
+    if(c->pattern)return fallback;
     return ((unsigned)lrint(fmin(1,fmax(0,c->alpha))*255)<<24)|((unsigned)lrint(fmin(1,fmax(0,c->red))*255)<<16)|((unsigned)lrint(fmin(1,fmax(0,c->green))*255)<<8)|(unsigned)lrint(fmin(1,fmax(0,c->blue))*255);
 }
 static void label_content_changed(struct LabelState *state) {

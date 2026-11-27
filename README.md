@@ -64,6 +64,8 @@ python -B -m porter build --help
 
 未提供 shader plan 的 Metal 应用默认停止构建。仅用于启动诊断的 dev 配置可显式设置 `android.host.allow_incomplete_shaders=true`，保留待转换库信息；调用这些库时仍返回转换缺失错误。该选项不适用于 release。
 
+shader plan 提供每个模块的实际入口、资源绑定和反射信息。常量采样器在构建时转换为过滤、寻址和 LOD 参数，运行时不依赖特定应用的原始常量或资源目录。未知 AIR 编码会停止转换；其他转换器可直接提供采样器描述。
+
 在线服务优先复用原应用的通用地址与配置；iOS 专属的账号、支付、推送和第三方平台标识不能直接用于 Android。没有可复用配置时，运行库按未配置处理，返回相应失败或不可用状态；Helpshift 有有效 domain 时可使用网页后端。
 
 资源通常直接从已安装 APK 读取；需要真实文件路径或系统不支持共享内存时，按需处理单个文件，临时映射文件随使用结束释放。启动时清理旧版运行库留下的资源副本。着色器和驱动编译结果缓存在应用私有目录，更新后清理旧缓存，即使应用版本号没有变化。缓存不可用时会重新生成。
@@ -72,7 +74,7 @@ python -B -m porter build --help
 
 已加载的外部适配器可通过可选的 `texture_options(context)` 返回有效纹理配置；返回空配置会停用转换，用于与原程序的格式支持保持一致。
 
-APK 输出到外部工作区的 `out/<application-id>/<CFBundleVersion>/dev|release/`。不同版本共用构建缓存时需顺序构建；并行构建应使用独立工作区。
+APK 输出到外部工作区的 `out/<application-id>/<CFBundleVersion>/dev|release/`，默认文件名为 `application.apk`；外部适配器可在 `prepare_package` 返回的选项中用 `filename` 指定 APK 文件名。不同版本共用构建缓存时需顺序构建；并行构建应使用独立工作区。
 
 应用每次进程启动会重写 `Android/data/<包名>/files/crash.log`，随后只追加异常和崩溃。release 正常日志关闭。原生栈无法继续读取时会注明原因；定位时需使用 APK 旁的同版符号文件。
 
@@ -81,16 +83,17 @@ APK 输出到外部工作区的 `out/<application-id>/<CFBundleVersion>/dev|rele
 运行目标为 ARM64 Android 9 及以上版本。窗口、选图和权限按系统能力选择接口；GPU 驱动、WebView、图库及定位服务仍会影响可用功能。目前没有覆盖所有系统版本和厂商 ROM 的验证。
 
 - Foundation/UIKit 的通用对象回收尚未完成；弱引用自动清零目前只覆盖运行库托管生命周期的对象。
+- 字符串格式化支持本地化数字；`stringsdict` 复数规则和对象的区域化描述仍未实现。
 - 加密镜像、chained fixups、导出重转发与 resolver 尚不支持。依赖收集限于原 IPA 中可解析的 ARM64 镜像；运行时加载新镜像及跨镜像 TLS 导出尚未实现。
 - Swift 系统库不会自动补充；动态类迁移、Swift 对象与宿主 Foundation 对象的完整桥接、Core Data 持久化仍未实现。
 - CoreUI 的完整 trait 选择尚未实现；无法唯一解析的 atlas 或默认图像变体保持不可用，原始 catalog 保留。
 - Scene 生命周期、复杂 NIB、Auto Layout、通用滚动和文本编辑仍有兼容缺口。
 - 导航与模态尚缺完整原生转场、Popover 箭头、自定义呈现控制器和复杂多窗口行为。
-- 完整 CoreAnimation、三维图层合成和层组排序尚未实现；富文本绘图上下文及部分文字排版选项仍不支持。
+- 完整 CoreAnimation、三维图层合成和层组排序尚未实现；富文本绘图上下文及部分文字排版选项仍不支持。图案颜色尚不能用作文字前景、图层边框或阴影。
 - 表格尚缺约束驱动的自动行高、NIB 单元格、编辑/移动、插删动画和完整分组样式；离屏行几何可能使用估计高度。
 - 网页支持基本加载和交互，多窗口、下载及部分导航和脚本接口仍未实现。
 - 照片接口尚缺相机、裁剪、视频、iCloud 版本、图库变更观察及完整查询条件；iOS 旧图库标识不能直接对应 Android 文件。
-- Metal → Vulkan 与 MSL/AIR 转换仅支持已实现的接口和转换路径。
+- Metal → Vulkan 支持图形和计算命令、动态 viewport/scissor、颜色 MSAA resolve，以及设备支持的深度/模板 resolve。shader 能力和线程组信息在构建时记录，运行时校验设备支持。多 viewport、非整组线程派发、部分 resolve 过滤与独立深度/模板目标仍未支持；MSL/AIR 转换仅覆盖已有路径。
 - 音频格式支持仍有限，实时 AudioQueue 播放尚未实现。Android 公开信息无法完整识别其他应用的音频归属与混音状态，次要音频静音提示仍为近似实现。
 - 通知的完整日历/位置触发、分类动作与附件，Bonjour 浏览/解析，以及手势失败依赖与完整仲裁尚未实现。
 - 后台定位、区域监控、航向和部分定位授权接口尚未实现；地理编码依赖设备上的 Android 服务。

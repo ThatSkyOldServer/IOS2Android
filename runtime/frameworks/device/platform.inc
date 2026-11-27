@@ -1,6 +1,8 @@
  
 
 static struct HostObject device, locale;
+static unsigned process_thermal_condition;
+static Word process_thermal_state(void) { return __atomic_load_n(&process_thermal_condition,__ATOMIC_RELAXED); }
 
 static Word system_text(const char *key) {
     JNIEnv *env=attached_environment(key);
@@ -70,6 +72,7 @@ static Method platform_method(Word object,const char *selector,const char *recei
         if (!class_receiver && !strcmp(selector,"localeIdentifier")) return (Method)locale_identifier;
     }
     if (!class_receiver && !strcmp(receiver,"_OBJC_CLASS_$_NSProcessInfo")) {
+        if (!strcmp(selector,"thermalState")) return (Method)process_thermal_state;
         if (!strcmp(selector,"operatingSystemVersion")) return (Method)operating_system_version;
         if (!strcmp(selector,"isOperatingSystemAtLeastVersion:")) return (Method)version_at_least;
     }

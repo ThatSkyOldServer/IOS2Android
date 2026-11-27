@@ -106,7 +106,8 @@ static const char *const extra_class_names[]={
     , "_OBJC_CLASS_$_I2AMetalDescriptorArray"
     , "_OBJC_CLASS_$_I2AMetalBuffer", "_OBJC_CLASS_$_I2AMetalSamplerState", "_OBJC_CLASS_$_I2AMetalDepthStencilState", "_OBJC_CLASS_$_I2AMetalTexture"
     , "_OBJC_CLASS_$_I2AMetalLibrary", "_OBJC_CLASS_$_I2AMetalFunction", "_OBJC_CLASS_$_I2AMetalRenderPipelineState"
-    , "_OBJC_CLASS_$_I2AMetalComputePipelineState"
+    , "_OBJC_CLASS_$_I2AMetalComputePipelineState", "_OBJC_CLASS_$_I2AMetalComputeCommandEncoder"
+    , "_OBJC_CLASS_$_MTLComputePipelineReflection"
     , "_OBJC_CLASS_$_I2AMetalBlitCommandEncoder"
     , "_OBJC_CLASS_$_MTLArgument", "_OBJC_CLASS_$_MTLStructType", "_OBJC_CLASS_$_MTLStructMember", "_OBJC_CLASS_$_MTLVertexAttribute", "_OBJC_CLASS_$_MTLRenderPipelineReflection"
     , "_OBJC_CLASS_$_MTLTextureDescriptor", "_OBJC_CLASS_$_MTLSamplerDescriptor", "_OBJC_CLASS_$_MTLDepthStencilDescriptor", "_OBJC_CLASS_$_MTLStencilDescriptor"
@@ -311,7 +312,7 @@ static struct MethodRecord *owned_method_record(Word cls,const char *selector) {
     if(!record && !dynamic_class(cls))record=host_instance_record(host_symbol(cls),selector);
     return record;
 }
-static Method lookup(Word cls, const char *selector) {
+static Method lookup_uncached(Word cls, const char *selector) {
     for (unsigned depth=0; depth<64 && cls; ++depth) {
         struct MethodRecord *owned=owned_method_record(cls,selector);
         if(owned)return __atomic_load_n(&owned->implementation,__ATOMIC_ACQUIRE);
@@ -325,6 +326,22 @@ static Method lookup(Word cls, const char *selector) {
         cls = read_word(cls+8);
     }
     return NULL;
+}
+static Method lookup(Word cls,const char *selector) {
+    /* Only cache class method-list lookup, whose result depends on class and
+     * selector. Framework fallback can depend on object state and stays outside.
+     * Image selectors and registered classes live for the process lifetime. */
+    struct MethodLookupEntry { Word cls;const char *selector;Method method;unsigned epoch; };
+    static _Thread_local struct MethodLookupEntry cache[256];
+    if (!class_layouts_ready || !cls || !in_image((Word)selector) || (!in_image(cls) && !host_symbol(cls)))
+        return lookup_uncached(cls,selector);
+    unsigned epoch=__atomic_load_n(&method_cache_epoch,__ATOMIC_ACQUIRE);
+    size_t slot=((cls>>4)^(cls>>15)^((Word)selector>>2)^((Word)selector>>12))&(COUNT(cache)-1);
+    struct MethodLookupEntry *entry=&cache[slot];
+    if (entry->cls==cls && entry->selector==selector && entry->epoch==epoch) return entry->method;
+    Method method=lookup_uncached(cls,selector);
+    *entry=(struct MethodLookupEntry){cls,selector,method,epoch};
+    return method;
 }
 
 static Method lookup_external_class_method(Word cls,const char *selector) {

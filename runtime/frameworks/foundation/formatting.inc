@@ -57,7 +57,7 @@ __attribute__((naked)) static void darwin_variable_bindings(void) { __asm__ vola
 static Method formatting_method(Word object,const char *selector,const char *receiver,int class_receiver) {
     if (!receiver) return NULL;
     if (!strcmp(receiver,"_OBJC_CLASS_$_NSString") || !strcmp(receiver,"_OBJC_CLASS_$_NSMutableString")) {
-        if ((class_receiver && !strcmp(selector,"stringWithFormat:")) || (!class_receiver &&
+        if ((class_receiver && (!strcmp(selector,"stringWithFormat:") || !strcmp(selector,"localizedStringWithFormat:"))) || (!class_receiver &&
             (!strcmp(selector,"initWithFormat:") || !strcmp(selector,"appendFormat:") || !strcmp(selector,"stringByAppendingFormat:"))))
             return (Method)darwin_message_format;
         if (!class_receiver && !strcmp(selector,"initWithFormat:arguments:")) return (Method)format_message_arguments;

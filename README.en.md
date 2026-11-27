@@ -64,6 +64,8 @@ External adapters supply application patches, resource replacements, service con
 
 Metal applications without a shader plan fail the build by default. A dev configuration used for startup diagnosis may explicitly set `android.host.allow_incomplete_shaders=true` to retain pending library metadata; using those libraries still reports missing translation. This option is not available for release builds.
 
+The shader plan supplies each module's actual entry point, resource bindings, and reflection. Literal samplers are converted to filter, address, and LOD parameters at build time; the runtime does not depend on an application's raw constants or resource directories. Unknown AIR encodings stop conversion. Other translators can supply sampler descriptions directly.
+
 Online services reuse portable endpoints and configuration from the original application where available. iOS account, payment, push, and third-party platform identifiers cannot be used directly on Android. Without compatible configuration, the runtime reports failure or unavailability. Helpshift can use its web backend when a valid domain is available.
 
 Resources are normally read from the installed APK. A real-path requirement or unavailable shared-memory support is handled per file; temporary mapping files are released when no longer in use. Startup removes resource copies left by older runtime versions. Shaders and driver compilation results are cached in private storage. Updates remove old caches even when the application version stays the same. Unavailable caches are regenerated.
@@ -72,7 +74,7 @@ Texture conversion is optional. Resource paths are selected in the `textures` bu
 
 A loaded adapter may return the effective texture configuration through the optional `texture_options(context)` hook. Returning an empty configuration disables conversion to match the source application's format support.
 
-APKs are written to `out/<application-id>/<CFBundleVersion>/dev|release/` in the external workspace. Build different input versions sequentially when sharing a cache. Use separate workspaces for parallel builds.
+APKs are written to `out/<application-id>/<CFBundleVersion>/dev|release/` in the external workspace, with `application.apk` as the default filename. An adapter can set `filename` in the options returned by `prepare_package`. Build different input versions sequentially when sharing a cache. Use separate workspaces for parallel builds.
 
 Each process launch replaces `Android/data/<package>/files/crash.log`, then appends exceptions and crashes only. Normal release logging stays disabled. Native records explain when a stack cannot be read further. Use the matching symbols beside the APK to locate failures.
 
@@ -81,16 +83,17 @@ Each process launch replaces `Android/data/<package>/files/crash.log`, then appe
 The runtime targets ARM64 Android 9 and later. Window, picker, and permission APIs are selected according to platform capabilities. GPU drivers, WebView, photo providers, and location services still affect feature availability. Validation does not cover every Android version or vendor ROM.
 
 - General Foundation/UIKit object destruction remains incomplete. Automatic weak-reference clearing currently covers only objects whose lifetimes are managed by the runtime.
+- String formatting supports localized numbers; `stringsdict` plural rules and locale-aware object descriptions are not yet implemented.
 - Encrypted binaries, chained fixups, reexports, and resolver exports are unsupported. Dependency collection is limited to resolvable ARM64 images in the original IPA; loading new images at runtime and binding thread-local exports across images remain unimplemented.
 - System Swift libraries are not supplied automatically. Dynamic class relocation, full bridging between Swift objects and host Foundation objects, and Core Data persistence remain unimplemented.
 - Full CoreUI trait selection remains unimplemented. Ambiguous atlases or default rendition aliases remain unavailable, and original catalogs are retained.
 - Scene lifecycle, complex NIBs, Auto Layout, general scrolling, and text editing still have compatibility gaps.
 - Navigation and modal presentation still lack complete native transitions, popover arrows, custom presentation controllers, and complex multi-window behavior.
-- Full CoreAnimation, three-dimensional layer composition, and layer-group ordering remain unimplemented. Attributed-text drawing contexts and some text layout options are unsupported.
+- Full CoreAnimation, three-dimensional layer composition, and layer-group ordering remain unimplemented. Attributed-text drawing contexts and some text layout options are unsupported. Pattern colors are not supported for text foregrounds, layer borders, or shadows.
 - Tables still lack constraint-based automatic row heights, NIB cells, editing/reordering, insertion/deletion animations, and complete grouped styling. Offscreen row geometry may use estimated heights.
 - Web pages support basic loading and interaction. Multiple windows, downloads, and some navigation and scripting APIs remain unsupported.
 - Photo support still lacks camera capture, cropping, video, iCloud versions, library change observation, and complete query options. Legacy iOS photo identifiers cannot directly identify Android files.
-- Metal-to-Vulkan and MSL/AIR translation cover only the interfaces and translation paths currently implemented.
+- Metal-to-Vulkan supports graphics and compute commands, dynamic viewport/scissor state, color MSAA resolve, and depth/stencil resolve modes supported by the device. Shader requirements and workgroup metadata are recorded at build time and checked against device support. Multiple viewports, partial workgroup dispatch, some resolve filters, and separate depth/stencil targets remain unsupported. MSL/AIR translation covers only the existing paths.
 - Audio format support is limited, and real-time AudioQueue playback is not implemented. Android's public playback information does not fully expose other apps' audio ownership or mixing state, so secondary-audio hints are approximate.
 - Full calendar/location notification triggers, notification actions and attachments, Bonjour browsing/resolution, and gesture failure dependencies and arbitration are not implemented.
 - Background location, region monitoring, heading, and some authorization APIs are not implemented. Geocoding depends on the device's Android service.

@@ -9,12 +9,18 @@ struct MetalPipelineKey {
     struct MetalDepthState *depth;
 };
 struct MetalGraphicsPipeline;
+struct MetalDescriptorLayouts { VkDescriptorSetLayout sets[3]; unsigned references; };
+static void metal_descriptor_layouts_release(struct MetalDescriptorLayouts *layouts) {
+    if(!layouts || __atomic_sub_fetch(&layouts->references,1,__ATOMIC_ACQ_REL))return;
+    for(unsigned i=0;i<COUNT(layouts->sets);++i)if(layouts->sets[i])VKD(vkDestroyDescriptorSetLayout)(vulkan.device,layouts->sets[i],NULL);
+    free(layouts);
+}
 struct MetalPipelineVariant { struct MetalPipelineKey key; VkPipeline pipeline; struct MetalGraphicsPipeline *shared; struct MetalPipelineVariant *next; };
 struct MetalPipeline {
     struct MetalResource object;
     struct MetalFunction *vertex,*fragment;
-    VkDescriptorSetLayout sets[2];
-    unsigned dynamic_uniform,dynamic_storage,dynamic_count,*dynamic_slots[2],descriptor_counts[6];
+    struct MetalDescriptorLayouts *descriptor_layouts;
+    unsigned dynamic_uniform,dynamic_storage,dynamic_count,*dynamic_slots[2],descriptor_counts[7];
     VkPipelineLayout layout;
     VkPipeline compute_fallback;
     VkRenderPass pass;
@@ -135,28 +141,20 @@ JNIEXPORT void JNICALL HOST_JNI(HostActivity_persistPipelineCache)(JNIEnv *env,j
     free(data);pthread_mutex_lock(&metal_pipeline_cache_mutex);if(saved){metal_pipeline_saved_generation=generation;LOG("Vulkan pipeline cache saved: %zu bytes",size);}int changed=saved && generation!=metal_pipeline_generation;__atomic_store_n(&metal_pipeline_save_pending,0,__ATOMIC_RELEASE);pthread_mutex_unlock(&metal_pipeline_cache_mutex);pthread_mutex_unlock(&metal_pipeline_save_mutex);
     if(changed)metal_pipeline_request_save();
 }
-static struct { uint64_t bits; VkSampler sampler; } metal_literal_samplers[16];
+static VkSampler metal_literal_samplers[COUNT(shader_literal_samplers)];
 static pthread_mutex_t metal_literal_sampler_mutex=PTHREAD_MUTEX_INITIALIZER;
 
-static VkResult metal_literal_sampler(uint64_t bits,VkSampler *output) {
-
-    if (bits!=0x8000000000080a92ULL && bits!=0x8000000000080000ULL && bits!=0x8000000000080049ULL &&
-        bits!=0x8000000000080a49ULL && bits!=0x8000000000088049ULL) return VK_ERROR_FEATURE_NOT_PRESENT;
+static VkResult metal_literal_sampler(uint32_t index,VkSampler *output) {
+    if (!index || index>COUNT(shader_literal_samplers)) return VK_ERROR_FEATURE_NOT_PRESENT;
+    unsigned slot=index-1;
     pthread_mutex_lock(&metal_literal_sampler_mutex);
-    unsigned slot=COUNT(metal_literal_samplers);
-    for (unsigned i=0;i<COUNT(metal_literal_samplers);++i) {
-        if (metal_literal_samplers[i].bits==bits) { *output=metal_literal_samplers[i].sampler; pthread_mutex_unlock(&metal_literal_sampler_mutex); return VK_SUCCESS; }
-        if (!metal_literal_samplers[i].bits && slot==COUNT(metal_literal_samplers)) slot=i;
-    }
-    if (slot==COUNT(metal_literal_samplers)) { pthread_mutex_unlock(&metal_literal_sampler_mutex); return VK_ERROR_OUT_OF_HOST_MEMORY; }
-    VkSamplerCreateInfo info={.sType=VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,.magFilter=(VkFilter)((bits>>9)&3),.minFilter=(VkFilter)((bits>>11)&3),
-        .mipmapMode=VK_SAMPLER_MIPMAP_MODE_NEAREST,.maxAnisotropy=1,.borderColor=VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,.maxLod=0};
-    const VkSamplerAddressMode address[]={VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        VK_SAMPLER_ADDRESS_MODE_REPEAT,VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT};
-    info.addressModeU=address[bits&3]; info.addressModeV=address[(bits>>3)&3]; info.addressModeW=address[(bits>>6)&3];
-     
+    if (metal_literal_samplers[slot]) { *output=metal_literal_samplers[slot];pthread_mutex_unlock(&metal_literal_sampler_mutex);return VK_SUCCESS; }
+    const struct ShaderSamplerSpec *spec=&shader_literal_samplers[slot];
+    VkSamplerCreateInfo info={.sType=VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,.magFilter=(VkFilter)spec->mag_filter,.minFilter=(VkFilter)spec->min_filter,
+        .mipmapMode=(VkSamplerMipmapMode)spec->mip_filter,.maxAnisotropy=1,.borderColor=(VkBorderColor)spec->border,.minLod=spec->lod_min,.maxLod=spec->lod_max,
+        .addressModeU=(VkSamplerAddressMode)spec->address_u,.addressModeV=(VkSamplerAddressMode)spec->address_v,.addressModeW=(VkSamplerAddressMode)spec->address_w};
     VkResult result=VKD(vkCreateSampler)(vulkan.device,&info,NULL,output);
-    if (result==VK_SUCCESS) { metal_literal_samplers[slot].bits=bits; metal_literal_samplers[slot].sampler=*output; }
+    if (result==VK_SUCCESS) metal_literal_samplers[slot]=*output;
     pthread_mutex_unlock(&metal_literal_sampler_mutex); return result;
 }
 
@@ -252,9 +250,12 @@ static VkDescriptorType metal_pipeline_binding_type(const struct MetalPipeline *
 }
 static unsigned metal_descriptor_kind_index(VkDescriptorType type) {
     return type==VK_DESCRIPTOR_TYPE_SAMPLER ? 0 : type==VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ? 1 : type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ? 2 :
-        type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ? 4 : type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC ? 5 : 3;
+        type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ? 4 : type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC ? 5 : type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? 6 : 3;
 }
 static VkResult metal_pipeline_layout(struct MetalPipeline *pipeline) {
+    pipeline->descriptor_layouts=calloc(1,sizeof(*pipeline->descriptor_layouts));
+    if(!pipeline->descriptor_layouts)return VK_ERROR_OUT_OF_HOST_MEMORY;
+    pipeline->descriptor_layouts->references=1;
     unsigned uniform=0,storage=0;
     for (unsigned stage_index=0;stage_index<2;++stage_index) {
         struct MetalFunction *function=stage_index ? pipeline->fragment : pipeline->vertex;
@@ -291,17 +292,17 @@ static VkResult metal_pipeline_layout(struct MetalPipeline *pipeline) {
                 }
                 pipeline->dynamic_slots[stage_index][i]=slot; ++pipeline->dynamic_count;
             }
-            if (binding->sampler_bits) {
-                VkResult result=metal_literal_sampler(binding->sampler_bits,&samplers[i]);
+            if (binding->literal_sampler) {
+                VkResult result=metal_literal_sampler(binding->literal_sampler,&samplers[i]);
                 if (result!=VK_SUCCESS) { free(bindings); free(samplers); return result; }
                 bindings[i].pImmutableSamplers=&samplers[i];
             }
         }
         VkDescriptorSetLayoutCreateInfo info={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=count,.pBindings=bindings};
-        VkResult result=VKD(vkCreateDescriptorSetLayout)(vulkan.device,&info,NULL,&pipeline->sets[stage_index]);
+        VkResult result=VKD(vkCreateDescriptorSetLayout)(vulkan.device,&info,NULL,&pipeline->descriptor_layouts->sets[stage_index]);
         free(bindings); free(samplers); if (result!=VK_SUCCESS) return result;
     }
-    VkPipelineLayoutCreateInfo info={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.setLayoutCount=2,.pSetLayouts=pipeline->sets};
+    VkPipelineLayoutCreateInfo info={.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.setLayoutCount=2,.pSetLayouts=pipeline->descriptor_layouts->sets};
     return VKD(vkCreatePipelineLayout)(vulkan.device,&info,NULL,&pipeline->layout);
 }
 /* Pipeline and framebuffer passes must also agree on their dependencies. */
@@ -347,8 +348,8 @@ static VkResult metal_pipeline_variant(struct MetalPipeline *pipeline,const stru
     if (!variant) { pthread_mutex_unlock(&pipeline->mutex); return VK_ERROR_OUT_OF_HOST_MEMORY; }
     variant->key=*key;
     VkPipelineShaderStageCreateInfo stages[2]={
-        {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_VERTEX_BIT,.module=pipeline->vertex->module,.pName="main"},
-        {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_FRAGMENT_BIT,.module=pipeline->fragment ? pipeline->fragment->module : VK_NULL_HANDLE,.pName="main"}
+        {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_VERTEX_BIT,.module=pipeline->vertex->module,.pName=pipeline->vertex->spec->spirv_entry},
+        {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_FRAGMENT_BIT,.module=pipeline->fragment ? pipeline->fragment->module : VK_NULL_HANDLE,.pName=pipeline->fragment ? pipeline->fragment->spec->spirv_entry : NULL}
     };
     VkPipelineVertexInputStateCreateInfo vertex={.sType=VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
         .vertexBindingDescriptionCount=pipeline->binding_count,.pVertexBindingDescriptions=pipeline->bindings,
@@ -359,7 +360,8 @@ static VkResult metal_pipeline_variant(struct MetalPipeline *pipeline,const stru
         .depthClampEnable=key->clamp,.rasterizerDiscardEnable=!pipeline->rasterization,.polygonMode=key->polygon,.cullMode=key->cull,.frontFace=key->front,
         .depthBiasEnable=VK_TRUE,.lineWidth=1};
     VkPipelineMultisampleStateCreateInfo multisample={.sType=VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .rasterizationSamples=pipeline->samples,.alphaToCoverageEnable=pipeline->alpha_coverage,.alphaToOneEnable=pipeline->alpha_one};
+        .rasterizationSamples=pipeline->samples,.alphaToCoverageEnable=pipeline->alpha_coverage,.alphaToOneEnable=pipeline->alpha_one,
+        .sampleShadingEnable=pipeline->fragment && (pipeline->fragment->requirements&METAL_SHADER_SAMPLE_RATE),.minSampleShading=1};
     VkPipelineDepthStencilStateCreateInfo depth=key->depth ? key->depth->state : (VkPipelineDepthStencilStateCreateInfo){
         .sType=VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,.depthCompareOp=VK_COMPARE_OP_ALWAYS,.maxDepthBounds=1};
     VkPipelineColorBlendStateCreateInfo blend={.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
@@ -389,10 +391,8 @@ static void metal_pipeline_dispose(struct MetalPipeline *pipeline) {
     }
     if (pipeline->pass) VKD(vkDestroyRenderPass)(vulkan.device,pipeline->pass,NULL);
     if (pipeline->layout) VKD(vkDestroyPipelineLayout)(vulkan.device,pipeline->layout,NULL);
-    for (unsigned i=0;i<2;++i) {
-        if (pipeline->sets[i]) VKD(vkDestroyDescriptorSetLayout)(vulkan.device,pipeline->sets[i],NULL);
-        free(pipeline->dynamic_slots[i]);
-    }
+    metal_descriptor_layouts_release(pipeline->descriptor_layouts);
+    for (unsigned i=0;i<2;++i) free(pipeline->dynamic_slots[i]);
     pthread_mutex_destroy(&pipeline->mutex); free(pipeline);
 }
 static void metal_pipeline_destroy(Word value) { metal_pipeline_dispose((void *)value); }

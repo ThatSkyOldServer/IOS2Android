@@ -5,6 +5,29 @@ static int shader_diagnostics_requested;
 static void metal_math_configure_observation(int enabled);
 static uint64_t metal_descriptor_cache_counts[2];
 static uint64_t metal_layout_counts[2];
+struct MetalCommandSample { char label[64];uint64_t nanoseconds,operations;unsigned samples; };
+static struct MetalCommandSample metal_command_samples[32];
+static pthread_mutex_t metal_command_sample_mutex=PTHREAD_MUTEX_INITIALIZER;
+static unsigned metal_command_sample_cursor;
+#define METAL_DIAGNOSTIC_PASSES 64
+struct MetalPassTiming { const char *shader;char label[64];uint32_t width,height;unsigned first_draw,draws,mixed,closed,loads,stores,snapshot_regions,resumed;uint64_t snapshot_color_bytes; };
+struct MetalPassSummary { const char *shader;char label[64];uint32_t width,height;uint64_t nanoseconds,draws,snapshot_regions,snapshot_color_bytes;unsigned samples,mixed,loads,stores,resumed; };
+static struct MetalPassSummary metal_pass_samples[64];
+static pthread_mutex_t metal_pass_sample_mutex=PTHREAD_MUTEX_INITIALIZER;
+static unsigned metal_pass_sample_cursor;
+struct MetalPresentTiming {
+    uint64_t generation,start,end,sum;
+    unsigned commands,pending,closed,valid;
+};
+static struct MetalPresentTiming metal_present_timings[64];
+static pthread_mutex_t metal_present_timing_mutex=PTHREAD_MUTEX_INITIALIZER;
+static uint64_t metal_present_timing_generation=1;
+static void metal_diagnostic_reset_present_groups(void) {
+    pthread_mutex_lock(&metal_present_timing_mutex);
+    for (unsigned i=0;i<COUNT(metal_present_timings);++i) metal_present_timings[i].valid=0;
+    ++metal_present_timing_generation;
+    pthread_mutex_unlock(&metal_present_timing_mutex);
+}
 #else
 #define metal_diagnostic_enabled 0
 #define metal_diagnostic_readback 0
@@ -25,8 +48,13 @@ static void metal_math_trace_render(struct MetalRenderEncoder *,struct MetalFunc
 static void metal_diagnostic_command_begin(struct MetalCommand *);
 static void metal_diagnostic_command_end(struct MetalCommand *);
 static void metal_diagnostic_command_complete(struct MetalCommand *);
+static void metal_diagnostic_submitted(struct MetalCommand *);
+static void metal_diagnostic_present_complete(struct MetalCommand *,uint64_t,uint64_t);
 static void metal_diagnostic_capture(struct MetalRenderEncoder *);
 static void metal_diagnostic_present(void);
+static void metal_diagnostic_pass_begin(struct MetalRenderEncoder *);
+static void metal_diagnostic_pass_end(struct MetalRenderEncoder *,unsigned);
+static void metal_diagnostic_pass_draw(struct MetalRenderEncoder *);
 static uint64_t metal_diagnostic_time(void) {
     if (!metal_diagnostic_enabled) return 0;
     struct timespec time; clock_gettime(CLOCK_MONOTONIC,&time);
@@ -48,11 +76,13 @@ JNIEXPORT void JNICALL HOST_JNI(HostActivity_configureRenderDiagnostics)(JNIEnv 
         snprintf(tls_diagnostics_directory,sizeof(tls_diagnostics_directory),"%s",path);
         (*env)->ReleaseStringUTFChars(env,directory,path);
         metal_diagnostic_enabled=enabled;
+        metal_diagnostic_reset_present_groups();
         metal_diagnostic_readback=enabled;
         render_diagnostics_requested=enabled;
     }
 }
 JNIEXPORT void JNICALL HOST_JNI(HostActivity_configurePerformanceSampling)(JNIEnv *env,jobject object,jboolean enabled) {
+    metal_diagnostic_reset_present_groups();
     metal_diagnostic_readback=0;
     metal_diagnostic_enabled=enabled; render_diagnostics_requested=enabled;
     LOG("[DIAG-render] Live performance sampling %s (target readback disabled)",enabled ? "enabled" : "disabled");

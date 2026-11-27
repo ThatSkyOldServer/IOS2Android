@@ -50,7 +50,7 @@ static void core_source_add(Word loop_object,Word source_object,Word mode) {
     if (!link) { pthread_mutex_unlock(&scheduling_mutex);loop_function_close(task);stop("Runloop source allocation failed","CFRunLoopAddSource"); }
     *link=(struct CoreSourceLink){loop,kind,task,mode,source->links}; source->links=link;
     unsigned pending=source->signaled;Word schedule=source->context.schedule,info=source->context.info;
-    pthread_cond_broadcast(&scheduling_condition); pthread_mutex_unlock(&scheduling_mutex);
+    loop_notify_locked(loop);pthread_mutex_unlock(&scheduling_mutex);
     if(schedule)((void (*)(Word,Word,Word))schedule)(info,loop_object,mode);
     if(pending)loop_function_signal(task);
 }
@@ -59,7 +59,7 @@ static void core_source_remove(Word loop_object,Word source_object,Word mode) {
     pthread_mutex_lock(&scheduling_mutex); struct CoreSourceLink **slot=&source->links;
     while (*slot && ((*slot)->loop->object!=loop_object || (*slot)->mode!=kind)) slot=&(*slot)->next;
     struct CoreSourceLink *removed=*slot;
-    if (removed) { *slot=removed->next;pthread_cond_broadcast(&scheduling_condition); }
+    if (removed) *slot=removed->next;
     pthread_mutex_unlock(&scheduling_mutex);
     if (removed) { if(source->context.cancel)((void (*)(Word,Word,Word))source->context.cancel)(source->context.info,loop_object,mode);Word task=removed->task;free(removed);loop_function_close(task); }
 }
@@ -67,7 +67,6 @@ static void core_source_invalidate(Word object) {
     struct CoreRunLoopSource *source=core_source_check(object); runloop_source_retain(object);
     pthread_mutex_lock(&scheduling_mutex); source->valid=0;
     struct CoreSourceLink *links=source->links; source->links=NULL;
-    if (links) pthread_cond_broadcast(&scheduling_condition);
     pthread_mutex_unlock(&scheduling_mutex);
     while (links) { struct CoreSourceLink *next=links->next;if(source->context.cancel)((void (*)(Word,Word,Word))source->context.cancel)(source->context.info,links->loop->object,links->mode_object);Word task=links->task;free(links);loop_function_close(task);links=next; }
     runloop_source_release(object);
@@ -97,7 +96,7 @@ static void core_source_signal(Word object) {
     size_t index=0;for(struct CoreSourceLink *p=source->links;p;p=p->next)tasks[index++]=p->task;
     pthread_mutex_unlock(&scheduling_mutex);for(size_t i=0;i<count;++i)loop_function_signal(tasks[i]);if(tasks!=local)free(tasks);
 }
-static void core_loop_wakeup(Word object) { if(object==(Word)&main_run_loop && platform_main_looper)ALooper_wake(platform_main_looper);pthread_mutex_lock(&scheduling_mutex);pthread_cond_broadcast(&scheduling_condition);pthread_mutex_unlock(&scheduling_mutex); }
+static void core_loop_wakeup(Word object) { if(object==(Word)&main_run_loop && platform_main_looper)ALooper_wake(platform_main_looper);struct NativeLoop *loop=native_loop(object);pthread_mutex_lock(&scheduling_mutex);loop_notify_locked(loop);pthread_mutex_unlock(&scheduling_mutex); }
 static unsigned char core_source_contains(Word loop,Word object,Word mode) {
     struct CoreRunLoopSource *source=core_source_check(object); unsigned kind=core_source_mode(mode); unsigned char found=0;
     pthread_mutex_lock(&scheduling_mutex);

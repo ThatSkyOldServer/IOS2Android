@@ -199,7 +199,7 @@ final class TextRenderer {
         }
         void save(boolean layer) {
             DrawingState previous=new DrawingState(state);
-            Paint composite=state.paint(false); composite.setColor(Color.WHITE); composite.setAlpha(Math.round(state.alpha*255));
+            Paint composite=state.paint(false); composite.setShader(null);composite.setColor(Color.WHITE); composite.setAlpha(Math.round(state.alpha*255));
             int saved=layer ? canvas.saveLayer(null,composite) : canvas.save();
             frames.add(new DrawingFrame(saved,previous,layer));
             if (layer) { state.alpha=1; state.fill.setXfermode(null); state.stroke.setXfermode(null); state.fill.clearShadowLayer(); state.stroke.clearShadowLayer(); }
@@ -234,7 +234,12 @@ final class TextRenderer {
             if (mask) {
                 int save=canvas.saveLayer(rect,null); canvas.clipRect(rect); canvas.getMatrix(matrix); map.postConcat(matrix);
                 frames.get(frames.size()-1).masks.add(new DrawingMask(bitmap,map,save));
-            } else canvas.drawBitmap(bitmap,map,state.paint(false));
+            } else {Paint paint=state.paint(false);paint.setShader(null);canvas.drawBitmap(bitmap,map,paint);}
+        }
+        void pattern(double[] values,int i,boolean stroke) {
+            Bitmap image=images[(int)values[i]];if(image==null)throw new IllegalArgumentException("Invalid pattern image");
+            BitmapShader shader=new BitmapShader(image,Shader.TileMode.REPEAT,Shader.TileMode.REPEAT);Matrix transform=new Matrix();float scale=(float)values[i+1];transform.setScale(scale,scale);shader.setLocalMatrix(transform);
+            Paint paint=stroke ? state.stroke : state.fill;paint.setColor(Color.WHITE);paint.setAlpha(channel(values[i+2]));paint.setShader(shader);
         }
         void gradient(double[] v,int i) {
             boolean radial=v[i]!=0; float x0=(float)v[i+1],y0=(float)v[i+2],r0=(float)v[i+3],x1=(float)v[i+4],y1=(float)v[i+5],r1=(float)v[i+6];
@@ -271,7 +276,7 @@ final class TextRenderer {
                 switch(op) {
                     case 1:save(false);break; case 2:restore(false);break;
                     case 3:matrix.setValues(new float[]{(float)v[i],(float)v[i+2],(float)v[i+4],(float)v[i+1],(float)v[i+3],(float)v[i+5],0,0,1});canvas.concat(matrix);break;
-                    case 4:state.fill.setColor(color(v,i));break; case 5:state.stroke.setColor(color(v,i));break;
+                    case 4:state.fill.setShader(null);state.fill.setColor(color(v,i));break; case 5:state.stroke.setShader(null);state.stroke.setColor(color(v,i));break;
                     case 6:state.stroke.setStrokeWidth((float)v[i]);break;
                     case 7:state.stroke.setStrokeJoin(v[i]==0 ? Paint.Join.MITER : v[i]==1 ? Paint.Join.ROUND : Paint.Join.BEVEL);break;
                     case 8:state.stroke.setStrokeMiter((float)v[i]);break; case 9:state.alpha=(float)Math.max(0,Math.min(1,v[i]));break;
@@ -290,6 +295,7 @@ final class TextRenderer {
                     case 28:save(true);break; case 29:restore(true);break;
                     case 30:point(12,(float)v[i],(float)v[i+1]);point(13,(float)(v[i]+v[i+2]),(float)v[i+1]);point(13,(float)(v[i]+v[i+2]),(float)(v[i+1]+v[i+3]));point(13,(float)v[i],(float)(v[i+1]+v[i+3]));path.close();currentX=startX;currentY=startY;break;
                     case 31:if(count==1)state.stroke.setPathEffect(null);else{int n=count-1;float[] dash=new float[n%2==0 ? n : n*2];for(int k=0;k<dash.length;k++)dash[k]=(float)v[i+1+k%n];state.stroke.setPathEffect(new DashPathEffect(dash,(float)v[i]));}break;
+                    case 32:case 33:pattern(v,i,op==33);break;
                     default:throw new IllegalArgumentException("Unknown drawing command: "+op);
                 }
                 offset=i+count;

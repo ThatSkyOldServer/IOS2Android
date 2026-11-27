@@ -198,20 +198,28 @@ static struct GuestRange text_editor_selection(Word object){return text_field_st
 static void text_editor_set_selection(Word object,const char *selector,struct GuestRange range){struct TextFieldState *field=text_field_state(object);size_t length=string_length(field->properties[0],selector);if(range.location>length || range.length>length-range.location)stop("Text selection exceeds content",selector);if(!memcmp(&range,&field->selection,sizeof(range)))return;field->selection=range;ui_input_sync(object);input_selection_changed(object);}
 static Word text_editor_property(Word object,const char *selector){struct TextFieldState *field=text_field_state(object);return !strcmp(selector,"isEditable") || !strcmp(selector,"editable") ? field->editable : !strcmp(selector,"isSelectable") || !strcmp(selector,"selectable") ? field->selectable : field->detection;}
 static void text_editor_set_property(Word object,const char *selector,Word value){struct TextFieldState *field=text_field_state(object);if(!strcmp(selector,"setEditable:")){if(!value && text_first_responder==object && !text_resign(object))return;field->editable=value!=0;}else if(!strcmp(selector,"setSelectable:")){if(!value && !field->editable && text_first_responder==object && !text_resign(object))return;field->selectable=value!=0;}else{if(value!=UINTPTR_MAX && (value&~(Word)7))stop("Unsupported text data detectors",selector);field->detection=value;}++field->revision;ui_input_sync(object);}
-struct UIKitColor { Word isa; double red,green,blue,alpha; };
+struct UIKitColor { Word isa; double red,green,blue,alpha; Word pattern; };
 static Word ui_color_rgba(Word cls,const char *selector,double red,double green,double blue,double alpha) {
     struct UIKitColor *color=calloc(1,sizeof(*color));
     if (!color) stop("Allocation failed",selector);
-    *color=(struct UIKitColor){cls,red,green,blue,alpha}; return (Word)color;
+    *color=(struct UIKitColor){.isa=cls,.red=red,.green=green,.blue=blue,.alpha=alpha}; return (Word)color;
 }
+static Word ui_color_pattern_image(Word object) { return object && read_word(object)==external_class("_OBJC_CLASS_$_UIColor") ? ((struct UIKitColor *)object)->pattern : 0; }
+static double ui_color_opacity(Word object) { return object ? ((struct UIKitColor *)object)->alpha : 0; }
+static Word ui_color_pattern(Word cls,const char *selector,Word image) {
+    if(!image || !class_inherits(read_word(image),external_class("_OBJC_CLASS_$_UIImage")))stop("Invalid pattern image",selector);
+    struct UIKitColor *color=(void *)ui_color_rgba(cls,selector,0,0,0,1);color->pattern=image;return (Word)color;
+}
+static Word ui_color_init_pattern(Word object,const char *selector,Word image) { Word color=ui_color_pattern(read_word(object),selector,image);free((void *)object);return color; }
 static Word ui_color_white(Word cls,const char *selector,double white,double alpha) { return ui_color_rgba(cls,selector,white,white,white,alpha); }
 static unsigned char ui_color_get_rgba(struct UIKitColor *color,const char *selector,double *red,double *green,double *blue,double *alpha) {
+    if(color->pattern)return 0;
     if (red) *red=color->red; if (green) *green=color->green;
     if (blue) *blue=color->blue; if (alpha) *alpha=color->alpha;
     return 1;  
 }
 static Word ui_color_alpha(struct UIKitColor *color,const char *selector,double alpha) {
-    return ui_color_rgba(color->isa,selector,color->red,color->green,color->blue,alpha);
+    struct UIKitColor *copy=(void *)ui_color_rgba(color->isa,selector,color->red,color->green,color->blue,alpha);copy->pattern=color->pattern;return (Word)copy;
 }
 static Word ui_color_black(Word cls,const char *selector) { return ui_color_white(cls,selector,0,1); }
 static Word ui_color_named(Word cls,const char *selector) {
@@ -226,7 +234,7 @@ static Word ui_color_named(Word cls,const char *selector) {
 static Word ui_color_clear(Word cls,const char *selector) { return ui_color_white(cls,selector,0,0); }
 static Word ui_color_from_cg(Word cls,const char *selector,Word object) {
     if (!object || read_word(object)!=external_class("_OBJC_CLASS_$_UIColor")) return 0;
-    struct UIKitColor *color=(void *)object; return ui_color_rgba(cls,selector,color->red,color->green,color->blue,color->alpha);
+    struct UIKitColor *color=(void *)object,*copy=(void *)ui_color_alpha(color,selector,color->alpha);copy->isa=cls;return (Word)copy;
 }
 struct UIKitFontDescriptor { Word isa,attributes; };
 struct UIKitFont { Word isa,descriptor; double size; double metrics[6]; int metrics_ready; };
@@ -590,12 +598,15 @@ static Method ui_text_method(Word object,const char *selector,const char *receiv
         if (!strcmp(selector,"shadowBlurRadius")) return (Method)ui_shadow_get_blur;
     }
     if (!strcmp(receiver,"_OBJC_CLASS_$_UIColor") && !class_receiver) {
+        if (!strcmp(selector,"initWithPatternImage:")) return (Method)ui_color_init_pattern;
+        if (!strcmp(selector,"copy") || !strcmp(selector,"copyWithZone:")) return (Method)identity;
         if (!strcmp(selector,"set") || !strcmp(selector,"setFill") || !strcmp(selector,"setStroke")) return (Method)ui_color_set;
         if (!strcmp(selector,"CGColor")) return (Method)identity;
         if (!strcmp(selector,"getRed:green:blue:alpha:")) return (Method)ui_color_get_rgba;
         if (!strcmp(selector,"colorWithAlphaComponent:")) return (Method)ui_color_alpha;
     }
     if (!strcmp(receiver,"_OBJC_CLASS_$_UIColor") && class_receiver) {
+        if (!strcmp(selector,"colorWithPatternImage:")) return (Method)ui_color_pattern;
         if (!strcmp(selector,"colorWithWhite:alpha:")) return (Method)ui_color_white;
         if (!strcmp(selector,"colorWithRed:green:blue:alpha:")) return (Method)ui_color_rgba;
         if (!strcmp(selector,"colorWithCGColor:")) return (Method)ui_color_from_cg;

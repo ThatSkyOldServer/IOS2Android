@@ -16,9 +16,11 @@ static Word color_space_device_gray(void) { return (Word)&device_gray_space; }
 static void color_space_release(Word space) { if (space && space!=(Word)&device_rgb_space && space!=(Word)&device_gray_space) stop("Unsupported color space","CGColorSpaceRelease"); }
 static const double *color_components(Word color) {
     if (!color || read_word(color)!=external_class("_OBJC_CLASS_$_UIColor")) stop("Unsupported color representation","CGColorGetComponents");
-    _Static_assert(offsetof(struct UIKitColor,red)==8 && sizeof(struct UIKitColor)==40,"RGBA CGFloat storage");
-    return &((struct UIKitColor *)color)->red;
+    _Static_assert(offsetof(struct UIKitColor,red)==8 && offsetof(struct UIKitColor,alpha)==32,"RGBA CGFloat storage");
+    struct UIKitColor *value=(void *)color;return value->pattern ? &value->alpha : &value->red;
 }
+static size_t color_component_count(Word color) { color_components(color);return ui_color_pattern_image(color) ? 1 : 4; }
+static double color_alpha(Word color) { color_components(color);return ui_color_opacity(color); }
 static double rect_min_x(struct GuestRect r) { return fmin(r.x,r.x+r.width); }
 static double rect_max_x(struct GuestRect r) { return fmax(r.x,r.x+r.width); }
 static double rect_min_y(struct GuestRect r) { return fmin(r.y,r.y+r.height); }
@@ -71,7 +73,7 @@ static struct GuestSize affine_size(struct GuestSize s,struct GuestAffine t) { r
 enum DrawingCommand {
     DRAW_SAVE=1,DRAW_RESTORE,DRAW_TRANSFORM,DRAW_FILL_COLOR,DRAW_STROKE_COLOR,DRAW_WIDTH,DRAW_JOIN,DRAW_MITER,DRAW_ALPHA,DRAW_BLEND,DRAW_SHADOW,
     DRAW_MOVE,DRAW_LINE,DRAW_CURVE,DRAW_QUAD,DRAW_CLOSE,DRAW_BEGIN,DRAW_ARC,DRAW_ARC_TO,DRAW_PATH,DRAW_PAINT,DRAW_CLIP,DRAW_RECT,DRAW_ELLIPSE,
-    DRAW_GRADIENT,DRAW_MASK,DRAW_IMAGE,DRAW_LAYER_BEGIN,DRAW_LAYER_END,DRAW_PATH_RECT,DRAW_DASH
+    DRAW_GRADIENT,DRAW_MASK,DRAW_IMAGE,DRAW_LAYER_BEGIN,DRAW_LAYER_END,DRAW_PATH_RECT,DRAW_DASH,DRAW_FILL_PATTERN,DRAW_STROKE_PATTERN
 };
 struct DrawingBuffer { double *values; size_t count,capacity; };
 struct DrawingPath { Word tag; unsigned references,mutable; struct DrawingBuffer buffer; struct GuestPoint current,start; unsigned has_current; };
@@ -210,14 +212,21 @@ static void drawing_fill(Word c,double r,double g,double b,double a) { drawing_c
 static void drawing_stroke(Word c,double r,double g,double b,double a) { drawing_context_command(c,DRAW_STROKE_COLOR,(double[]){r,g,b,a},4); }
 static void drawing_fill_gray(Word c,double gray,double a) { drawing_fill(c,gray,gray,gray,a); }
 static void drawing_stroke_gray(Word c,double gray,double a) { drawing_stroke(c,gray,gray,gray,a); }
-static void drawing_fill_color(Word c,Word color) { if (color) { const double *v=color_components(color); drawing_fill(c,v[0],v[1],v[2],v[3]); } }
-static void drawing_stroke_color(Word c,Word color) { if (color) { const double *v=color_components(color); drawing_stroke(c,v[0],v[1],v[2],v[3]); } }
+static size_t drawing_add_image(struct DrawingContext *,Word);
+static void drawing_color(Word c,Word color,int stroke) {
+    if(!color)return;const double *v=color_components(color);Word image=ui_color_pattern_image(color);
+    if(image){size_t index=drawing_add_image(drawing_check(c),image);drawing_context_command(c,stroke ? DRAW_STROKE_PATTERN : DRAW_FILL_PATTERN,(double[]){index,1/ui_image_scale(image),ui_color_opacity(color)},3);}
+    else (stroke ? drawing_stroke : drawing_fill)(c,v[0],v[1],v[2],v[3]);
+}
+static void drawing_fill_color(Word c,Word color) { drawing_color(c,color,0); }
+static void drawing_stroke_color(Word c,Word color) { drawing_color(c,color,1); }
 static void drawing_line_width(Word c,double value) { drawing_context_command(c,DRAW_WIDTH,&value,1); }
 static void drawing_line_join(Word c,unsigned value) { drawing_context_command(c,DRAW_JOIN,(double[]){value},1); }
 static void drawing_miter(Word c,double value) { drawing_context_command(c,DRAW_MITER,&value,1); }
 static void drawing_alpha(Word c,double value) { drawing_context_command(c,DRAW_ALPHA,&value,1); }
 static void drawing_blend(Word c,unsigned value) { drawing_context_command(c,DRAW_BLEND,(double[]){value},1); }
 static void drawing_shadow(Word c,struct GuestSize offset,double blur,Word color) {
+    if(ui_color_pattern_image(color))stop("Pattern shadow colors are unavailable","CGContextSetShadowWithColor");
     const double transparent[4]={0}; const double *v=color ? color_components(color) : transparent;
     drawing_context_command(c,DRAW_SHADOW,(double[]){offset.width,offset.height,blur,v[0],v[1],v[2],v[3]},7);
 }
@@ -265,7 +274,7 @@ static Word drawing_gradient_create(Word space,const double *components,const do
 static Word drawing_gradient_colors(Word space,Word colors,const double *locations) {
     struct Sequence *array=(void *)colors; if (!array || !array->count || array->count>INT_MAX/4) return 0;
     double *rgba=malloc(array->count*4*sizeof(double)); if (!rgba) stop("Allocation failed","CGGradient colors");
-    for (size_t i=0;i<array->count;++i) memcpy(rgba+i*4,color_components(array->items[i]),4*sizeof(double));
+    for (size_t i=0;i<array->count;++i) { if(ui_color_pattern_image(array->items[i])){free(rgba);return 0;}memcpy(rgba+i*4,color_components(array->items[i]),4*sizeof(double)); }
     Word result=drawing_gradient_create(space==(Word)&device_gray_space ? (Word)&device_rgb_space : space,rgba,locations,array->count); free(rgba); return result;
 }
 static void drawing_gradient(Word c,Word object,struct GuestPoint start,double r0,struct GuestPoint end,double r1,unsigned options,int radial) {
@@ -372,7 +381,7 @@ static Word geometry_export(const char *name) {
     GEOMETRY(CGContextDrawImage,drawing_image); GEOMETRY(CGContextClipToMask,drawing_mask); GEOMETRY(CGContextBeginTransparencyLayer,drawing_layer_begin); GEOMETRY(CGContextEndTransparencyLayer,drawing_layer_end);
     GEOMETRY(UIGraphicsBeginImageContext,image_context_begin_plain); GEOMETRY(UIGraphicsBeginImageContextWithOptions,image_context_begin); GEOMETRY(UIGraphicsEndImageContext,image_context_end); GEOMETRY(UIGraphicsGetCurrentContext,image_context_current); GEOMETRY(UIGraphicsGetImageFromCurrentImageContext,image_context_image); GEOMETRY(UIImageJPEGRepresentation,image_jpeg);
     GEOMETRY(CGFontCreateWithFontName,drawing_font_create); GEOMETRY(CGFontCopyTableForTag,drawing_font_table); GEOMETRY(CGFontRetain,drawing_resource_keep); GEOMETRY(CGFontRelease,drawing_resource_drop);
-    GEOMETRY(CGColorGetComponents,color_components);
+    GEOMETRY(CGColorGetComponents,color_components); GEOMETRY(CGColorGetNumberOfComponents,color_component_count); GEOMETRY(CGColorGetAlpha,color_alpha);
     GEOMETRY(CGRectGetMinX,rect_min_x); GEOMETRY(CGRectGetMaxX,rect_max_x); GEOMETRY(CGRectGetMidX,rect_mid_x);
     GEOMETRY(CGRectGetMinY,rect_min_y); GEOMETRY(CGRectGetMaxY,rect_max_y); GEOMETRY(CGRectGetMidY,rect_mid_y);
     GEOMETRY(CGRectGetWidth,rect_width); GEOMETRY(CGRectGetHeight,rect_height); GEOMETRY(CGRectIsNull,rect_null); GEOMETRY(CGRectIsEmpty,rect_empty);

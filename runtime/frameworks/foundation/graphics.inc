@@ -179,12 +179,15 @@ static void metal_set_drawable_size(Word object,const char *selector,struct Gues
 #include "../../backends/vulkan/command_buffer.inc"
 #include "../../backends/vulkan/render_encoder.inc"
 #include "../../diagnostics/metal_diagnostics.inc"
+#include "../../backends/vulkan/compute_encoder.inc"
 #include "../../backends/vulkan/presentation.inc"
 static Method graphics_method(Word object,const char *selector,const char *receiver,int class_receiver) {
     Method present=metal_present_method(object,selector,receiver,class_receiver);
     if (present) return present;
     Method render=metal_render_method(object,selector,receiver,class_receiver);
     if (render) return render;
+    Method compute_encoder=metal_compute_encoder_method(object,selector,receiver,class_receiver);
+    if (compute_encoder) return compute_encoder;
     Method command=metal_commands_method(object,selector,receiver,class_receiver);
     if (command) return command;
     Method compute=metal_compute_method(object,selector,receiver,class_receiver);

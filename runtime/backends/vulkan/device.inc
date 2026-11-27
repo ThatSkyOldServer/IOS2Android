@@ -1,6 +1,14 @@
  
 #define VK_USE_PLATFORM_ANDROID_KHR 1
 #include <vulkan/vulkan.h>
+enum MetalShaderRequirement {
+    METAL_SHADER_VERTEX_STORES=1U<<0, METAL_SHADER_FRAGMENT_STORES=1U<<1,
+    METAL_SHADER_IMAGE_READ=1U<<2, METAL_SHADER_IMAGE_WRITE=1U<<3,
+    METAL_SHADER_STORAGE_FORMATS=1U<<4, METAL_SHADER_FLOAT64=1U<<5,
+    METAL_SHADER_INT64=1U<<6, METAL_SHADER_INT16=1U<<7,
+    METAL_SHADER_SAMPLE_RATE=1U<<8, METAL_SHADER_FEATURE_MASK=(1U<<9)-1,
+    METAL_SHADER_STORAGE_WRITES=1U<<16
+};
 static struct {
     int attempted,available,pvrtc;
     void *library;
@@ -11,10 +19,16 @@ static struct {
     VkPhysicalDeviceProperties properties;
     VkPhysicalDeviceMemoryProperties memory;
     VkPhysicalDeviceFeatures features;
+    uint32_t shader_requirements;
+    uint32_t api_version;
+    VkPhysicalDeviceDepthStencilResolveProperties depth_resolve;
+    PFN_vkCreateRenderPass2 create_render_pass2;
     VkDevice device;
     VkQueue queue;
     uint32_t queue_family;
     uint32_t timestamp_bits;
+    PFN_vkGetCalibratedTimestampsEXT calibrated_timestamps;
+    VkTimeDomainEXT host_time_domain;
     VkSurfaceKHR surface;
     ANativeWindow *window;
     unsigned window_generation;
@@ -50,7 +64,11 @@ static int vulkan_start(void) {
     operation="VK_KHR_surface / VK_KHR_android_surface";
     if (!surface_extension || !android_extension) goto failed;
     const char *instance_names[]={VK_KHR_SURFACE_EXTENSION_NAME,VK_KHR_ANDROID_SURFACE_EXTENSION_NAME};
-    VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.pApplicationName=GUEST_APP_NAME,.applicationVersion=GUEST_APP_BUILD,.apiVersion=VK_API_VERSION_1_0};
+    uint32_t loader_version=VK_API_VERSION_1_0;
+    PFN_vkEnumerateInstanceVersion enumerate_version=(PFN_vkEnumerateInstanceVersion)vulkan.get_instance_proc(NULL,"vkEnumerateInstanceVersion");
+    if (enumerate_version && enumerate_version(&loader_version)!=VK_SUCCESS) loader_version=VK_API_VERSION_1_0;
+    vulkan.api_version=loader_version<VK_API_VERSION_1_2 ? loader_version : VK_API_VERSION_1_2;
+    VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.pApplicationName=GUEST_APP_NAME,.applicationVersion=GUEST_APP_BUILD,.apiVersion=vulkan.api_version};
     VkInstanceCreateInfo instance={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app,.enabledExtensionCount=2,.ppEnabledExtensionNames=instance_names};
     operation="vkCreateInstance"; result=create_instance(&instance,NULL,&vulkan.instance);
     if (result!=VK_SUCCESS) goto failed;
@@ -93,7 +111,7 @@ static int vulkan_start(void) {
         uint32_t selected=UINT32_MAX;
         for (uint32_t j=0;j<queue_count;++j) {
             VkBool32 present=VK_FALSE;
-            if (families[j].queueCount && (families[j].queueFlags&VK_QUEUE_GRAPHICS_BIT) && presentation(devices[i],j,vulkan.surface,&present)==VK_SUCCESS && present) { selected=j; break; }
+            if (families[j].queueCount && (families[j].queueFlags&(VK_QUEUE_GRAPHICS_BIT|VK_QUEUE_COMPUTE_BIT))==(VK_QUEUE_GRAPHICS_BIT|VK_QUEUE_COMPUTE_BIT) && presentation(devices[i],j,vulkan.surface,&present)==VK_SUCCESS && present) { selected=j; break; }
         }
         if (selected!=UINT32_MAX) vulkan.timestamp_bits=families[selected].timestampValidBits;
         if (selected==UINT32_MAX) continue;
@@ -101,30 +119,74 @@ static int vulkan_start(void) {
         if (device_extensions(devices[i],NULL,&ext_count,NULL)!=VK_SUCCESS || ext_count>4096) continue;
         VkExtensionProperties *device_ext=calloc(ext_count ? ext_count : 1,sizeof(*device_ext));
         if (!device_ext) continue;
-        int swapchain=0,pvrtc=0;
+        int swapchain=0,pvrtc=0,renderpass2=0,depth_resolve=0,calibrated=0;
         if (device_extensions(devices[i],NULL,&ext_count,device_ext)==VK_SUCCESS)
             for (uint32_t j=0;j<ext_count;++j) {
                 if (!strcmp(device_ext[j].extensionName,VK_KHR_SWAPCHAIN_EXTENSION_NAME)) swapchain=1;
                 if (!strcmp(device_ext[j].extensionName,VK_IMG_FORMAT_PVRTC_EXTENSION_NAME)) pvrtc=1;
+                if (!strcmp(device_ext[j].extensionName,VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME)) renderpass2=1;
+                if (!strcmp(device_ext[j].extensionName,VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME)) depth_resolve=1;
+                if (!strcmp(device_ext[j].extensionName,VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) calibrated=1;
             }
         free(device_ext);
         if (!swapchain) continue;
         VkPhysicalDeviceFeatures supported; features(devices[i],&supported);
         VkPhysicalDeviceFeatures enabled={.samplerAnisotropy=supported.samplerAnisotropy,.independentBlend=supported.independentBlend,.textureCompressionETC2=supported.textureCompressionETC2,
             .textureCompressionASTC_LDR=supported.textureCompressionASTC_LDR,.textureCompressionBC=supported.textureCompressionBC,.fillModeNonSolid=supported.fillModeNonSolid,
-            .depthClamp=supported.depthClamp,.shaderStorageImageExtendedFormats=supported.shaderStorageImageExtendedFormats,.imageCubeArray=supported.imageCubeArray,
+            .depthClamp=supported.depthClamp,.depthBiasClamp=supported.depthBiasClamp,
+            .alphaToOne=supported.alphaToOne,.sampleRateShading=supported.sampleRateShading,
+            .shaderFloat64=supported.shaderFloat64,.shaderInt64=supported.shaderInt64,.shaderInt16=supported.shaderInt16,
+            .shaderStorageImageExtendedFormats=supported.shaderStorageImageExtendedFormats,.imageCubeArray=supported.imageCubeArray,
+            .shaderStorageImageReadWithoutFormat=supported.shaderStorageImageReadWithoutFormat,
             .shaderStorageImageWriteWithoutFormat=supported.shaderStorageImageWriteWithoutFormat,
-            .fragmentStoresAndAtomics=I2A_SHADER_DIAGNOSTICS && supported.fragmentStoresAndAtomics,
+            .fragmentStoresAndAtomics=supported.fragmentStoresAndAtomics,
             .vertexPipelineStoresAndAtomics=supported.vertexPipelineStoresAndAtomics};
         float priority=1;
         VkDeviceQueueCreateInfo queue={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=selected,.queueCount=1,.pQueuePriorities=&priority};
-        const char *names[]={VK_KHR_SWAPCHAIN_EXTENSION_NAME,VK_IMG_FORMAT_PVRTC_EXTENSION_NAME};
-        VkDeviceCreateInfo info={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,.pQueueCreateInfos=&queue,.enabledExtensionCount=pvrtc ? 2 : 1,.ppEnabledExtensionNames=names,.pEnabledFeatures=&enabled};
+        uint32_t api=prop.apiVersion<vulkan.api_version ? prop.apiVersion : vulkan.api_version;
+        int resolve_core=api>=VK_API_VERSION_1_2;
+        int resolve_extension=!resolve_core && api>=VK_API_VERSION_1_1 && renderpass2 && depth_resolve;
+        const char *names[5]={VK_KHR_SWAPCHAIN_EXTENSION_NAME};unsigned name_count=1;
+        if (pvrtc) names[name_count++]=VK_IMG_FORMAT_PVRTC_EXTENSION_NAME;
+        if (resolve_extension) { names[name_count++]=VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME;names[name_count++]=VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME; }
+        if(calibrated)names[name_count++]=VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME;
+        VkDeviceCreateInfo info={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,.pQueueCreateInfos=&queue,.enabledExtensionCount=name_count,.ppEnabledExtensionNames=names,.pEnabledFeatures=&enabled};
         operation="vkCreateDevice"; result=create_device(devices[i],&info,NULL,&vulkan.device);
         if (result!=VK_SUCCESS) continue;
         vulkan.physical=devices[i]; vulkan.properties=prop; vulkan.features=enabled; vulkan.queue_family=selected; vulkan.pvrtc=pvrtc;
+        vulkan.shader_requirements=(enabled.vertexPipelineStoresAndAtomics ? METAL_SHADER_VERTEX_STORES : 0) |
+            (enabled.fragmentStoresAndAtomics ? METAL_SHADER_FRAGMENT_STORES : 0) |
+            (enabled.shaderStorageImageReadWithoutFormat ? METAL_SHADER_IMAGE_READ : 0) |
+            (enabled.shaderStorageImageWriteWithoutFormat ? METAL_SHADER_IMAGE_WRITE : 0) |
+            (enabled.shaderStorageImageExtendedFormats ? METAL_SHADER_STORAGE_FORMATS : 0) |
+            (enabled.shaderFloat64 ? METAL_SHADER_FLOAT64 : 0) | (enabled.shaderInt64 ? METAL_SHADER_INT64 : 0) |
+            (enabled.shaderInt16 ? METAL_SHADER_INT16 : 0) | (enabled.sampleRateShading ? METAL_SHADER_SAMPLE_RATE : 0);
         memory(vulkan.physical,&vulkan.memory);
         vulkan.get_device_proc=(PFN_vkGetDeviceProcAddr)vulkan.get_instance_proc(vulkan.instance,"vkGetDeviceProcAddr");
+        if(calibrated && vulkan.timestamp_bits==64) {
+            PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT domains=(PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT)vulkan.get_instance_proc(vulkan.instance,"vkGetPhysicalDeviceCalibrateableTimeDomainsEXT");
+            uint32_t domain_count=0;
+            if(domains && domains(vulkan.physical,&domain_count,NULL)==VK_SUCCESS && domain_count<=16) {
+                VkTimeDomainEXT available[16];int device_clock=0,host_clock=0;
+                if(domains(vulkan.physical,&domain_count,available)==VK_SUCCESS)for(unsigned d=0;d<domain_count;++d) {
+                    device_clock|=available[d]==VK_TIME_DOMAIN_DEVICE_EXT;
+                    host_clock|=available[d]==VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT;
+                }
+                if(device_clock && host_clock) {
+                    vulkan.host_time_domain=VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT;
+                    vulkan.calibrated_timestamps=(PFN_vkGetCalibratedTimestampsEXT)vulkan.get_device_proc(vulkan.device,"vkGetCalibratedTimestampsEXT");
+                }
+            }
+        }
+        if (resolve_core || resolve_extension) {
+            PFN_vkGetPhysicalDeviceProperties2 query_properties=(PFN_vkGetPhysicalDeviceProperties2)vulkan.get_instance_proc(vulkan.instance,"vkGetPhysicalDeviceProperties2");
+            vulkan.create_render_pass2=(PFN_vkCreateRenderPass2)vulkan.get_device_proc(vulkan.device,resolve_core ? "vkCreateRenderPass2" : "vkCreateRenderPass2KHR");
+            if (query_properties && vulkan.create_render_pass2) {
+                vulkan.depth_resolve=(VkPhysicalDeviceDepthStencilResolveProperties){.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES};
+                VkPhysicalDeviceProperties2 properties2={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,.pNext=&vulkan.depth_resolve};
+                query_properties(vulkan.physical,&properties2);
+            } else vulkan.create_render_pass2=NULL;
+        }
         PFN_vkGetDeviceQueue get_queue=(PFN_vkGetDeviceQueue)vulkan.get_device_proc(vulkan.device,"vkGetDeviceQueue");
         get_queue(vulkan.device,selected,0,&vulkan.queue);
         vulkan.available=1;

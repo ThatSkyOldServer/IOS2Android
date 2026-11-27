@@ -6,15 +6,15 @@ struct MetalPresentationRenderer {
     VkPipeline pipeline;
     VkSampler sampler;
     VkDescriptorPool pool;
-    VkImageView views[8];
-    VkImageView sources[8];
-    VkFramebuffer frames[8];
-    VkDescriptorSet sets[8];
+    unsigned count;
+    VkImageView *views,*sources;
+    VkFramebuffer *frames;
+    VkDescriptorSet *sets;
 };
 static void metal_presentation_renderer_destroy(struct MetalPresentationRenderer *state) {
-    for(unsigned i=0;i<8;++i) {
-        if(state->frames[i])VKD(vkDestroyFramebuffer)(vulkan.device,state->frames[i],NULL);
-        if(state->views[i])VKD(vkDestroyImageView)(vulkan.device,state->views[i],NULL);
+    for(unsigned i=0;i<state->count;++i) {
+        if(state->frames && state->frames[i])VKD(vkDestroyFramebuffer)(vulkan.device,state->frames[i],NULL);
+        if(state->views && state->views[i])VKD(vkDestroyImageView)(vulkan.device,state->views[i],NULL);
     }
     if(state->pipeline)VKD(vkDestroyPipeline)(vulkan.device,state->pipeline,NULL);
     if(state->pool)VKD(vkDestroyDescriptorPool)(vulkan.device,state->pool,NULL);
@@ -22,12 +22,21 @@ static void metal_presentation_renderer_destroy(struct MetalPresentationRenderer
     if(state->set_layout)VKD(vkDestroyDescriptorSetLayout)(vulkan.device,state->set_layout,NULL);
     if(state->sampler)VKD(vkDestroySampler)(vulkan.device,state->sampler,NULL);
     if(state->pass)VKD(vkDestroyRenderPass)(vulkan.device,state->pass,NULL);
+    free(state->views);free(state->sources);free(state->frames);free(state->sets);
     memset(state,0,sizeof(*state));
 }
 static VkResult metal_presentation_renderer_create(struct MetalPresentationRenderer *state,VkFormat format,
         const VkImage *images,unsigned count,VkExtent2D extent,const char **operation) {
     VkResult result=VK_SUCCESS;
     VkShaderModule vertex=VK_NULL_HANDLE,fragment=VK_NULL_HANDLE;
+    VkDescriptorSetLayout *layouts=NULL;
+    state->count=count;
+    state->views=calloc(count,sizeof(*state->views));state->sources=calloc(count,sizeof(*state->sources));
+    state->frames=calloc(count,sizeof(*state->frames));state->sets=calloc(count,sizeof(*state->sets));
+    layouts=calloc(count,sizeof(*layouts));
+    if(!state->views || !state->sources || !state->frames || !state->sets || !layouts) {
+        *operation="presentation image storage";result=VK_ERROR_OUT_OF_HOST_MEMORY;goto failed;
+    }
 #define PRESENT_CREATE(name,...) do { *operation=#name; result=VKD(name)(__VA_ARGS__); if(result!=VK_SUCCESS)goto failed; } while(0)
     VkAttachmentDescription attachment={.format=format,.samples=VK_SAMPLE_COUNT_1_BIT,.loadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE,
         .storeOp=VK_ATTACHMENT_STORE_OP_STORE,.stencilLoadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE,.stencilStoreOp=VK_ATTACHMENT_STORE_OP_DONT_CARE,
@@ -72,9 +81,10 @@ static VkResult metal_presentation_renderer_create(struct MetalPresentationRende
     VkDescriptorPoolSize size={VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,count};
     VkDescriptorPoolCreateInfo pool={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,.maxSets=count,.poolSizeCount=1,.pPoolSizes=&size};
     PRESENT_CREATE(vkCreateDescriptorPool,vulkan.device,&pool,NULL,&state->pool);
-    VkDescriptorSetLayout layouts[8];for(unsigned i=0;i<count;++i)layouts[i]=state->set_layout;
+    for(unsigned i=0;i<count;++i)layouts[i]=state->set_layout;
     VkDescriptorSetAllocateInfo allocate={.sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=state->pool,.descriptorSetCount=count,.pSetLayouts=layouts};
     PRESENT_CREATE(vkAllocateDescriptorSets,vulkan.device,&allocate,state->sets);
+    free(layouts);layouts=NULL;
     for(unsigned i=0;i<count;++i) {
         VkImageViewCreateInfo view={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=images[i],.viewType=VK_IMAGE_VIEW_TYPE_2D,.format=format,
             .subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}};
@@ -86,6 +96,7 @@ static VkResult metal_presentation_renderer_create(struct MetalPresentationRende
     VKD(vkDestroyShaderModule)(vulkan.device,vertex,NULL);VKD(vkDestroyShaderModule)(vulkan.device,fragment,NULL);
     return VK_SUCCESS;
 failed:
+    free(layouts);
     if(vertex)VKD(vkDestroyShaderModule)(vulkan.device,vertex,NULL);
     if(fragment)VKD(vkDestroyShaderModule)(vulkan.device,fragment,NULL);
     metal_presentation_renderer_destroy(state);return result;

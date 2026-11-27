@@ -6,9 +6,11 @@ import android.animation.ValueAnimator;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.BitmapShader;
 import android.graphics.Canvas;
 import android.graphics.ColorFilter;
 import android.graphics.LinearGradient;
+import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
@@ -52,8 +54,10 @@ final class ViewComposition {
         if(node.geometry==null)System.arraycopy(presentation,0,node.live,0,PRESENTATION_FIELDS);
         node.bind();node.render();
     }
-    void layer(long token,long owner,boolean raw,boolean replace,float[] metrics,int[] options,int[] colors,float[] locations,byte[] image) {
-        if(closed)return;Node node=node(token);node.raw=raw;node.owner=owner;Bitmap bitmap=replace ? image==null ? null : BitmapFactory.decodeByteArray(image,0,image.length) : node.layer==null ? null : node.layer.image;if(replace && image!=null && bitmap==null)throw new IllegalArgumentException("Unable to decode the supplied layer image.");node.layer=new Layer(metrics,options,colors,locations,bitmap);
+    private static Bitmap layerImage(byte[] bytes) { if(bytes==null)return null;Bitmap image=BitmapFactory.decodeByteArray(bytes,0,bytes.length);if(image==null)throw new IllegalArgumentException("Unable to decode the supplied layer image.");return image; }
+    void layer(long token,long owner,boolean raw,boolean replace,float[] metrics,int[] options,int[] colors,float[] locations,byte[] image,boolean replacePattern,byte[] pattern) {
+        if(closed)return;Node node=node(token);node.raw=raw;node.owner=owner;Bitmap bitmap=replace ? layerImage(image) : node.layer==null ? null : node.layer.image;
+        Bitmap tile=replacePattern ? layerImage(pattern) : node.layer==null ? null : node.layer.pattern;node.layer=new Layer(metrics,options,colors,locations,bitmap,tile);
         if(node.view==null)node.view=callback.view(token);node.bind();node.render();
     }
     void bind(long token,View view) { if(closed)return;Node node=node(token);node.view=view;node.bind();node.render(); }
@@ -145,16 +149,22 @@ final class ViewComposition {
         animation.render();animation.animator.start();if(playTime>0)animation.animator.setCurrentPlayTime(playTime);
     }
     private static final class Layer {
-        final float[] metrics,locations;final int[] options,colors;final Bitmap image;
-        Layer(float[] metrics,int[] options,int[] colors,float[] locations,Bitmap image){this.metrics=metrics;this.options=options;this.colors=colors;this.locations=locations;this.image=image;}
+        final float[] metrics,locations;final int[] options,colors;final Bitmap image,pattern;
+        Layer(float[] metrics,int[] options,int[] colors,float[] locations,Bitmap image,Bitmap pattern){this.metrics=metrics;this.options=options;this.colors=colors;this.locations=locations;this.image=image;this.pattern=pattern;}
     }
     private static final class Decoration extends Drawable {
         final boolean foreground;final Paint paint=new Paint(Paint.ANTI_ALIAS_FLAG|Paint.FILTER_BITMAP_FLAG);final RectF rectangle=new RectF(),destination=new RectF();final Rect source=new Rect();Layer layer;Drawable fallback;Shader shader;int shaderWidth=-1,shaderHeight=-1;
+        Bitmap patternImage;BitmapShader patternShader;Matrix patternMatrix;float patternScale,patternX,patternY;
         Decoration(boolean foreground){this.foreground=foreground;}
         @Override protected void onBoundsChange(Rect bounds){if(fallback!=null)fallback.setBounds(bounds);}
         @Override public void draw(Canvas canvas){if(layer==null)return;Rect bounds=getBounds();float width=bounds.width(),height=bounds.height(),radius=layer.metrics[1];if(width<=0 || height<=0)return;rectangle.set(bounds);paint.setShader(null);paint.setStyle(Paint.Style.FILL);
             if(foreground){if(fallback!=null)fallback.draw(canvas);float line=Math.min(layer.metrics[0],Math.min(width,height));if(line>0){float half=line/2;rectangle.inset(half,half);paint.setColor(layer.options[1]);paint.setStrokeWidth(line);paint.setStyle(Paint.Style.STROKE);canvas.drawRoundRect(rectangle,Math.max(0,radius-half),Math.max(0,radius-half),paint);}return;}
-            if(layer.options[3]==0 && fallback!=null)fallback.draw(canvas);else {paint.setColor(layer.options[0]);canvas.drawRoundRect(rectangle,radius,radius,paint);}
+            if(layer.pattern!=null){
+                boolean changed=patternImage!=layer.pattern;
+                if(changed){patternImage=layer.pattern;patternShader=new BitmapShader(patternImage,Shader.TileMode.REPEAT,Shader.TileMode.REPEAT);if(patternMatrix==null)patternMatrix=new Matrix();}
+                if(changed || patternScale!=layer.metrics[11] || patternX!=bounds.left || patternY!=bounds.top){patternScale=layer.metrics[11];patternX=bounds.left;patternY=bounds.top;patternMatrix.setScale(patternScale,patternScale);patternMatrix.postTranslate(patternX,patternY);patternShader.setLocalMatrix(patternMatrix);}
+                paint.setColor(0xffffffff);paint.setAlpha(Math.round(255*Math.max(0,Math.min(1,layer.metrics[12]))));paint.setShader(patternShader);canvas.drawRoundRect(rectangle,radius,radius,paint);paint.setShader(null);
+            }else{patternImage=null;patternShader=null;if(layer.options[3]==0 && fallback!=null)fallback.draw(canvas);else {paint.setColor(layer.options[0]);canvas.drawRoundRect(rectangle,radius,radius,paint);}}
             if(layer.colors!=null && layer.colors.length>0){if(layer.colors.length==1 || layer.metrics[2]==layer.metrics[4] && layer.metrics[3]==layer.metrics[5])paint.setColor(layer.colors[layer.colors.length-1]);else {if(shaderWidth!=bounds.width() || shaderHeight!=bounds.height()){shader=new LinearGradient(bounds.left+width*layer.metrics[2],bounds.top+height*layer.metrics[3],bounds.left+width*layer.metrics[4],bounds.top+height*layer.metrics[5],layer.colors,layer.locations!=null && layer.locations.length==layer.colors.length ? layer.locations : null,Shader.TileMode.CLAMP);shaderWidth=bounds.width();shaderHeight=bounds.height();}paint.setShader(shader);paint.setColor(0xffffffff);}canvas.drawRoundRect(rectangle,radius,radius,paint);paint.setShader(null);}
             if(layer.image!=null){Bitmap image=layer.image;float[] m=layer.metrics;int left=Math.max(0,Math.min(image.getWidth(),Math.round(m[6]*image.getWidth()))),top=Math.max(0,Math.min(image.getHeight(),Math.round(m[7]*image.getHeight()))),right=Math.max(left,Math.min(image.getWidth(),Math.round((m[6]+m[8])*image.getWidth()))),bottom=Math.max(top,Math.min(image.getHeight(),Math.round((m[7]+m[9])*image.getHeight())));source.set(left,top,right,bottom);if(right==left || bottom==top)return;
                 float naturalWidth=source.width()*m[10],naturalHeight=source.height()*m[10],w=width,h=height;int gravity=layer.options[2];if(gravity==1 || gravity==2){float scale=gravity==1 ? Math.min(width/naturalWidth,height/naturalHeight) : Math.max(width/naturalWidth,height/naturalHeight);w=naturalWidth*scale;h=naturalHeight*scale;}else if(gravity>=3){w=naturalWidth;h=naturalHeight;}

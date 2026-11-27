@@ -1,6 +1,7 @@
 import collections
 import re
 import struct
+from .samplers import decode_air_sampler
 
 
 def split(text):
@@ -193,18 +194,19 @@ class Translator:
             expression = f'uint(textureSize({values[0]}, int({values[1]})).' + ('x' if function.startswith('get_width') else 'y') + ')'
         elif function in ('sample_texture_2d', 'gather_texture_2d'):
             texture, raw, coord, valid, offset = values[:5]
-            if valid != 'true' or raw not in (0x8000000000080000, 0x8000000000080049, 0x8000000000080a49, 0x8000000000088049):
+            if valid != 'true':
                 raise ValueError('Untranslated AIR texture operand/sampler')
+            sampler = decode_air_sampler(raw)
             if raw not in self.samplers:
                 self.samplers[raw] = len(self.samplers)
             binding = 240 + self.samplers[raw]
             sampled = f'sampler2D({texture}, i2aSampler{binding})'
-            if raw & 0x8000:
+            if sampler['pixel_coordinates']:
                 coord = f'(({coord}) / vec2(textureSize({texture}, 0)))'
             signed_offset = 'ivec2(' + offset + ')'
             if function.startswith('gather'):
                 expression = f'textureGatherOffset({sampled}, {coord}, {signed_offset}, int({values[5]}))'
-            elif values[5] == 'true' or self.stage == 'comp' or (raw & 0x8000):
+            elif values[5] == 'true' or self.stage == 'comp' or sampler['pixel_coordinates']:
                 expression = f'textureLodOffset({sampled}, {coord}, {values[6]}, {signed_offset})'
             else:
                 if values[6] != '0.0':

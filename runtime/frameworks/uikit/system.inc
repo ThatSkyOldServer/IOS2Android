@@ -74,6 +74,14 @@ static void deliver_display_notifications(void *context) {
     if (changes&2) platform_notification("UIDeviceBatteryStateDidChangeNotification",(Word)&device,0);
     if (changes&4) platform_notification("UIDeviceOrientationDidChangeNotification",(Word)&device,0);
     if (changes&8) platform_notification("NSProcessInfoPowerStateDidChangeNotification",(Word)&process_info,0);
+    if (changes&16) platform_notification("NSProcessInfoThermalStateDidChangeNotification",(Word)&process_info,0);
+}
+JNIEXPORT void JNICALL HOST_JNI(HostActivity_updateThermalSnapshot)(JNIEnv *env,jobject instance,jint status) {
+    /* Android NONE/LIGHT/MODERATE/SEVERE/CRITICAL map to Apple's four levels;
+     * shutdown/emergency remain critical. No per-frame platform query. */
+    unsigned condition=status<=0 ? 0 : status<=2 ? 1 : status==3 ? 2 : 3;
+    unsigned previous=__atomic_exchange_n(&process_thermal_condition,condition,__ATOMIC_RELAXED);
+    if(previous!=condition && java_vm && started)schedule_main_function(deliver_display_notifications,(void *)(Word)16);
 }
 
 JNIEXPORT void JNICALL HOST_JNI(HostActivity_updateSystemSnapshot)(JNIEnv *env,jobject activity,jint width,jint height,jfloat scale,jint rotation,jboolean tablet,jfloat battery,jint battery_state,jboolean low_power) {
